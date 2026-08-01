@@ -1,0 +1,149 @@
+inventory:
+  # Sub-Store inventory collection: keep every real node and do not apply the
+  # health sorting script to this collection.
+  url: "${SUB_STORE_INVENTORY_URL}"
+  timeout_seconds: 90
+  headers: {}
+
+data_dir: /app/data
+reports_dir: /app/reports
+
+http:
+  host: 0.0.0.0
+  port: 8080
+  api_token: "${NODE_HEALTH_API_TOKEN:-}"
+
+schedule:
+  enabled: true
+  time: "05:30"
+  timezone: Asia/Shanghai
+  default_mode: maintenance
+
+probe:
+  controller_url: http://mihomo-probe:9090
+  controller_listen: 0.0.0.0:9090
+  controller_secret: ""
+  listener_host: 0.0.0.0
+  proxy_host: mihomo-probe
+  mihomo_binary: /usr/local/bin/mihomo
+  ipquality_script: /app/ip.sh
+  start_port: 20000
+  startup_timeout_seconds: 30
+  request_timeout_seconds: 15
+  concurrency: 8
+  full_concurrency: 2
+  samples: 3
+  ip_url: https://api.ipify.org?format=json
+  geo_url_template: https://ipapi.co/{ip}/json/
+  google_url: https://www.gstatic.com/generate_204
+  chatgpt_url: https://chatgpt.com/cdn-cgi/trace
+
+policy:
+  # maintenance keeps these identities unordered and fixed; rebuild lets all
+  # fully audited candidates compete for these slots again.
+  stable_slots: 3
+  full_audit_top_candidates: 10
+  full_audit_max_age_hours: 48
+  min_full_passes_high_confidence: 2
+  minimum_publish_available_ratio: 0.2
+  # A rebuild still probes every available node, but isolated third-party
+  # failures do not discard the entire multi-hour run. Incomplete nodes cannot
+  # enter stable slots and remain low-confidence until a later full pass.
+  minimum_rebuild_full_completion_ratio: 0.8
+  # A JSON result is not trusted for ordering until at least this many
+  # independent risk-score providers returned usable values.
+  min_valid_risk_sources: 2
+  # One noisy DNSBL listing is only a warning. Three independent listings are
+  # required before DNSBL alone can trigger a stable-slot redline.
+  dnsbl_redline_threshold: 3
+  # A new stable candidate must succeed in at least two of the default three
+  # public-egress samples. Existing slots are preserved when this is uncertain.
+  minimum_candidate_success_rate: 0.6666
+  # Controlled maintenance promotion. A transiently unavailable or missing
+  # stable identity is never used as the weakest comparison target.
+  promotion_enabled: true
+  promotion_min_full_passes: 2
+  promotion_score_margin: 12
+  promotion_max_per_region_per_run: 1
+  promotion_cooldown_days: 7
+  expected_country:
+    hong-kong: HK
+    taiwan: TW
+    japan: JP
+    singapore: SG
+    united-states: US
+    south-korea: KR
+    united-kingdom: GB
+    germany: DE
+    france: FR
+    canada: CA
+    australia: AU
+
+report:
+  markdown: true
+  json: true
+  include_exit_ip: true
+  include_raw_details: true
+  retention_days: 180
+
+audit:
+  enabled: true
+  # Leave empty to allow only the same scheme/host/port as inventory.url.
+  # Add another exact origin only when audits must read a second Sub-Store.
+  allowed_origins: []
+  max_subscription_bytes: 10485760
+  max_nodes: 500
+
+local_socks:
+  stable_slots: 3
+  dynamic_offset: 3
+  region_order:
+    - hong-kong
+    - taiwan
+    - japan
+    - singapore
+    - united-states
+    - south-korea
+    - united-kingdom
+    - germany
+    - france
+    - canada
+    - australia
+    - other
+  port_bases:
+    hong-kong: 62000
+    taiwan: 62200
+    japan: 62400
+    singapore: 62600
+    united-states: 62800
+    south-korea: 63000
+    united-kingdom: 63200
+    germany: 63400
+    france: 63600
+    canada: 63800
+    australia: 64000
+    other: 64200
+
+regions:
+  hong-kong:
+    - '香港|港(?!口)|\bHK\b|Hong\s*Kong'
+  taiwan:
+    - '台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|\bTW\b|Taiwan|Taipei'
+  japan:
+    - '日本|\bJP\b|Japan|Tokyo|Osaka|东京|大阪'
+  singapore:
+    - '新加坡|狮城|獅城|\bSG\b|Singapore'
+  united-states:
+    - '美国|美國|\bUS\b|\bUSA\b|United\s*States|洛杉矶|洛杉磯|西雅图|西雅圖|纽约|紐約|夏威夷'
+  south-korea:
+    - '韩国|韓國|\bKR\b|Korea|首尔|首爾'
+  united-kingdom:
+    - '英国|英國|\bUK\b|Britain|United\s*Kingdom|London|伦敦|倫敦'
+  germany:
+    - '德国|德國|\bDE\b|Germany|Frankfurt|法兰克福|法蘭克福'
+  france:
+    - '法国|法國|\bFR\b|France|Paris|巴黎'
+  canada:
+    - '加拿大|\bCA\b|Canada|Toronto|多伦多|多倫多'
+  australia:
+    - '澳大利亚|澳大利亞|澳洲|\bAU\b|Australia|Sydney|悉尼'

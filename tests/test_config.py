@@ -1,0 +1,108 @@
+from pathlib import Path
+
+import pytest
+
+from node_health.config import DEFAULT_REGION_PATTERNS, load_config
+from node_health.inventory import classify_region
+
+
+def write_config(path: Path, extra: str = "") -> Path:
+    path.write_text(
+        "inventory:\n"
+        "  url: http://inventory.invalid/collection.yaml\n"
+        "http:\n"
+        "  host: 127.0.0.1\n"
+        "  port: 8080\n"
+        f"{extra}",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_config_rejects_cross_component_slot_mismatch(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "policy:\n  stable_slots: 5\n",
+    )
+    with pytest.raises(ValueError, match="stable_slots must be 3"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            "local_socks:\n  stable_slots: 5\n  dynamic_offset: 3\n",
+            "local_socks.stable_slots must be 3",
+        ),
+        (
+            "local_socks:\n  stable_slots: 3\n  dynamic_offset: 5\n",
+            "local_socks.dynamic_offset must be 3",
+        ),
+    ],
+)
+def test_config_rejects_legacy_local_socks_slot_contract(tmp_path, extra, message):
+    with pytest.raises(ValueError, match=message):
+        load_config(write_config(tmp_path / "config.yaml", extra))
+
+
+def test_config_requires_token_for_lan_listener(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "http:\n  host: 0.0.0.0\n  port: 8080\n",
+    )
+    with pytest.raises(ValueError, match="api_token is required"):
+        load_config(path)
+
+
+def test_minimal_loopback_config_is_valid(tmp_path):
+    config = load_config(write_config(tmp_path / "config.yaml"))
+    assert config.http.host == "127.0.0.1"
+    assert config.policy.stable_slots == 3
+    assert config.policy.dnsbl_redline_threshold == 3
+
+
+def test_config_rejects_single_dnsbl_listing_as_redline_threshold(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "policy:\n  dnsbl_redline_threshold: 1\n",
+    )
+    with pytest.raises(ValueError, match="dnsbl_redline_threshold must be at least 2"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("name", ["台北 01", "臺北 01", "Taipei IEPL"])
+def test_taipei_names_are_classified_as_taiwan(name):
+    assert classify_region(name, DEFAULT_REGION_PATTERNS) == "taiwan"
+
+
+def test_deployment_config_classifies_chinese_taipei_names(monkeypatch):
+    monkeypatch.setenv("SUB_STORE_INVENTORY_URL", "http://inventory.invalid/clash.yaml")
+    monkeypatch.setenv("NODE_HEALTH_API_TOKEN", "test-token")
+    path = Path(__file__).resolve().parents[1] / "deploy" / "config" / "config.example.yaml"
+    config = load_config(path)
+
+    assert classify_region("台北 01", config.region_patterns) == "taiwan"
+    assert classify_region("臺北 01", config.region_patterns) == "taiwan"
+
+
+def test_config_rejects_region_without_fixed_openwrt_port_block(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "regions:\n  mars:\n    - Mars\n",
+    )
+    with pytest.raises(ValueError, match="outside the fixed local-socks port plan: mars"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("schedule:\n  time: '25:00'\n", "schedule.time must be HH:MM"),
+        ("schedule:\n  default_mode: unsafe\n", "schedule.default_mode"),
+        ("schedule:\n  timezone: Invalid/Nowhere\n", "schedule.timezone is invalid"),
+    ],
+)
+def test_config_rejects_scheduler_values_that_would_stop_the_worker(tmp_path, extra, message):
+    with pytest.raises(ValueError, match=message):
+        load_config(write_config(tmp_path / "config.yaml", extra))

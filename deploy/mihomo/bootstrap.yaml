@@ -1,0 +1,18 @@
+# This controller is reachable only on the private Compose network.
+mixed-port: 17890
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: warning
+ipv6: true
+external-controller: 0.0.0.0:9090
+secret: ""
+
+profile:
+  store-selected: false
+  store-fake-ip: false
+
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT

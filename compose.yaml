@@ -1,0 +1,84 @@
+name: ipquality-node-health
+
+services:
+  mihomo-probe:
+    image: ${MIHOMO_IMAGE:-metacubex/mihomo:v1.19.29}
+    container_name: ipquality-mihomo-probe
+    restart: always
+    command:
+      - -d
+      - /tmp/mihomo
+      - -f
+      - /etc/mihomo/bootstrap.yaml
+    volumes:
+      - ./deploy/mihomo/bootstrap.yaml:/etc/mihomo/bootstrap.yaml:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - node-health
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/version || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  node-health:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12.11-slim-bookworm}
+    image: ipquality-node-health:local
+    container_name: ipquality-node-health
+    restart: always
+    user: ${PUID:-1026}:${PGID:-100}
+    depends_on:
+      mihomo-probe:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      NODE_HEALTH_CONFIG: /app/config/config.yaml
+      NODE_HEALTH_API_TOKEN: ${NODE_HEALTH_API_TOKEN:?set NODE_HEALTH_API_TOKEN}
+      SUB_STORE_INVENTORY_URL: ${SUB_STORE_INVENTORY_URL:?set SUB_STORE_INVENTORY_URL}
+    ports:
+      - ${NODE_HEALTH_BIND_IP:-0.0.0.0}:${NODE_HEALTH_PORT:-18887}:8080
+    volumes:
+      - ./deploy/config/config.example.yaml:/app/config/config.yaml:ro
+      - ${NODE_HEALTH_STORAGE_ROOT:?set NODE_HEALTH_STORAGE_ROOT}/data:/app/data
+      - ${NODE_HEALTH_STORAGE_ROOT:?set NODE_HEALTH_STORAGE_ROOT}/reports:/app/reports
+    networks:
+      - node-health
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  node-health:
+    name: ipquality-node-health
+    driver: bridge

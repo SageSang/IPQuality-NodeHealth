@@ -376,6 +376,11 @@ stail[link]="$Font_I报告链接：$Font_U"
 esac
 }
 countRunTimes(){
+if [[ ${IPQUALITY_AUTOMATION:-0} == 1 ]];then
+stail[today]="-"
+stail[total]="-"
+return
+fi
 local RunTimes=$(curl $CurlARG -s --max-time 10 "https://hits.xykt.de/ip?action=hit" 2>&1)
 stail[today]=$(echo "$RunTimes"|jq '.daily')
 stail[total]=$(echo "$RunTimes"|jq '.total')
@@ -1777,6 +1782,43 @@ check_email_service $service
 kill_progress_bar
 done
 }
+skip_mail(){
+smail[local]=2
+smail[remote]=0
+services=("Gmail" "Outlook" "Yahoo" "Apple" "QQ" "MailRU" "AOL" "GMX" "MailCOM" "163" "Sohu" "Sina")
+for service in "${services[@]}";do
+smailstatus[$service]=""
+done
+}
+read_dnsbl_zones(){
+if [[ -n ${IPQUALITY_DNSBL_FILE:-} && -r $IPQUALITY_DNSBL_FILE ]];then
+cat -- "$IPQUALITY_DNSBL_FILE"
+else
+curl $CurlARG -sL "${rawgithub}main/ref/dnsbl.list"
+fi
+}
+filter_dnsbl_zones(){
+awk '
+function valid_label(label) {
+return length(label) >= 1 && length(label) <= 63 && label ~ /^[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?$/
+}
+{
+zone = $0
+sub(/\r$/, "", zone)
+gsub(/^[[:space:]]+|[[:space:]]+$/, "", zone)
+sub(/\.$/, "", zone)
+if (length(zone) < 1 || length(zone) > 253) next
+count = split(zone, labels, ".")
+valid = 1
+for (label_index = 1; label_index <= count; label_index++) {
+if (!valid_label(labels[label_index])) {
+valid = 0
+break
+}
+}
+if (valid) print tolower(zone)
+}'
+}
 check_dnsbl_parallel(){
 ip_to_check=$1
 parallel_jobs=$2
@@ -1789,7 +1831,18 @@ local total=0
 local clean=0
 local blacklisted=0
 local other=0
-curl $CurlARG -sL "${rawgithub}main/ref/dnsbl.list"|sort -u|xargs -P "$parallel_jobs" -I {} bash -c "result=\$(dig +short \"$reversed_ip.{}\" A); if [[ -z \"\$result\" ]]; then echo 'Clean'; elif [[ \"\$result\" == '127.0.0.2' ]]; then echo 'Blacklisted'; else echo 'Other'; fi"|{
+read_dnsbl_zones|filter_dnsbl_zones|sort -u|xargs -P "$parallel_jobs" -I {} bash -c '
+zone=$1
+reversed_ip=$2
+result=$(dig +short "${reversed_ip}.${zone}" A)
+if [[ -z $result ]];then
+echo "Clean"
+elif [[ $result == "127.0.0.2" ]];then
+echo "Blacklisted"
+else
+echo "Other"
+fi
+' _ {} "$reversed_ip"|{
 while IFS= read -r line;do
 ((total++))
 case "$line" in
@@ -2257,6 +2310,7 @@ echo -ne "\r$shelp\n"
 exit 0
 }
 show_ad(){
+[[ ${IPQUALITY_AUTOMATION:-0} == 1 ]]&&return
 RANDOM=$(date +%s)
 local -a ads=()
 local i=1
@@ -2432,7 +2486,7 @@ score_updates+=".Score |= . + { IP2LOCATION: \"${ip2location[score]:-null}\" } |
 score_updates+=".Score |= . + { SCAMALYTICS: \"${scamalytics[score]:-null}\" } | "
 score_updates+=".Score |= . + { ipapi: \"${ipapi[score]:-null}\" } | "
 score_updates+=".Score |= . + { AbuseIPDB: \"${abuseipdb[score]:-null}\" } | "
-score_updates+=".Score |= . + { IPQS: \"${ipapi[ipqs]:-null}\" } | "
+score_updates+=".Score |= . + { IPQS: \"${ipqs[score]:-null}\" } | "
 score_updates+=".Score |= . + { DBIP: \"${dbip[score]:-null}\" } | "
 factor_updates+=$(factor_bool "${ip2location[countrycode]}" "IP2LOCATION" "CountryCode")
 factor_updates+=$(factor_bool "${ipapi[countrycode]}" "ipapi" "CountryCode")
@@ -2576,7 +2630,11 @@ MediaUnlockTest_YouTube_Premium $2
 MediaUnlockTest_PrimeVideo_Region $2
 MediaUnlockTest_Reddit $2
 OpenAITest $2
+if [[ -n $usePROXY || ${IPQUALITY_SKIP_MAIL:-0} == 1 ]];then
+skip_mail
+else
 check_mail
+fi
 [[ $2 -eq 4 ]]&&check_dnsbl "$IP" 50
 echo -ne "$Font_LineClear" 1>&2
 if [ $2 -eq 4 ]||[[ $IPV4work -eq 0 || $IPV4check -eq 0 ]];then
@@ -2640,3 +2698,4 @@ clear
 show_ad
 [[ $IPV4work -ne 0 && $IPV4check -ne 0 ]]&&check_IP "$IPV4" 4
 [[ $IPV6work -ne 0 && $IPV6check -ne 0 ]]&&check_IP "$IPV6" 6
+exit 0

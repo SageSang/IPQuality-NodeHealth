@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime state and local deployment secrets.
+data/
+reports/
+.env
+deploy/.env
