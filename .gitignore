@@ -7,3 +7,6 @@ data/
 reports/
 .env
 deploy/.env
+
+# Never reintroduce upstream credential/test-session material.
+ref/cookies.txt
