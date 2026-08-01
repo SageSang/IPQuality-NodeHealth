@@ -61,6 +61,7 @@ def test_minimal_loopback_config_is_valid(tmp_path):
     assert config.policy.stable_slots == 3
     assert config.policy.stable_unavailable_replace_after_runs == 3
     assert config.policy.dnsbl_redline_threshold == 3
+    assert config.report.retention_days == 30
 
 
 def test_config_rejects_non_positive_unavailable_replacement_threshold(tmp_path):
@@ -121,6 +122,7 @@ def test_deployment_config_classifies_chinese_taipei_names(monkeypatch):
     assert config.policy.promotion_min_full_passes == 3
     assert config.policy.promotion_score_margin == 20
     assert config.policy.promotion_cooldown_days == 3
+    assert config.report.retention_days == 30
 
 
 def test_config_rejects_region_without_fixed_openwrt_port_block(tmp_path):

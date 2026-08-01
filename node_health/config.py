@@ -112,7 +112,7 @@ class ReportConfig:
     json: bool = True
     include_exit_ip: bool = True
     include_raw_details: bool = True
-    retention_days: int = 180
+    retention_days: int = 30
 
 
 @dataclass

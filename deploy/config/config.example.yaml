@@ -94,7 +94,7 @@ report:
   json: true
   include_exit_ip: true
   include_raw_details: true
-  retention_days: 180
+  retention_days: 30
 
 audit:
   enabled: true

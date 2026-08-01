@@ -177,7 +177,7 @@ curl -fsS http://192.0.2.2:18887/current.json
 
 `data/current.json` 是服务内部的完整当期结果；HTTP `/current.json` 只公开 Sub-Store/OpenWrt 所需的版本、地区稳定槽、动态白名单和拒绝列表，不公开节点名称、出口 IP 或原始检测详情。`state.json` 保存下一轮决策需要的连续通过次数、可信深检和槽位冷却信息；`state-snapshots` 默认只保留最近三个，并通过版本与 `current.json` 配对。
 
-每日 `YYYY-MM-DD.md/.json` 是该日期最后一次写入的完整报告，同一天重复运行会覆盖同名日报。`latest-run.md` 每次发布都会更新，展示当前 degraded/unavailable/absent 槽位；`slot-changes-latest.md` 首次创建后只在真实身份变化时更新，因此不会被下一轮“无变化”覆盖。每日完整报告默认保留 180 天，带日期和版本号的槽位变更历史不随它清理。
+每日 `YYYY-MM-DD.md/.json` 是该日期最后一次写入的完整报告，同一天重复运行会覆盖同名日报。`latest-run.md` 每次发布都会更新，展示当前 degraded/unavailable/absent 槽位；`slot-changes-latest.md` 首次创建后只在真实身份变化时更新，因此不会被下一轮“无变化”覆盖。每日完整报告默认保留 30 天，带日期和版本号的槽位变更历史不随它清理。
 
 如果状态文件不存在或其中没有任何已记录的稳定槽位身份，服务会自动把计划任务或手动 `maintenance` 升级为 `rebuild`。仍在 inventory 中但暂时 unavailable 的槽位在阈值前仍算有效历史；已从 inventory 消失的身份会在当轮释放。损坏且无法解析的状态文件不会被静默忽略，服务会停止发布并要求从备份恢复或由你明确清理后重建。
 
