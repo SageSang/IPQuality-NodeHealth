@@ -157,7 +157,7 @@ def test_no_change_run_does_not_overwrite_latest_slot_change(tmp_path):
     latest_run = (
         store.config.reports_dir / "alerts" / "latest-run.md"
     ).read_text(encoding="utf-8")
-    assert "No stable-slot changes in this run." in latest_run
+    assert "本轮稳定槽位没有变化。" in latest_run
 
 
 def test_report_retention_deletes_only_exact_old_daily_report_names(tmp_path):

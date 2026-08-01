@@ -437,6 +437,12 @@ async function testStablePortGaps() {
   assert.strictEqual(ports['Brazil node'], 64200);
   assert.strictEqual(ports['US untested'], undefined);
   assert.ok(!output.listeners.some((listener) => listener.port === 62801));
+  const exported = output.listeners.map(
+    (listener) => `socks5://192.0.2.4:${listener.port}{${listener.proxy}}`,
+  );
+  assert.ok(exported.includes('socks5://192.0.2.4:62800{US one}'));
+  assert.ok(exported.includes('socks5://192.0.2.4:62803{US candidate}'));
+  assert.ok(!exported.some((line) => line.includes('{unresolved}') || line.includes('{dynamic-')));
   assert.strictEqual(operatorModule.STABLE_SLOT_COUNT, 3);
   assert.strictEqual(converter.STABLE_SLOT_COUNT, 3);
 }

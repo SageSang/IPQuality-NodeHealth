@@ -165,6 +165,7 @@ def make_service(tmp_path, count=7):
 
 def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_path):
     service, _, full, _ = make_service(tmp_path)
+    service.config.local_socks_advertise_host = "192.0.2.4"
     current = service.run_once("maintenance")
     assert current["requested_mode"] == "maintenance"
     assert current["mode"] == "rebuild"
@@ -173,8 +174,8 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     assert (tmp_path / "data" / "current.json").exists()
     report = (tmp_path / "data" / "reports" / "2026-07-24.md").read_text(encoding="utf-8")
     assert "62800" in report
-    assert "socks5://127.0.0.1:62800{" in report
-    assert "Exit IP" in report
+    assert "socks5://192.0.2.4:62800{US node 0}" in report
+    assert "出口 IP" in report
     assert "Los Angeles" in report
     report_json = json.loads(
         (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
@@ -203,6 +204,37 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
         "subdivision_name": "California",
         "timezone": "America/Los_Angeles",
     }
+    for item in report_json["nodes"]:
+        local_socks = item.get("local_socks")
+        if local_socks:
+            assert local_socks["name"] == item["name"]
+            assert local_socks["url"].endswith("{" + item["name"] + "}")
+
+    latest_txt = (
+        tmp_path
+        / "data"
+        / "reports"
+        / "local-socks"
+        / "latest"
+        / "united-states.txt"
+    ).read_text(encoding="utf-8")
+    archived_txt = (
+        tmp_path
+        / "data"
+        / "reports"
+        / "scheduled"
+        / "2026"
+        / "07"
+        / "24"
+        / current["version"]
+        / "local-socks"
+        / "united-states.txt"
+    ).read_text(encoding="utf-8")
+    assert archived_txt == latest_txt
+    assert "socks5://192.0.2.4:62800{US node 0}" in latest_txt
+    assert len(latest_txt.splitlines()) == 7
+    assert "unresolved" not in latest_txt
+    assert "{dynamic-" not in latest_txt
     assert "geo" not in current["nodes"][next(iter(current["nodes"]))]
 
 
@@ -278,7 +310,7 @@ def test_maintenance_keeps_temporarily_unavailable_stable_slot(tmp_path):
     latest = (tmp_path / "data" / "reports" / "alerts" / "latest-run.md").read_text(
         encoding="utf-8"
     )
-    assert "unavailable" in latest
+    assert "不可达" in latest
 
 
 def test_maintenance_quality_redline_replaces_only_one_slot(tmp_path):
@@ -302,7 +334,7 @@ def test_maintenance_quality_redline_replaces_only_one_slot(tmp_path):
     assert changes[0]["redline_reasons"] == "egress-ip-unstable"
     history = list((tmp_path / "data" / "reports" / "alerts").glob("2026-07-24-*.md"))
     assert len(history) >= 2
-    assert any("quality-redline" in path.read_text(encoding="utf-8") for path in history)
+    assert any("触发质量红线" in path.read_text(encoding="utf-8") for path in history)
 
 
 def test_missing_inventory_node_is_immediately_replaced(tmp_path):
@@ -319,11 +351,11 @@ def test_missing_inventory_node_is_immediately_replaced(tmp_path):
     assert region["stable_slots"]["3"] != ghost_key
     assert ghost_key not in second["nodes"]
     report = (tmp_path / "data" / "reports" / "2026-07-24.md").read_text(encoding="utf-8")
-    assert "missing-from-inventory" in report
+    assert "节点已从订阅中消失" in report
     changes = (tmp_path / "data" / "reports" / "alerts" / "slot-changes-latest.md").read_text(
         encoding="utf-8"
     )
-    assert "missing-from-inventory" in changes
+    assert "节点已从订阅中消失" in changes
 
 
 def test_three_consecutive_unavailable_runs_replace_only_that_slot(tmp_path):
@@ -518,7 +550,7 @@ def test_incomplete_fresh_full_degrades_stable_slot_without_losing_trusted_full(
     assert slot["stable_status"]["1"]["status"] == "degraded"
     assert "full-audit-incomplete" in slot["stable_status"]["1"]["reasons"]
     assert state["nodes"][key]["last_full"]["completed"] is True
-    assert "full-audit-incomplete" in latest
+    assert "本轮深度检测未完成" in latest
 
 
 def test_chatgpt_redline_remains_latched_until_a_fresh_clean_full(tmp_path):
@@ -607,8 +639,8 @@ def test_stable_warning_is_degraded_without_changing_the_slot(tmp_path):
     latest = (tmp_path / "data" / "reports" / "alerts" / "latest-run.md").read_text(
         encoding="utf-8"
     )
-    assert "degraded" in report
-    assert "degraded" in latest
+    assert "降级" in report
+    assert "降级" in latest
 
 
 def test_first_rebuild_publishes_even_when_all_nodes_are_unavailable(tmp_path):
@@ -862,9 +894,16 @@ def test_subscription_audit_checks_all_nodes_without_changing_ranking_state(tmp_
     assert "secret-" not in serialized
     assert report["nodes"][0]["full"]["details"]["Media"]["ChatGPT"]["Status"] == "Yes"
     markdown = service.store.audit_report_path(audit_id, "md").read_text(encoding="utf-8")
-    assert "Raw IPQuality result" in markdown
-    assert "this audit did not modify the production stable slots" in markdown
+    assert "IPQuality 原始结果" in markdown
+    assert "本次临时审计不会修改正式环境的稳定槽位" in markdown
     assert "<script>" not in markdown
+    audit_txt = (
+        service.store.audit_report_dir(audit_id)
+        / "local-socks"
+        / "united-states.txt"
+    ).read_text(encoding="utf-8")
+    assert "{US node 0}" in audit_txt
+    assert "{dynamic-" not in audit_txt
 
 
 def test_subscription_audit_http_api_and_authenticated_report_download(tmp_path):

@@ -109,6 +109,12 @@ Each report node has a normalized `geo` object for its observed exit IP,
 country, subdivision, city, ASN, organization, timezone, coordinates, source,
 observation time, and fresh/cached status. These report-only fields are not
 part of `current.json` and are never consumed for ranking recovery.
+Every successful scheduled publication also writes the current regional SOCKS5
+lists to `reports/local-socks/latest/<region>.txt` and archives the same files
+under `reports/scheduled/YYYY/MM/DD/<version>/local-socks/`. Subscription audits
+write their lists beside the audit report in its `local-socks/` directory.
+Each line uses `socks5://<advertise-host>:<port>{<real source node name>}`;
+internal position labels such as `dynamic-001` are never used as proxy names.
 `reports/alerts/latest-run.md` is refreshed for every publication.
 `slot-changes-latest.md` is created initially and thereafter changes only when
 a stable identity changes. Each such change also creates an immutable
@@ -210,6 +216,8 @@ The same conversion writes every region TXT file into a staging directory.
 Only after the new Mihomo process is ready does the apply script replace
 `/root/local-socks`; a TXT publication failure rolls the service config back
 as well. `ADVERTISE_HOST` controls the LAN address written into those files.
+The text inside braces is the exact source proxy name bound to that listener,
+for example `socks5://192.0.2.4:62000{🇭🇰 Hong Kong 07}`.
 
 `NODE_PATH` defaults to module locations outside the TXT export directory. When the
 installed `js-yaml` cannot be resolved through it, set `JS_YAML_PATH` to the
