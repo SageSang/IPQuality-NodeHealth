@@ -18,6 +18,7 @@ fi
 : "${WORK_DIR:=/etc/local-socks}"
 : "${CACHE_DIR:=$WORK_DIR/cache/node-health}"
 : "${APPLY_COMMAND:=$WORK_DIR/apply-ranking.sh}"
+: "${STABLE_CONVERTER_URL:=}"
 : "${NODE_BIN:=/usr/bin/node}"
 : "${SERVICE_SCRIPT:=/etc/init.d/local-socks}"
 : "${CONFIG_PATH:=$WORK_DIR/config.yaml}"
@@ -260,7 +261,16 @@ if [ ! -x "$APPLY_COMMAND" ]; then
   record_failure 'apply command is not executable'
 fi
 
-if ! "$APPLY_COMMAND" "$SOURCE_YAML" "$RANKING_FINAL" "$version_final"; then
+CONVERTER_OVERRIDE=''
+if [ -n "$STABLE_CONVERTER_URL" ]; then
+  CONVERTER_OVERRIDE="$STAGE_DIR/stable-converter.js"
+  download "$STABLE_CONVERTER_URL" "$CONVERTER_OVERRIDE" \
+    || record_failure 'stable converter download failed'
+  [ -s "$CONVERTER_OVERRIDE" ] || record_failure 'stable converter download is empty'
+fi
+
+if ! STABLE_CONVERTER_OVERRIDE="$CONVERTER_OVERRIDE" \
+  "$APPLY_COMMAND" "$SOURCE_YAML" "$RANKING_FINAL" "$version_final"; then
   record_failure 'validated local-socks apply failed'
 fi
 

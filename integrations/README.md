@@ -222,6 +222,11 @@ config SHA-256, service status, and all regional TXT files before skipping.
 Manual overwrite, a stopped service, or missing exports triggers a repair
 apply without deleting `applied.version`.
 
+The ranking version is a stable fingerprint of the runtime projection. A daily
+scan may refresh scores and reports without changing this version, so an
+unchanged ranking does not restart `local-socks`; a changed node set, slot,
+dynamic order, or rejection set does.
+
 ## Stable-port converter
 
 `local-socks/convert-any-proxy-to-local-socks-stable.js` is a standalone
@@ -234,7 +239,7 @@ converter.nodeKey(proxy)
 ```
 
 For every fixed region, slots 1 through 3 map to `base + slot - 1`.
-Candidates start at `base + 5`; empty stable slots remain empty and never
+Candidates start at `base + 3`; empty stable slots remain empty and never
 shift another slot. Explicitly rejected keys are omitted. Unknown proxies are
 also omitted after a valid state is loaded. A state fetch/validation failure is
 handled before conversion and leaves the last working OpenWrt config active.

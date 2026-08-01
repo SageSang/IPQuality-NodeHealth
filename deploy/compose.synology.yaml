@@ -46,6 +46,7 @@ services:
       NODE_HEALTH_CONFIG: /app/config/config.yaml
       NODE_HEALTH_API_TOKEN: ${NODE_HEALTH_API_TOKEN:?set NODE_HEALTH_API_TOKEN}
       SUB_STORE_INVENTORY_URL: ${SUB_STORE_INVENTORY_URL:?set SUB_STORE_INVENTORY_URL}
+      LOCAL_SOCKS_ADVERTISE_HOST: ${LOCAL_SOCKS_ADVERTISE_HOST:?set LOCAL_SOCKS_ADVERTISE_HOST}
     ports:
       - ${NODE_HEALTH_BIND_IP:-0.0.0.0}:${NODE_HEALTH_PORT:-18887}:8080
     volumes:
@@ -78,4 +79,3 @@ networks:
   node-health:
     name: ipquality-node-health
     driver: bridge
-

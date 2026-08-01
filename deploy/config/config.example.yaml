@@ -97,6 +97,9 @@ audit:
 local_socks:
   stable_slots: 3
   dynamic_offset: 3
+  # Address used by AdsPower and other LAN clients to reach OpenWrt SOCKS5
+  # listeners. Keep this identical to OpenWrt ADVERTISE_HOST.
+  advertise_host: "${LOCAL_SOCKS_ADVERTISE_HOST:-192.0.2.4}"
   region_order:
     - hong-kong
     - taiwan

@@ -42,6 +42,7 @@ Copy `deploy/config/config.example.yaml` to `config/config.yaml`, copy
 ```dotenv
 NODE_HEALTH_API_TOKEN=<long-random-secret>
 SUB_STORE_INVENTORY_URL=http://192.0.2.2:3001/download/collection/inventory?target=ClashMeta&noCache=true
+LOCAL_SOCKS_ADVERTISE_HOST=<OpenWrt-LAN-IP>
 NODE_HEALTH_IMAGE=ghcr.io/sagesang/ipquality-node-health:latest
 ```
 
@@ -86,4 +87,3 @@ docker compose up -d
 Do not enable unattended Watchtower updates initially. A version can change
 ranking policy or persisted-state contracts; publish a release, run tests, and
 then advance the pinned image tag.
-

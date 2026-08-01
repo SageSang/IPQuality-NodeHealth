@@ -193,6 +193,9 @@ class StateStore:
             slot_changes,
             self.config.report.include_exit_ip,
             self.config.report.include_raw_details,
+            self.config.region_port_bases,
+            self.config.policy.stable_slots,
+            self.config.local_socks_advertise_host,
         )
         report_markdown = build_report_markdown(
             current,
@@ -202,6 +205,7 @@ class StateStore:
             self.config.policy.stable_slots,
             self.config.report.include_exit_ip,
             self.config.report.include_raw_details,
+            self.config.local_socks_advertise_host,
         )
         alert_markdown = _alert_markdown(current, assessments, slot_changes)
 
@@ -276,6 +280,9 @@ class StateStore:
             [],
             self.config.report.include_exit_ip,
             self.config.report.include_raw_details,
+            self.config.region_port_bases,
+            self.config.policy.stable_slots,
+            self.config.local_socks_advertise_host,
         )
         report_markdown = build_report_markdown(
             current,
@@ -285,6 +292,7 @@ class StateStore:
             self.config.policy.stable_slots,
             self.config.report.include_exit_ip,
             self.config.report.include_raw_details,
+            self.config.local_socks_advertise_host,
         )
         directory = self.audit_report_dir(audit_id)
         json_path = directory / "report.json"
@@ -420,6 +428,43 @@ def _connection_detail(assessment: NodeAssessment) -> dict[str, Any]:
     return {key: value for key, value in aliases.items() if value not in {None, ""}}
 
 
+def _local_socks_detail(
+    position: tuple[int, int | None, str] | None,
+    advertise_host: str,
+    name: str,
+) -> dict[str, Any] | None:
+    if position is None or position[1] is None:
+        return None
+    port = position[1]
+    return {
+        "host": advertise_host,
+        "port": port,
+        "protocol": "socks5",
+        "name": name,
+        "url": f"socks5://{advertise_host}:{port}{{{name}}}",
+    }
+
+
+def _report_order(
+    current: dict[str, Any], port_bases: dict[str, int], slot_count: int
+) -> dict[str, tuple[int, int | None, str]]:
+    order: dict[str, tuple[int, int | None, str]] = {}
+    for region, payload in current.get("regions", {}).items():
+        base = port_bases.get(region)
+        for slot, key in payload.get("stable_slots", {}).items():
+            index = int(slot) - 1
+            order[str(key)] = (index, _listener_port(region, base, index), f"{int(slot):03d}")
+        dynamic_start = 0 if region == "other" else slot_count
+        for index, key in enumerate(payload.get("ranked", [])):
+            absolute = dynamic_start + index
+            order[str(key)] = (
+                absolute,
+                _listener_port(region, base, absolute),
+                f"dynamic-{index + 1:03d}",
+            )
+    return order
+
+
 def _report_summary(assessments: list[NodeAssessment]) -> dict[str, Any]:
     by_region: dict[str, int] = {}
     for item in assessments:
@@ -450,7 +495,11 @@ def build_report_json(
     slot_changes: list[dict[str, str]],
     include_exit_ip: bool,
     include_raw_details: bool,
+    port_bases: dict[str, int],
+    slot_count: int,
+    advertise_host: str,
 ) -> dict[str, Any]:
+    order = _report_order(current, port_bases, slot_count)
     return {
         "schema_version": 1,
         "report_kind": current.get("report_kind", "scheduled"),
@@ -465,7 +514,16 @@ def build_report_json(
         "slot_changes": slot_changes,
         "regions": current.get("regions", {}),
         "nodes": [
-            _assessment_detail(item, include_exit_ip, include_raw_details)
+            {
+                **_assessment_detail(item, include_exit_ip, include_raw_details),
+                **(
+                    {"local_socks": detail}
+                    if (detail := _local_socks_detail(
+                        order.get(item.node.key), advertise_host, item.node.name
+                    ))
+                    else {}
+                ),
+            }
             for item in sorted(assessments, key=_report_sort_key)
         ],
     }
@@ -521,26 +579,10 @@ def build_report_markdown(
     slot_count: int,
     include_exit_ip: bool,
     include_raw_details: bool,
+    advertise_host: str,
 ) -> str:
     lookup = _slot_lookup(current)
-    order: dict[str, tuple[int, int | None, str]] = {}
-    for region, payload in current.get("regions", {}).items():
-        base = port_bases.get(region)
-        for slot, key in payload.get("stable_slots", {}).items():
-            index = int(slot) - 1
-            order[str(key)] = (
-                index,
-                _listener_port(region, base, index),
-                f"{int(slot):03d}",
-            )
-        dynamic_start = 0 if region == "other" else slot_count
-        for index, key in enumerate(payload.get("ranked", [])):
-            absolute = dynamic_start + index
-            order[str(key)] = (
-                absolute,
-                _listener_port(region, base, absolute),
-                f"dynamic-{index + 1:03d}",
-            )
+    order = _report_order(current, port_bases, slot_count)
     report_kind = str(current.get("report_kind") or "scheduled")
     title = (
         f"Subscription audit: {_markdown_escape(current.get('name') or current['version'])}"
@@ -597,8 +639,8 @@ def build_report_markdown(
             "",
             "## Recommended top slots" if report_kind == "subscription-audit" else "## Stable slot status",
             "",
-            "| Region | Slot | Port | Node | Status | Last exit IP | Last full | Score | Reasons |",
-            "|---|---:|---:|---|---|---|---|---:|---|",
+            "| Region | Slot | Port | SOCKS5 | Node | Status | Last exit IP | Last full | Score | Reasons |",
+            "|---|---:|---:|---|---|---|---|---|---:|---|",
         ]
     )
     for region in current.get("region_order", []):
@@ -611,13 +653,16 @@ def build_report_markdown(
             name = str(status.get("name") or current.get("nodes", {}).get(key, {}).get("name") or "unknown")
             reasons = ", ".join(str(value) for value in status.get("reasons", [])) or "-"
             port = base + int(slot) - 1 if base is not None else "-"
+            socks5 = (
+                f"socks5://{advertise_host}:{port}{{{name}}}" if port != "-" else "-"
+            )
             escaped_name = name.replace("|", "\\|")
             escaped_reasons = reasons.replace("|", "\\|")
             last_exit_ip = str(status.get("last_exit_ip") or "-") if include_exit_ip else "[omitted]"
             last_full = str(status.get("last_full_checked_at") or "-")
             score = float(status.get("score") or 0)
             lines.append(
-                f"| {region} | {slot} | {port} | {escaped_name} | "
+                f"| {region} | {slot} | {port} | `{socks5}` | {escaped_name} | "
                 f"{status.get('status', 'unknown')} | {last_exit_ip} | {last_full} | "
                 f"{score:.2f} | {escaped_reasons} |"
             )
@@ -627,9 +672,9 @@ def build_report_markdown(
             "",
             "## Current order and checks",
             "",
-            "| Region | Position | Port | Node | Exit IP | ASN | Latency | "
+            "| Region | Position | Port | SOCKS5 | Node | Exit IP | ASN | Latency | "
             "Success | Score | Confidence | Decision |",
-            "|---|---|---:|---|---|---|---:|---:|---:|---|---|",
+            "|---|---|---:|---|---|---|---|---:|---:|---:|---|---|",
         ]
     )
     region_indexes = {
@@ -660,13 +705,16 @@ def build_report_markdown(
             if order_item is not None and order_item[1] is not None
             else "-"
         )
+        socks5 = (
+            f"socks5://{advertise_host}:{port}{{{item.node.name}}}" if port != "-" else "-"
+        )
         latency = "-" if item.quick.latency_ms is None else f"{item.quick.latency_ms:.1f} ms"
         reason = ", ".join(item.evaluation.reasons)
         decision = item.evaluation.decision + (f" ({reason})" if reason else "")
         name = item.node.name.replace("|", "\\|")
         asn = item.quick.asn.replace("|", "\\|")
         lines.append(
-            f"| {item.node.region} | {position} | {port} | {name} | "
+            f"| {item.node.region} | {position} | {port} | `{socks5}` | {name} | "
             f"{(item.quick.exit_ip or '-') if include_exit_ip else '[omitted]'} | {asn or '-'} | "
             f"{latency} | {item.quick.success_rate:.0%} | {item.evaluation.score:.2f} | "
             f"{item.evaluation.confidence} | {decision} |"
@@ -675,6 +723,10 @@ def build_report_markdown(
     lines.extend(["", "## Detailed checks", ""])
     for item in sorted(assessments, key=_report_sort_key):
         detail = _assessment_detail(item, include_exit_ip, include_raw_details)
+        socks5_detail = _local_socks_detail(
+            order.get(item.node.key), advertise_host, item.node.name
+        )
+        socks5 = socks5_detail["url"] if socks5_detail else "-"
         quick = detail["quick"]
         full = detail["full"]
         fresh = detail["fresh_full_attempt"]
@@ -698,6 +750,7 @@ def build_report_markdown(
                 f"- Node key: `{item.node.key}`",
                 f"- Region: `{_markdown_escape(item.node.region)}`",
                 f"- Connection: {_markdown_escape(connection_text)}",
+                f"- Local SOCKS5: `{socks5}`",
                 f"- Decision: `{item.evaluation.decision}`; confidence: "
                 f"`{item.evaluation.confidence}`; score: `{item.evaluation.score:.2f}`",
                 f"- Reasons: {_markdown_escape(reasons)}",

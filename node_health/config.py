@@ -136,6 +136,7 @@ class AppConfig:
     http: HttpConfig = field(default_factory=HttpConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    local_socks_advertise_host: str = "127.0.0.1"
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -200,6 +201,9 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
         http=HttpConfig(**raw.get("http", {})),
         report=ReportConfig(**raw.get("report", {})),
         audit=AuditConfig(**raw.get("audit", {})),
+        local_socks_advertise_host=str(
+            local_socks_raw.get("advertise_host", "127.0.0.1")
+        ).strip(),
     )
     _validate_config(config, local_socks_raw)
     return config
@@ -240,6 +244,8 @@ def _validate_config(config: AppConfig, local_socks_raw: dict[str, Any]) -> None
         raise ValueError("http.port must be in 1..65535")
     if config.report.retention_days < 1:
         raise ValueError("report.retention_days must be positive")
+    if not config.local_socks_advertise_host:
+        raise ValueError("local_socks.advertise_host must not be empty")
     if config.audit.max_subscription_bytes < 1024:
         raise ValueError("audit.max_subscription_bytes must be at least 1024")
     if config.audit.max_nodes < 1:

@@ -142,7 +142,17 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     assert (tmp_path / "data" / "current.json").exists()
     report = (tmp_path / "data" / "reports" / "2026-07-24.md").read_text(encoding="utf-8")
     assert "62800" in report
+    assert "socks5://127.0.0.1:62800{" in report
     assert "Exit IP" in report
+
+
+def test_unchanged_runtime_projection_keeps_version_stable(tmp_path):
+    service, _, _, _ = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+    second = service.run_once("maintenance")
+    assert second["version"] == first["version"]
+    assert second["generated_at"] != first["generated_at"]
 
 
 def test_maintenance_keeps_temporarily_unavailable_stable_slot(tmp_path):
@@ -228,6 +238,7 @@ def test_unchanged_rebuild_resets_cooldown_without_slot_change_alert(tmp_path):
         (tmp_path / "data" / "reports" / "2026-07-25.json").read_text(encoding="utf-8")
     )
     assert report["slot_changes"] == []
+    assert any("local_socks" in item for item in report["nodes"])
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
     assert all(
         value.startswith("2026-07-25")

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import math
 import threading
-import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -600,7 +601,7 @@ class NodeHealthService:
         if generated_at.tzinfo is None:
             generated_at = generated_at.replace(tzinfo=timezone.utc)
         iso_time = generated_at.astimezone().isoformat(timespec="seconds")
-        version = generated_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+        version = self._runtime_version(source_digest, regions)
 
         current = self._build_current(
             version,
@@ -616,6 +617,30 @@ class NodeHealthService:
         state = self._build_state(current, previous, assessments, regions, changes)
         self.store.publish(current, state, assessments, changes, generated_at.astimezone())
         return current
+
+    @staticmethod
+    def _runtime_version(
+        source_digest: str, regions: dict[str, dict[str, object]]
+    ) -> str:
+        """Return a stable version for the OpenWrt runtime projection.
+
+        Health scores and timestamps may change on every scan, but they do not
+        require a local-socks restart when the selected node identities and
+        ordering remain unchanged.
+        """
+        projection = {
+            "source_digest": source_digest,
+            "regions": {
+                region: {
+                    "stable_slots": payload.get("stable_slots", {}),
+                    "ranked": payload.get("ranked", []),
+                    "rejected": payload.get("rejected", {}),
+                }
+                for region, payload in sorted(regions.items())
+            },
+        }
+        encoded = json.dumps(projection, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return "r-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
     def _assess(
         self,
