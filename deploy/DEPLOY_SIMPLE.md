@@ -162,8 +162,9 @@ curl -fsS -X POST \
   'http://NAS_LAN_IP:18887/api/run?mode=rebuild'
 ```
 
-接口启动后台任务后立即返回。通过 `/healthz` 查看 `running`、`last_success`
-和 `last_error`。首次节点多时耗时会较长，不要在运行中重建容器。
+接口启动后台任务后立即返回。通过 `/healthz` 查看 `running`、`last_success`、
+`last_error`、`started_at` 和当前阶段的节点完成百分比 `progress`。首次节点多时
+耗时会较长，不要在运行中重建容器。
 
 成功后检查：
 

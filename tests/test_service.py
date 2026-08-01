@@ -81,9 +81,15 @@ class FakeFull:
         self.exit_ips = {}
         self.risk_sources = {}
         self.calls = []
+        self.started_event = None
+        self.release_event = None
 
     def check(self, node, port):
         self.calls.append(node.key)
+        if self.started_event is not None:
+            self.started_event.set()
+        if self.release_event is not None:
+            self.release_event.wait(timeout=5)
         completed = node.key not in self.incomplete
         index = int(node.name.rsplit(" ", 1)[-1]) + 1
         status = self.statuses.get(node.key, "Yes")
@@ -627,7 +633,10 @@ def test_http_endpoints_and_token(tmp_path):
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         with urllib.request.urlopen(base + "/healthz") as response:
-            assert json.load(response)["status"] == "ok"
+            health = json.load(response)
+            assert health["status"] == "ok"
+            assert health["progress"] is None
+            assert health["started_at"] is None
         with urllib.request.urlopen(base + "/current.json") as response:
             ranking = json.load(response)
             assert ranking["mode"] == "rebuild"
@@ -672,6 +681,53 @@ def test_http_endpoints_and_token(tmp_path):
         with urllib.request.urlopen(request) as response:
             assert response.status == 202
     finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_healthz_reports_live_scheduled_scan_progress(tmp_path):
+    service, _, full, _ = make_service(tmp_path, count=1)
+    full.started_event = threading.Event()
+    full.release_event = threading.Event()
+    server = create_server(service.config, service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        request = urllib.request.Request(
+            base + "/api/run?mode=rebuild",
+            data=b"",
+            headers={"Authorization": "Bearer test-token"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 202
+        assert full.started_event.wait(timeout=2)
+
+        with urllib.request.urlopen(base + "/healthz") as response:
+            health = json.load(response)
+        assert health["running"] is True
+        assert health["running_mode"] == "rebuild"
+        assert health["started_at"] == "2026-07-24T00:02:00+00:00"
+        assert health["progress"] == {
+            "phase": "full-scan",
+            "inventory_nodes": 1,
+            "completed_nodes": 0,
+            "total_nodes": 1,
+            "remaining_nodes": 1,
+            "percent": 0.0,
+        }
+
+        full.release_event.set()
+        deadline = time.monotonic() + 3
+        while service.status()["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert service.status()["running"] is False
+        assert service.status()["progress"] is None
+        assert service.status()["last_success"] is not None
+    finally:
+        full.release_event.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
@@ -783,6 +839,14 @@ def test_subscription_audit_checks_all_nodes_without_changing_ranking_state(tmp_
     assert audit_id
     status = _wait_for_audit(service, audit_id)
     assert status["status"] == "completed_with_warnings"
+    assert status["progress"] == {
+        "phase": "completed",
+        "inventory_nodes": 4,
+        "completed_nodes": 4,
+        "total_nodes": 4,
+        "remaining_nodes": 0,
+        "percent": 100.0,
+    }
     assert status["summary"]["nodes"] == 4
     assert status["summary"]["available"] == 3
     assert unavailable_key not in full.calls

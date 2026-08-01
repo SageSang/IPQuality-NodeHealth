@@ -144,11 +144,13 @@ curl -fsS -X POST \
 
 这里的“原子”是单个可变文件的原子替换，不是把状态和所有报告合成一个跨文件事务。发布顺序是报告 -> `data/state-snapshots/<version>.json` -> `data/state.json` -> `data/current.json`；最后一个 `current.json` 是权威提交点。若在最后一步前中断，重启后仍按旧 `current.json` 选择同版本快照，不会把新槽位状态误配给旧排序。极少数中断可能让磁盘上的报告版本暂时领先于权威 `current.json`，这是因为报告只用于观察、不参与恢复；核对某次报告时应比较其中的 `version` 与当前版本。
 
-运行接口返回 `202 Accepted` 只表示任务已经进入后台。用下面的接口查看 `running`、`running_mode`、`last_success` 和 `last_error`：
+运行接口返回 `202 Accepted` 只表示任务已经进入后台。用下面的接口查看 `running`、`running_mode`、`last_success`、`last_error`、`started_at` 和 `progress`：
 
 ```bash
 curl -fsS http://192.0.2.2:18887/healthz
 ```
+
+任务运行时，`progress` 会显示当前 `phase`、订阅总节点数、当前阶段已完成/总计/剩余节点数及 `percent`。百分比是当前阶段的节点完成度；`quick-scan` 完成后进入更耗时的 `full-scan`，会从该阶段的 0% 重新计算。任务完成或失败后 `running` 变为 `false`，实时进度清空，结果分别记录在 `last_success` 或 `last_error`。
 
 HTTP 服务仍能响应时 `/healthz` 保持 `200`，避免第三方接口短时故障造成 Container Manager 重启循环；最近一轮检测失败时，JSON 会变为 `status: "degraded"` 并给出 `last_error`。下一轮成功后恢复为 `status: "ok"`。因此容器显示 healthy 只代表服务进程可用，日常监控还应检查 JSON 状态和 `last_success` 日期。
 

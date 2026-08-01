@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -399,10 +399,13 @@ def run_parallel(
     checker: QuickProbe | FullAuditor,
     concurrency: int,
     result_kind: str,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, QuickResult | FullResult]:
     if result_kind not in {"quick", "full"}:
         raise ValueError("result_kind must be quick or full")
     results: dict[str, QuickResult | FullResult] = {}
+    completed = 0
+    total = len(nodes)
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
         futures = {executor.submit(checker.check, node, ports[node.key]): node for node in nodes}
         for future in as_completed(futures):
@@ -414,4 +417,7 @@ def run_parallel(
                     results[node.key] = FullResult(completed=False, checked_at=utc_now(), error=str(error))
                 else:
                     results[node.key] = QuickResult(available=False, checked_at=utc_now(), error=str(error))
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, total)
     return results

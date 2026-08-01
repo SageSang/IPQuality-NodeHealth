@@ -132,6 +132,8 @@ class NodeHealthService:
         self._last_error = ""
         self._last_success = str(self.store.load_current().get("generated_at") or "")
         self._active_audit_id = ""
+        self._task_started_at = ""
+        self._progress: dict[str, Any] | None = None
 
     def status(self) -> dict[str, Any]:
         with self._status_lock:
@@ -142,7 +144,63 @@ class NodeHealthService:
                 "last_success": self._last_success or None,
                 "last_error": self._last_error or None,
                 "active_audit_id": self._active_audit_id or None,
+                "started_at": self._task_started_at or None,
+                "progress": dict(self._progress) if self._progress is not None else None,
             }
+
+    @staticmethod
+    def _progress_payload(
+        phase: str,
+        completed_nodes: int = 0,
+        total_nodes: int = 0,
+        inventory_nodes: int = 0,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        total = max(0, int(total_nodes))
+        completed = min(total, max(0, int(completed_nodes))) if total else 0
+        payload = {
+            "phase": phase,
+            "inventory_nodes": max(0, int(inventory_nodes)),
+            "completed_nodes": completed,
+            "total_nodes": total,
+            "remaining_nodes": max(0, total - completed),
+            "percent": round(completed / total * 100, 2) if total else 0.0,
+        }
+        payload.update(extra)
+        return payload
+
+    def _set_progress(
+        self,
+        phase: str,
+        completed_nodes: int = 0,
+        total_nodes: int = 0,
+        inventory_nodes: int = 0,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = self._progress_payload(
+            phase,
+            completed_nodes,
+            total_nodes,
+            inventory_nodes,
+            **extra,
+        )
+        with self._status_lock:
+            self._progress = payload
+        return payload
+
+    def _scan_progress_callback(
+        self, phase: str, inventory_nodes: int
+    ) -> Callable[[int, int], None]:
+        return lambda completed, total: self._set_progress(
+            phase, completed, total, inventory_nodes
+        )
+
+    def _clear_task_status(self) -> None:
+        with self._status_lock:
+            self._running_mode = ""
+            self._active_audit_id = ""
+            self._task_started_at = ""
+            self._progress = None
 
     def run_once(self, mode: str = "maintenance") -> dict[str, Any]:
         if mode not in {"maintenance", "rebuild"}:
@@ -152,6 +210,8 @@ class NodeHealthService:
         with self._status_lock:
             self._running_mode = mode
             self._last_error = ""
+            self._task_started_at = ""
+            self._progress = self._progress_payload("queued")
         try:
             current = self._run_locked(mode)
             with self._status_lock:
@@ -163,8 +223,7 @@ class NodeHealthService:
                 self._last_error = str(error)
             raise
         finally:
-            with self._status_lock:
-                self._running_mode = ""
+            self._clear_task_status()
             self._run_lock.release()
 
     def trigger(self, mode: str = "maintenance") -> bool:
@@ -177,6 +236,8 @@ class NodeHealthService:
         with self._status_lock:
             self._running_mode = mode
             self._last_error = ""
+            self._task_started_at = ""
+            self._progress = self._progress_payload("queued")
 
         def worker() -> None:
             try:
@@ -188,8 +249,7 @@ class NodeHealthService:
                 with self._status_lock:
                     self._last_error = str(error)
             finally:
-                with self._status_lock:
-                    self._running_mode = ""
+                self._clear_task_status()
                 self._run_lock.release()
 
         try:
@@ -200,6 +260,8 @@ class NodeHealthService:
             LOGGER.exception(message)
             with self._status_lock:
                 self._running_mode = ""
+                self._task_started_at = ""
+                self._progress = None
                 self._last_error = message
             self._run_lock.release()
             raise ScanStartError(message) from error
@@ -244,6 +306,8 @@ class NodeHealthService:
             self._running_mode = "subscription-audit"
             self._active_audit_id = audit_id
             self._last_error = ""
+            self._task_started_at = ""
+            self._progress = self._progress_payload("queued")
 
         def worker() -> None:
             try:
@@ -266,9 +330,7 @@ class NodeHealthService:
                 with self._status_lock:
                     self._last_error = f"subscription audit {audit_id} failed: {error}"
             finally:
-                with self._status_lock:
-                    self._running_mode = ""
-                    self._active_audit_id = ""
+                self._clear_task_status()
                 self._run_lock.release()
 
         try:
@@ -294,6 +356,8 @@ class NodeHealthService:
                 with self._status_lock:
                     self._running_mode = ""
                     self._active_audit_id = ""
+                    self._task_started_at = ""
+                    self._progress = None
                     self._last_error = message
                 self._run_lock.release()
             raise ScanStartError(message) from error
@@ -310,6 +374,9 @@ class NodeHealthService:
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
         started_at = started.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._status_lock:
+            self._task_started_at = started_at
+        self._set_progress("downloading")
         self.store.update_audit_status(
             audit_id,
             status="running",
@@ -329,11 +396,39 @@ class NodeHealthService:
                 f"subscription contains {len(nodes)} nodes; audit.max_nodes is {self.config.audit.max_nodes}"
             )
         source_digest = inventory_digest(nodes)
+        self._set_progress("quick-scan", 0, len(nodes), len(nodes))
         self.store.update_audit_status(
             audit_id,
             phase="quick-scan",
             node_count=len(nodes),
+            progress=self._progress_payload("quick-scan", 0, len(nodes), len(nodes)),
         )
+
+        def audit_progress_callback(
+            phase: str, inventory_nodes: int, **extra: Any
+        ) -> Callable[[int, int], None]:
+            last_persisted = -1
+
+            def update(completed: int, total: int) -> None:
+                nonlocal last_persisted
+                payload = self._set_progress(
+                    phase, completed, total, inventory_nodes, **extra
+                )
+                step = max(1, math.ceil(total / 20))
+                if completed == total or completed - last_persisted >= step:
+                    try:
+                        self.store.update_audit_status(audit_id, progress=payload)
+                    except OSError as error:
+                        LOGGER.warning(
+                            "audit %s progress persistence failed: %s",
+                            audit_id,
+                            error,
+                        )
+                    finally:
+                        last_persisted = completed
+
+            return update
+
         with self.environment.open(nodes) as ports:
             quick_raw = run_parallel(
                 nodes,
@@ -341,6 +436,7 @@ class NodeHealthService:
                 self.quick_probe,
                 self.config.probe.concurrency,
                 "quick",
+                audit_progress_callback("quick-scan", len(nodes)),
             )
             quick_results = {
                 key: value for key, value in quick_raw.items() if isinstance(value, QuickResult)
@@ -348,14 +444,18 @@ class NodeHealthService:
             if len(quick_results) != len(nodes):
                 raise RuntimeError("quick audit did not return one result for every node")
             available_nodes = [node for node in nodes if quick_results[node.key].available]
+            full_extra = {
+                "quick_completed": len(nodes),
+                "available": len(available_nodes),
+                "full_planned": len(available_nodes),
+            }
+            full_progress = self._set_progress(
+                "full-scan", 0, len(available_nodes), len(nodes), **full_extra
+            )
             self.store.update_audit_status(
                 audit_id,
                 phase="full-scan",
-                progress={
-                    "quick_completed": len(nodes),
-                    "available": len(available_nodes),
-                    "full_planned": len(available_nodes),
-                },
+                progress=full_progress,
             )
             full_raw = run_parallel(
                 available_nodes,
@@ -363,6 +463,7 @@ class NodeHealthService:
                 self.full_auditor,
                 self.config.probe.full_concurrency,
                 "full",
+                audit_progress_callback("full-scan", len(nodes), **full_extra),
             )
             full_results = {
                 key: value for key, value in full_raw.items() if isinstance(value, FullResult)
@@ -435,7 +536,12 @@ class NodeHealthService:
             }
         )
         current["source"].update(initial_status["source"])
-        self.store.update_audit_status(audit_id, phase="writing-report")
+        publishing_progress = self._set_progress(
+            "publishing", len(nodes), len(nodes), len(nodes)
+        )
+        self.store.update_audit_status(
+            audit_id, phase="writing-report", progress=publishing_progress
+        )
         reports = self.store.publish_audit(audit_id, current, assessments, completed.astimezone())
         summary = {
             "nodes": len(nodes),
@@ -459,6 +565,9 @@ class NodeHealthService:
             audit_id,
             status=outcome,
             phase="completed",
+            progress=self._progress_payload(
+                "completed", len(nodes), len(nodes), len(nodes)
+            ),
             completed_at=completed_at,
             summary=summary,
             reports=reports,
@@ -490,17 +599,23 @@ class NodeHealthService:
         started_at = self.clock()
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=timezone.utc)
+        started_iso = started_at.astimezone(timezone.utc).isoformat(timespec="seconds")
+        with self._status_lock:
+            self._task_started_at = started_iso
+        self._set_progress("downloading")
         previous = self.store.load_state()
         effective_mode = requested_mode if _has_usable_slots(previous) else "rebuild"
         nodes, source_digest = fetch_inventory(self.config, self.downloader)
 
         with self.environment.open(nodes) as ports:
+            self._set_progress("quick-scan", 0, len(nodes), len(nodes))
             quick_raw = run_parallel(
                 nodes,
                 ports,
                 self.quick_probe,
                 self.config.probe.concurrency,
                 "quick",
+                self._scan_progress_callback("quick-scan", len(nodes)),
             )
             quick_results = {key: value for key, value in quick_raw.items() if isinstance(value, QuickResult)}
             if len(quick_results) != len(nodes):
@@ -521,12 +636,14 @@ class NodeHealthService:
                 started_at.astimezone(timezone.utc),
             )
             selected_nodes = [node for node in nodes if node.key in selected]
+            self._set_progress("full-scan", 0, len(selected_nodes), len(nodes))
             full_raw = run_parallel(
                 selected_nodes,
                 ports,
                 self.full_auditor,
                 self.config.probe.full_concurrency,
                 "full",
+                self._scan_progress_callback("full-scan", len(nodes)),
             )
             scanned_full = {key: value for key, value in full_raw.items() if isinstance(value, FullResult)}
             if len(scanned_full) != len(selected_nodes):
@@ -578,6 +695,7 @@ class NodeHealthService:
                             "is below publication guard"
                         )
 
+        self._set_progress("publishing", len(nodes), len(nodes), len(nodes))
         assessments = self._assess(
             nodes,
             quick_results,
