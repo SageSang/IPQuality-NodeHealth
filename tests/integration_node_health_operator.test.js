@@ -443,6 +443,14 @@ async function testStablePortGaps() {
   assert.ok(exported.includes('socks5://192.0.2.4:62800{US one}'));
   assert.ok(exported.includes('socks5://192.0.2.4:62803{US candidate}'));
   assert.ok(!exported.some((line) => line.includes('{unresolved}') || line.includes('{dynamic-')));
+  assert.deepStrictEqual(output.dns, {
+    enable: true,
+    listen: '127.0.0.1:11553',
+    'enhanced-mode': 'fake-ip',
+    'fake-ip-range': '198.18.0.1/16',
+    'default-nameserver': ['114.114.114.114'],
+    nameserver: ['https://doh.pub/dns-query'],
+  });
   assert.strictEqual(operatorModule.STABLE_SLOT_COUNT, 3);
   assert.strictEqual(converter.STABLE_SLOT_COUNT, 3);
 }
