@@ -183,7 +183,7 @@ curl -fsS http://192.0.2.2:18887/current.json
 
 ### 日常稳定维护
 
-配置中的调度器每天 `05:30` 自动执行：
+配置中的调度器每天 `03:30` 自动执行：
 
 ```http
 POST /api/run?mode=maintenance

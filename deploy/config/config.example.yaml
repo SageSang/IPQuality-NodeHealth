@@ -15,7 +15,7 @@ http:
 
 schedule:
   enabled: true
-  time: "05:30"
+  time: "03:30"
   timezone: Asia/Shanghai
   default_mode: maintenance
 

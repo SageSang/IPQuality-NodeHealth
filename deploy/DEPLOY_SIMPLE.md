@@ -221,7 +221,7 @@ START_PORT='62000'
 
 ## 9. 日常运行
 
-默认每天 `05:30` 自动执行一次 `maintenance`。无需群晖 cron，也无需
+默认每天 `03:30` 自动执行一次 `maintenance`。无需群晖 cron，也无需
 OpenWrt 每 10 分钟读取 `current.json`。
 
 `maintenance` 每天快速检查全部节点，深检所有稳定槽位、新节点、出口 IP

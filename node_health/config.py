@@ -94,7 +94,7 @@ class PolicyConfig:
 @dataclass
 class ScheduleConfig:
     enabled: bool = True
-    time: str = "05:30"
+    time: str = "03:30"
     timezone: str = "Asia/Shanghai"
     default_mode: str = "maintenance"
 
