@@ -94,7 +94,31 @@ class FakeFull:
                 node.key,
                 {"source-a": "low", "source-b": "low"} if completed else {},
             ),
-            details={"Media": {"ChatGPT": {"Status": status}}} if completed else {},
+            details={
+                "Info": {
+                    "ASN": "15169",
+                    "Organization": "Google LLC",
+                    "Latitude": "34.0522",
+                    "Longitude": "-118.2437",
+                    "Map": "https://check.place/34.0522,-118.2437,15,en",
+                    "TimeZone": "America/Los_Angeles",
+                    "City": {
+                        "Name": "Los Angeles",
+                        "PostalCode": "90001",
+                        "SubCode": "CA",
+                        "Subdivisions": "California",
+                    },
+                    "Region": {"Code": "US", "Name": "United States"},
+                    "RegisteredRegion": {
+                        "Code": "US",
+                        "Name": "United States",
+                    },
+                    "Type": "Geo-consistent",
+                },
+                "Media": {"ChatGPT": {"Status": status}},
+            }
+            if completed
+            else {},
             checked_at="2026-07-24T00:01:00+00:00",
             error="" if completed else "provider timeout",
         )
@@ -145,6 +169,35 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     assert "62800" in report
     assert "socks5://127.0.0.1:62800{" in report
     assert "Exit IP" in report
+    assert "Los Angeles" in report
+    report_json = json.loads(
+        (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    geo = report_json["nodes"][0]["geo"]
+    assert geo == {
+        "asn": "15169",
+        "city_name": "Los Angeles",
+        "country_code": "US",
+        "country_name": "United States",
+        "exit_ip": "8.8.8.1",
+        "latitude": 34.0522,
+        "location_type": "Geo-consistent",
+        "longitude": -118.2437,
+        "map_url": "https://check.place/34.0522,-118.2437,15,en",
+        "observed_at": "2026-07-24T00:01:00+00:00",
+        "organization": "Google LLC",
+        "postal_code": "90001",
+        "registered_country_code": "US",
+        "registered_country_name": "United States",
+        "result_source": "fresh",
+        "source": "ipquality.Info",
+        "subdivision_code": "CA",
+        "subdivision_name": "California",
+        "timezone": "America/Los_Angeles",
+    }
+    assert "geo" not in current["nodes"][next(iter(current["nodes"]))]
 
 
 def test_unsampled_dynamic_nodes_keep_their_previous_score(tmp_path):
@@ -172,6 +225,15 @@ def test_unsampled_dynamic_nodes_keep_their_previous_score(tmp_path):
     assert any(
         second["nodes"][key]["score"] != previous_scores[key]
         for key in dynamic & audited
+    )
+    report = json.loads(
+        (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    report_nodes = {item["node_key"]: item for item in report["nodes"]}
+    assert all(
+        report_nodes[key]["geo"]["result_source"] == "cached" for key in unsampled
     )
 
 

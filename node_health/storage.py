@@ -407,6 +407,7 @@ def _assessment_detail(
         "name": assessment.node.name,
         "region": assessment.node.region,
         "connection": _connection_detail(assessment),
+        "geo": _geo_detail(assessment, include_exit_ip),
         "quick": quick,
         "full": full,
         "full_result_source": (
@@ -426,6 +427,87 @@ def _assessment_detail(
         "fresh_full_completed": assessment.fresh_full_completed,
         "fresh_full_usable": assessment.fresh_full_usable,
     }
+
+
+def _clean_geo_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "n/a"}:
+        return None
+    return text
+
+
+def _geo_number(value: Any) -> float | None:
+    text = _clean_geo_text(value)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _geo_detail(
+    assessment: NodeAssessment, include_exit_ip: bool
+) -> dict[str, Any]:
+    full = assessment.full
+    details = full.details if full and isinstance(full.details, dict) else {}
+    info_value = details.get("Info")
+    info = info_value if isinstance(info_value, dict) else {}
+    city_value = info.get("City")
+    city = city_value if isinstance(city_value, dict) else {}
+    country_value = info.get("Region")
+    country = country_value if isinstance(country_value, dict) else {}
+    registered_value = info.get("RegisteredRegion")
+    registered = registered_value if isinstance(registered_value, dict) else {}
+    has_full_geo = bool(info)
+    result_source = (
+        "fresh"
+        if has_full_geo
+        and assessment.fresh_full_attempt is not None
+        and assessment.full is assessment.fresh_full_attempt
+        else ("cached" if has_full_geo else "quick")
+    )
+    payload: dict[str, Any] = {
+        "country_code": (
+            _clean_geo_text(country.get("Code"))
+            or _clean_geo_text(assessment.quick.country)
+        ),
+        "country_name": _clean_geo_text(country.get("Name")),
+        "registered_country_code": _clean_geo_text(registered.get("Code")),
+        "registered_country_name": _clean_geo_text(registered.get("Name")),
+        "subdivision_code": _clean_geo_text(city.get("SubCode")),
+        "subdivision_name": _clean_geo_text(city.get("Subdivisions")),
+        "city_name": _clean_geo_text(city.get("Name")),
+        "postal_code": _clean_geo_text(city.get("PostalCode")),
+        "asn": (
+            _clean_geo_text(info.get("ASN"))
+            or _clean_geo_text(assessment.quick.asn)
+        ),
+        "organization": _clean_geo_text(info.get("Organization")),
+        "timezone": _clean_geo_text(info.get("TimeZone")),
+        "latitude": _geo_number(info.get("Latitude")),
+        "longitude": _geo_number(info.get("Longitude")),
+        "map_url": _clean_geo_text(info.get("Map")),
+        "location_type": _clean_geo_text(info.get("Type")),
+        "observed_at": (
+            _clean_geo_text(full.checked_at)
+            or _clean_geo_text(assessment.quick.checked_at)
+            if has_full_geo and full is not None
+            else _clean_geo_text(assessment.quick.checked_at)
+        ),
+        "source": "ipquality.Info" if has_full_geo else "quick-probe",
+        "result_source": result_source,
+    }
+    if include_exit_ip:
+        payload["exit_ip"] = (
+            _clean_geo_text(full.audited_exit_ip)
+            or _clean_geo_text(assessment.quick.exit_ip)
+            if has_full_geo and full is not None
+            else _clean_geo_text(assessment.quick.exit_ip)
+        )
+    return payload
 
 
 def _connection_detail(assessment: NodeAssessment) -> dict[str, Any]:
@@ -688,9 +770,10 @@ def build_report_markdown(
             "",
             "## Current order and checks",
             "",
-            "| Region | Position | Port | SOCKS5 | Node | Exit IP | ASN | Latency | "
-            "Success | Score | Confidence | Decision |",
-            "|---|---|---:|---|---|---|---|---:|---:|---:|---|---|",
+            "| Region | Position | Port | SOCKS5 | Node | Exit IP | Country | "
+            "State / Province | City | ASN | Organization | Latency | Success | "
+            "Score | Confidence | Decision |",
+            "|---|---|---:|---|---|---|---|---|---|---|---|---:|---:|---:|---|---|",
         ]
     )
     region_indexes = {
@@ -728,10 +811,18 @@ def build_report_markdown(
         reason = ", ".join(item.evaluation.reasons)
         decision = item.evaluation.decision + (f" ({reason})" if reason else "")
         name = item.node.name.replace("|", "\\|")
-        asn = item.quick.asn.replace("|", "\\|")
+        geo = _geo_detail(item, include_exit_ip)
+        country = str(geo.get("country_name") or geo.get("country_code") or "-").replace(
+            "|", "\\|"
+        )
+        subdivision = str(geo.get("subdivision_name") or "-").replace("|", "\\|")
+        city = str(geo.get("city_name") or "-").replace("|", "\\|")
+        asn = str(geo.get("asn") or "-").replace("|", "\\|")
+        organization = str(geo.get("organization") or "-").replace("|", "\\|")
         lines.append(
             f"| {item.node.region} | {position} | {port} | `{socks5}` | {name} | "
-            f"{(item.quick.exit_ip or '-') if include_exit_ip else '[omitted]'} | {asn or '-'} | "
+            f"{(item.quick.exit_ip or '-') if include_exit_ip else '[omitted]'} | "
+            f"{country} | {subdivision} | {city} | {asn} | {organization} | "
             f"{latency} | {item.quick.success_rate:.0%} | {item.evaluation.score:.2f} | "
             f"{item.evaluation.confidence} | {decision} |"
         )
@@ -747,6 +838,7 @@ def build_report_markdown(
         full = detail["full"]
         fresh = detail["fresh_full_attempt"]
         connection = detail["connection"]
+        geo = detail["geo"]
         reasons = ", ".join(item.evaluation.reasons) or "none"
         connection_text = ", ".join(
             f"{key}={value}" for key, value in connection.items()
@@ -778,6 +870,14 @@ def build_report_markdown(
                 f"`{quick.get('country') or '-'}`; ASN: "
                 f"`{_markdown_escape(quick.get('asn') or '-')}`; stable IP: "
                 f"`{quick.get('exit_ip_stable')}`",
+                f"- Location: country=`{_markdown_escape(geo.get('country_name') or geo.get('country_code') or '-')}`; "
+                f"state/province=`{_markdown_escape(geo.get('subdivision_name') or '-')}`; "
+                f"city=`{_markdown_escape(geo.get('city_name') or '-')}`; "
+                f"postal code=`{_markdown_escape(geo.get('postal_code') or '-')}`",
+                f"- Geolocation evidence: organization=`{_markdown_escape(geo.get('organization') or '-')}`; "
+                f"timezone=`{_markdown_escape(geo.get('timezone') or '-')}`; "
+                f"source=`{geo.get('source')}`; result=`{geo.get('result_source')}`; "
+                f"observed at=`{geo.get('observed_at') or '-'}`",
                 f"- Service checks: Google=`{quick.get('google_ok')}`; "
                 f"ChatGPT=`{quick.get('chatgpt_ok')}`",
                 f"- Quick error: {_markdown_escape(quick.get('error') or 'none')}",

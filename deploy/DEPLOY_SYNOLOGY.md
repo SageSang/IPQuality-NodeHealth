@@ -287,7 +287,7 @@ reports/
 └── alerts/                             # 稳定槽位状态与变化
 ```
 
-Markdown 报告包含总览、稳定槽、实际端口、当前顺序和每个节点的可用性、出口 IP、国家、ASN、延迟、成功率、Google/ChatGPT、评分、置信度、风险原因、可信深检与本轮深检状态。开启 `include_raw_details` 时，每个节点还包含完整格式化的 IPQuality JSON；JSON 报告保留同样的结构化字段。
+Markdown 报告包含总览、稳定槽、实际端口、当前顺序和每个节点的可用性、出口 IP、国家、州/省、城市、ASN、运营商、延迟、成功率、Google/ChatGPT、评分、置信度、风险原因、可信深检与本轮深检状态。开启 `include_raw_details` 时，每个节点还包含完整格式化的 IPQuality JSON。JSON 报告在 `nodes[].geo` 中提供规范化地理信息，并用 `result_source` 标明结果来自本轮可信深检、缓存深检或快速检测；它不会改变 `current.json`、状态文件或 Sub-Store 排序协议。
 
 ### 临时订阅全量审计
 

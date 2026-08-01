@@ -105,6 +105,10 @@ remains old; reports are observability artifacts, not recovery state.
 
 The dated `reports/YYYY-MM-DD.md` and `.json` files describe the latest run
 written for that date and are retained for the configured number of days.
+Each report node has a normalized `geo` object for its observed exit IP,
+country, subdivision, city, ASN, organization, timezone, coordinates, source,
+observation time, and fresh/cached status. These report-only fields are not
+part of `current.json` and are never consumed for ranking recovery.
 `reports/alerts/latest-run.md` is refreshed for every publication.
 `slot-changes-latest.md` is created initially and thereafter changes only when
 a stable identity changes. Each such change also creates an immutable
