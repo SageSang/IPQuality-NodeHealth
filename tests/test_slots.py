@@ -225,6 +225,45 @@ def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown(
     assert changes == []
 
 
+def test_default_promotion_requires_three_passes_and_twenty_point_margin():
+    previous_slots = {"united-states": {"1": "a", "2": "b", "3": "c"}}
+    policy = PolicyConfig()
+
+    def run(candidate_score: float, passes: int):
+        items = [
+            assessment("a", 60, confidence="high", passes=3),
+            assessment("b", 70, confidence="high", passes=3),
+            assessment("c", 75, confidence="high", passes=3),
+            assessment("f", candidate_score, confidence="high", passes=passes),
+        ]
+        previous_nodes = {
+            item.node.key: {"last_score": item.evaluation.score} for item in items
+        }
+        return assign_all_regions(
+            "maintenance",
+            items,
+            previous_slots,
+            3,
+            ["united-states"],
+            previous_nodes,
+            policy,
+            {"united-states": {"1": "2026-07-01T00:00:00+00:00"}},
+            datetime(2026, 7, 24, tzinfo=timezone.utc),
+        )
+
+    regions, changes = run(80, 2)
+    assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
+    assert changes == []
+
+    regions, changes = run(79, 3)
+    assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
+    assert changes == []
+
+    regions, changes = run(80, 3)
+    assert regions["united-states"]["stable_slots"]["1"] == "f"
+    assert [change["reason"] for change in changes] == ["superior-candidate"]
+
+
 def test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence():
     previous_slots = {
         "united-states": {"1": "a", "2": "b", "3": "c"}

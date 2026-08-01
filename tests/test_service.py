@@ -54,6 +54,7 @@ class FakeQuick:
         self.unavailable_names = set()
         self.unstable = set()
         self.exit_ips = {}
+        self.latencies = {}
 
     def check(self, node, port):
         available = node.key not in self.unavailable and node.name not in self.unavailable_names
@@ -63,7 +64,7 @@ class FakeQuick:
             exit_ip=self.exit_ips.get(node.key, f"8.8.8.{index}"),
             country="US",
             asn="AS15169",
-            latency_ms=float(index) * 20,
+            latency_ms=self.latencies.get(node.key, float(index) * 20),
             success_rate=1.0 if available else 0,
             exit_ip_stable=node.key not in self.unstable,
             google_ok=True,
@@ -144,6 +145,34 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     assert "62800" in report
     assert "socks5://127.0.0.1:62800{" in report
     assert "Exit IP" in report
+
+
+def test_unsampled_dynamic_nodes_keep_their_previous_score(tmp_path):
+    service, quick, full, _ = make_service(tmp_path, count=12)
+    first = service.run_once("rebuild")
+    stable = set(first["regions"]["united-states"]["stable_slots"].values())
+    dynamic = set(first["regions"]["united-states"]["ranked"])
+    previous_scores = {
+        key: first["nodes"][key]["score"] for key in dynamic
+    }
+
+    for key in dynamic:
+        quick.latencies[key] = 5000
+    full.calls.clear()
+    second = service.run_once("maintenance")
+    audited = set(full.calls)
+    unsampled = dynamic - audited
+
+    assert stable.issubset(audited)
+    assert unsampled
+    assert all(
+        second["nodes"][key]["score"] == previous_scores[key]
+        for key in unsampled
+    )
+    assert any(
+        second["nodes"][key]["score"] != previous_scores[key]
+        for key in dynamic & audited
+    )
 
 
 def test_unchanged_runtime_projection_keeps_version_stable(tmp_path):

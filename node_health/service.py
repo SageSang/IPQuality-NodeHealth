@@ -730,6 +730,17 @@ class NodeHealthService:
                 previous_exit_ip=str(prior.get("last_exit_ip") or ""),
                 was_stable=node.key in stable_keys,
             )
+            if (
+                node.key not in stable_keys
+                and quick.available
+                and safe_prior_full is not None
+                and not fresh_is_trustworthy
+                and prior.get("last_score") is not None
+            ):
+                try:
+                    evaluation.score = float(prior["last_score"])
+                except (TypeError, ValueError):
+                    pass
             if fresh_full is not None and not fresh_full.completed:
                 evaluation.reasons.append("full-audit-incomplete")
             if fresh_full is not None and evaluation.confidence == "low":

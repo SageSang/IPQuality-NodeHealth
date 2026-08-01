@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import PolicyConfig
@@ -454,8 +454,13 @@ def select_full_audit_nodes(
 
     selected: set[str] = set()
     prior_nodes = previous_state.get("nodes", {})
-    for slots in previous_state.get("stable_slots", {}).values():
-        selected.update(str(value) for value in slots.values() if value)
+    stable_keys = {
+        str(value)
+        for slots in previous_state.get("stable_slots", {}).values()
+        for value in slots.values()
+        if value
+    }
+    selected.update(stable_keys)
 
     for node in available:
         prior = prior_nodes.get(node.key)
@@ -465,27 +470,48 @@ def select_full_audit_nodes(
             continue
         if prior.get("last_exit_ip") and prior.get("last_exit_ip") != quick.exit_ip:
             selected.add(node.key)
-        checked_at = _parse_time(prior.get("last_full_checked_at"))
-        threshold = (now or datetime.now(timezone.utc)) - timedelta(
-            hours=policy.full_audit_max_age_hours
-        )
-        if checked_at is None or checked_at < threshold:
-            selected.add(node.key)
 
     by_region: dict[str, list[Node]] = {}
     for node in available:
-        by_region.setdefault(node.region, []).append(node)
+        if node.key not in stable_keys:
+            by_region.setdefault(node.region, []).append(node)
+
+    def prior_score(node: Node) -> float:
+        try:
+            return float(prior_nodes.get(node.key, {}).get("last_score") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def review_age_key(node: Node) -> tuple[datetime, str]:
+        checked_at = _parse_time(
+            prior_nodes.get(node.key, {}).get("last_full_checked_at")
+        )
+        return checked_at or datetime.min.replace(tzinfo=timezone.utc), node.key
+
     for region_nodes in by_region.values():
         region_nodes.sort(
             key=lambda node: (
-                -(quick_results[node.key].success_rate),
-                quick_results[node.key].latency_ms
-                if quick_results[node.key].latency_ms is not None
-                else float("inf"),
+                -prior_score(node),
                 node.key,
             )
         )
-        selected.update(
-            node.key for node in region_nodes[: policy.full_audit_top_candidates]
+        mandatory = {node.key for node in region_nodes if node.key in selected}
+        rotation = [node for node in region_nodes if node.key not in mandatory]
+        sample_count = math.ceil(
+            len(rotation) * policy.full_audit_daily_fraction
         )
+        for sample_index in range(sample_count):
+            start = sample_index * len(rotation) // sample_count
+            end = (sample_index + 1) * len(rotation) // sample_count
+            block = rotation[start:end]
+            selected.add(min(block, key=review_age_key).key)
+
+        challengers = [
+            node
+            for node in region_nodes
+            if node.key in prior_nodes
+            and prior_nodes[node.key].get("last_decision") in {None, "eligible"}
+        ][: policy.promotion_challengers_per_region]
+        selected.update(node.key for node in challengers)
+
     return {key for key in selected if key in quick_results and quick_results[key].available}

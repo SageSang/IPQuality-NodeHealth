@@ -114,6 +114,12 @@ def test_deployment_config_classifies_chinese_taipei_names(monkeypatch):
 
     assert classify_region("台北 01", config.region_patterns) == "taiwan"
     assert classify_region("臺北 01", config.region_patterns) == "taiwan"
+    assert config.probe.full_concurrency == 3
+    assert config.policy.full_audit_daily_fraction == 0.25
+    assert config.policy.promotion_challengers_per_region == 1
+    assert config.policy.promotion_min_full_passes == 3
+    assert config.policy.promotion_score_margin == 20
+    assert config.policy.promotion_cooldown_days == 3
 
 
 def test_config_rejects_region_without_fixed_openwrt_port_block(tmp_path):

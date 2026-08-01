@@ -31,7 +31,7 @@ probe:
   startup_timeout_seconds: 30
   request_timeout_seconds: 15
   concurrency: 8
-  full_concurrency: 2
+  full_concurrency: 3
   samples: 3
   ip_url: https://api.ipify.org?format=json
   geo_url_template: https://ipapi.co/{ip}/json/
@@ -47,8 +47,12 @@ policy:
   # that slot with the best fully qualified candidate. A node absent from the
   # inventory is removed immediately instead of using this grace period.
   stable_unavailable_replace_after_runs: 3
-  full_audit_top_candidates: 10
-  full_audit_max_age_hours: 48
+  # Deep-audit one node from each four-node ranking block, preferring the
+  # least-recently audited member. This covers the dynamic pool in about 4 days.
+  full_audit_daily_fraction: 0.25
+  # Recheck the best non-stable node in every region each day so a sustained
+  # promotion is based on consecutive fresh evidence.
+  promotion_challengers_per_region: 1
   min_full_passes_high_confidence: 2
   minimum_publish_available_ratio: 0.2
   # A rebuild still probes every available node, but isolated third-party
@@ -67,10 +71,10 @@ policy:
   # Controlled maintenance promotion. A transiently unavailable or missing
   # stable identity is never used as the weakest comparison target.
   promotion_enabled: true
-  promotion_min_full_passes: 2
-  promotion_score_margin: 12
+  promotion_min_full_passes: 3
+  promotion_score_margin: 20
   promotion_max_per_region_per_run: 1
-  promotion_cooldown_days: 7
+  promotion_cooldown_days: 3
   expected_country:
     hong-kong: HK
     taiwan: TW

@@ -565,3 +565,69 @@ def test_full_audit_selection_modes_and_stale_history():
     now = datetime(2026, 7, 24, 12, tzinfo=timezone.utc)
     assert select_full_audit_nodes("rebuild", nodes, results, prior, policy, now) == {"a", "b"}
     assert select_full_audit_nodes("maintenance", nodes, results, prior, policy, now) == {"a", "b"}
+
+
+def test_maintenance_samples_oldest_quarter_across_dynamic_ranking():
+    nodes = [node(key) for key in "abcdefghi"]
+    results = {item.key: quick() for item in nodes}
+    prior_nodes = {
+        item.key: {
+            "last_exit_ip": "8.8.8.8",
+            "last_score": 100 - index,
+            "last_full_checked_at": f"2026-07-{20 + (index % 4):02d}T00:00:00+00:00",
+        }
+        for index, item in enumerate(nodes)
+    }
+    prior = {
+        "stable_slots": {"united-states": {"1": "a"}},
+        "nodes": prior_nodes,
+    }
+    policy = PolicyConfig(
+        full_audit_daily_fraction=0.25,
+        promotion_challengers_per_region=1,
+    )
+
+    selected = select_full_audit_nodes(
+        "maintenance",
+        nodes,
+        results,
+        prior,
+        policy,
+        datetime(2026, 7, 24, 12, tzinfo=timezone.utc),
+    )
+
+    # a is stable, b is the best dynamic challenger, and e/i are the oldest
+    # members of two evenly distributed four-node ranking blocks.
+    assert selected == {"a", "b", "e", "i"}
+
+
+def test_maintenance_always_audits_new_and_changed_egress_nodes():
+    nodes = [node(key) for key in "abcde"]
+    results = {item.key: quick() for item in nodes}
+    results["d"] = quick(exit_ip="1.1.1.1")
+    prior = {
+        "stable_slots": {"united-states": {"1": "a"}},
+        "nodes": {
+            key: {
+                "last_exit_ip": "8.8.8.8",
+                "last_score": 90 - index,
+                "last_full_checked_at": "2026-07-24T00:00:00+00:00",
+            }
+            for index, key in enumerate("abcd")
+        },
+    }
+    policy = PolicyConfig(
+        full_audit_daily_fraction=0.25,
+        promotion_challengers_per_region=0,
+    )
+
+    selected = select_full_audit_nodes(
+        "maintenance",
+        nodes,
+        results,
+        prior,
+        policy,
+        datetime(2026, 7, 24, 12, tzinfo=timezone.utc),
+    )
+
+    assert {"a", "d", "e"}.issubset(selected)

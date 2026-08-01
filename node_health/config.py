@@ -61,7 +61,7 @@ class ProbeConfig:
     startup_timeout_seconds: float = 20.0
     request_timeout_seconds: float = 12.0
     concurrency: int = 12
-    full_concurrency: int = 2
+    full_concurrency: int = 3
     samples: int = 3
     ip_url: str = "https://api.ipify.org?format=json"
     geo_url_template: str = "https://ipapi.co/{ip}/json/"
@@ -75,6 +75,8 @@ class PolicyConfig:
     stable_unavailable_replace_after_runs: int = 3
     full_audit_top_candidates: int = 10
     full_audit_max_age_hours: int = 48
+    full_audit_daily_fraction: float = 0.25
+    promotion_challengers_per_region: int = 1
     min_full_passes_high_confidence: int = 2
     minimum_publish_available_ratio: float = 0.2
     minimum_rebuild_full_completion_ratio: float = 0.8
@@ -82,10 +84,10 @@ class PolicyConfig:
     dnsbl_redline_threshold: int = 3
     minimum_candidate_success_rate: float = 0.6666
     promotion_enabled: bool = True
-    promotion_min_full_passes: int = 2
-    promotion_score_margin: float = 12.0
+    promotion_min_full_passes: int = 3
+    promotion_score_margin: float = 20.0
     promotion_max_per_region_per_run: int = 1
-    promotion_cooldown_days: int = 7
+    promotion_cooldown_days: int = 3
     expected_country: dict[str, str] = field(default_factory=dict)
 
 
@@ -243,6 +245,14 @@ def _validate_config(config: AppConfig, local_socks_raw: dict[str, Any]) -> None
         raise ValueError("policy.minimum_candidate_success_rate must be in (0, 1]")
     if config.policy.full_audit_max_age_hours <= 0:
         raise ValueError("policy.full_audit_max_age_hours must be positive")
+    if not 0 < config.policy.full_audit_daily_fraction <= 1:
+        raise ValueError("policy.full_audit_daily_fraction must be in (0, 1]")
+    if config.policy.promotion_challengers_per_region < 0:
+        raise ValueError(
+            "policy.promotion_challengers_per_region must not be negative"
+        )
+    if config.probe.concurrency < 1 or config.probe.full_concurrency < 1:
+        raise ValueError("probe concurrency values must be positive")
     if config.probe.start_port < 1024 or config.probe.start_port > 65535:
         raise ValueError("probe.start_port must be in 1024..65535")
     if config.http.port < 1 or config.http.port > 65535:
