@@ -73,6 +73,7 @@ class NodeAssessment:
     full: FullResult | None
     evaluation: Evaluation
     consecutive_full_passes: int = 0
+    consecutive_unavailable_runs: int = 0
     fresh_full_completed: bool = False
     fresh_full_usable: bool = False
     fresh_full_attempt: FullResult | None = None

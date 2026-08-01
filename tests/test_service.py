@@ -177,6 +177,7 @@ def test_maintenance_keeps_temporarily_unavailable_stable_slot(tmp_path):
     assert before[failed_slot] not in region["rejected"]
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
     assert state["nodes"][before[failed_slot]]["last_score"] == prior_score
+    assert state["nodes"][before[failed_slot]]["consecutive_unavailable_runs"] == 1
     latest = (tmp_path / "data" / "reports" / "alerts" / "latest-run.md").read_text(
         encoding="utf-8"
     )
@@ -207,7 +208,7 @@ def test_maintenance_quality_redline_replaces_only_one_slot(tmp_path):
     assert any("quality-redline" in path.read_text(encoding="utf-8") for path in history)
 
 
-def test_missing_inventory_node_stays_as_ghost_slot(tmp_path):
+def test_missing_inventory_node_is_immediately_replaced(tmp_path):
     service, _, _, source = make_service(tmp_path)
     first = service.run_once("rebuild")
     before = first["regions"]["united-states"]["stable_slots"]
@@ -216,15 +217,63 @@ def test_missing_inventory_node_stays_as_ghost_slot(tmp_path):
 
     second = service.run_once("maintenance")
     region = second["regions"]["united-states"]
-    assert region["stable_slots"] == before
-    assert region["stable_status"]["3"]["status"] == "absent"
-    assert second["nodes"][ghost_key]["decision"] == "absent"
+    assert region["stable_slots"]["1"] == before["1"]
+    assert region["stable_slots"]["2"] == before["2"]
+    assert region["stable_slots"]["3"] != ghost_key
+    assert ghost_key not in second["nodes"]
     report = (tmp_path / "data" / "reports" / "2026-07-24.md").read_text(encoding="utf-8")
     assert "missing-from-inventory" in report
-    latest = (tmp_path / "data" / "reports" / "alerts" / "latest-run.md").read_text(
+    changes = (tmp_path / "data" / "reports" / "alerts" / "slot-changes-latest.md").read_text(
         encoding="utf-8"
     )
-    assert "absent" in latest
+    assert "missing-from-inventory" in changes
+
+
+def test_three_consecutive_unavailable_runs_replace_only_that_slot(tmp_path):
+    service, quick, _, _ = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    before = first["regions"]["united-states"]["stable_slots"]
+    failed_slot = "2"
+    failed_key = before[failed_slot]
+    quick.unavailable.add(failed_key)
+
+    for expected_runs in (1, 2):
+        current = service.run_once("maintenance")
+        assert current["regions"]["united-states"]["stable_slots"] == before
+        state = json.loads(
+            (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+        )
+        assert state["nodes"][failed_key]["consecutive_unavailable_runs"] == expected_runs
+
+    current = service.run_once("maintenance")
+    after = current["regions"]["united-states"]["stable_slots"]
+    assert after[failed_slot] != failed_key
+    assert after["1"] == before["1"]
+    assert after["3"] == before["3"]
+    report = json.loads(
+        (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert any(
+        change["slot"] == failed_slot
+        and change["reason"] == "repeated-unavailable"
+        for change in report["slot_changes"]
+    )
+
+
+def test_reachable_stable_node_resets_unavailable_counter(tmp_path):
+    service, quick, _, _ = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    key = first["regions"]["united-states"]["stable_slots"]["1"]
+    quick.unavailable.add(key)
+    service.run_once("maintenance")
+
+    quick.unavailable.remove(key)
+    current = service.run_once("maintenance")
+    state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
+    assert current["regions"]["united-states"]["stable_slots"]["1"] == key
+    assert state["nodes"][key]["consecutive_unavailable_runs"] == 0
 
 
 def test_unchanged_rebuild_resets_cooldown_without_slot_change_alert(tmp_path):

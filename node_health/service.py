@@ -715,6 +715,12 @@ class NodeHealthService:
             elif fresh_full is not None:
                 passes = 0
 
+            unavailable_runs = 0
+            if not quick.available and node.key in stable_keys:
+                unavailable_runs = int(
+                    prior.get("consecutive_unavailable_runs", 0) or 0
+                ) + 1
+
             evaluation = evaluate_node(
                 node,
                 quick,
@@ -745,6 +751,7 @@ class NodeHealthService:
                     full=full,
                     evaluation=evaluation,
                     consecutive_full_passes=passes,
+                    consecutive_unavailable_runs=unavailable_runs,
                     fresh_full_completed=bool(fresh_full and fresh_full.completed),
                     fresh_full_usable=full_has_usable_reputation(
                         fresh_full, self.config.policy
@@ -809,6 +816,7 @@ class NodeHealthService:
                 "confidence": item.evaluation.confidence,
                 "decision": item.evaluation.decision,
                 "reasons": item.evaluation.reasons,
+                "consecutive_unavailable_runs": item.consecutive_unavailable_runs,
             }
             for item in assessments
         }
@@ -907,6 +915,7 @@ class NodeHealthService:
                     else prior.get("last_full_attempt_error", "")
                 ),
                 "consecutive_full_passes": item.consecutive_full_passes,
+                "consecutive_unavailable_runs": item.consecutive_unavailable_runs,
                 "last_score": (
                     prior.get("last_score", item.evaluation.score)
                     if item.node.key in assigned_keys

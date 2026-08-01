@@ -4,6 +4,10 @@ This deployment path keeps Synology on a Compose/YAML workflow. GitHub builds
 the application image; Synology only pulls and recreates the project. Runtime
 state, reports, configuration, and secrets remain outside the image.
 
+For the complete recommended Sub-Store and OpenWrt data flow, use
+`deploy/DEPLOY_SIMPLE.md`. This file only describes image delivery and
+Container Manager updates.
+
 ## 1. Publish an image
 
 Pushing `main` runs `.github/workflows/publish-container.yml` and publishes:

@@ -11,17 +11,17 @@ import yaml
 
 
 DEFAULT_REGION_PATTERNS = {
-    "hong-kong": [r"香港|港(?:[^A-Za-z]|$)|\bHK\b|Hong\s*Kong"],
-    "taiwan": [r"台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|\bTW\b|Taiwan|Taipei"],
-    "japan": [r"日本|\bJP\b|Japan|Tokyo|Osaka"],
-    "singapore": [r"新加坡|狮城|獅城|\bSG\b|Singapore"],
-    "united-states": [r"美国|美國|\bUS\b|\bUSA\b|United\s*States|洛杉矶|洛杉磯|西雅图|纽约"],
-    "south-korea": [r"韩国|韓國|\bKR\b|Korea|首尔|首爾"],
-    "united-kingdom": [r"英国|英國|\bUK\b|Britain|United\s*Kingdom|London"],
-    "germany": [r"德国|德國|\bDE\b|Germany|Frankfurt"],
-    "france": [r"法国|法國|\bFR\b|France|Paris"],
-    "canada": [r"加拿大|\bCA\b|Canada|Toronto"],
-    "australia": [r"澳大利亚|澳大利亞|澳洲|\bAU\b|Australia|Sydney"],
+    "hong-kong": [r"🇭🇰|香港|港(?:[^A-Za-z]|$)|Hong\s*Kong|(?-i:\bHK\b)"],
+    "taiwan": [r"🇹🇼|台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|Taiwan|Taipei|Hinet|(?-i:\bTW\b)"],
+    "japan": [r"🇯🇵|日本|Japan|Tokyo|Osaka|东京|大阪|(?-i:\bJP\b)"],
+    "singapore": [r"🇸🇬|新加坡|狮城|獅城|Singapore|(?-i:\bSG\b)"],
+    "united-states": [r"🇺🇸|美国|美國|United\s*States|Los\s*Angeles|San\s*Francisco|Seattle|New\s*York|洛杉矶|洛杉磯|西雅图|西雅圖|纽约|紐約|夏威夷|(?-i:\bUS\b)|(?-i:\bUSA\b)"],
+    "south-korea": [r"🇰🇷|韩国|韓國|South\s*Korea|Korea|Seoul|首尔|首爾|(?-i:\bKR\b)"],
+    "united-kingdom": [r"🇬🇧|英国|英國|United\s*Kingdom|Great\s*Britain|Britain|England|London|Manchester|伦敦|倫敦|(?-i:\bUK\b)"],
+    "germany": [r"🇩🇪|德国|德國|Germany|Deutschland|Frankfurt|Berlin|法兰克福|法蘭克福|(?-i:\bDE\b)"],
+    "france": [r"🇫🇷|法国|法國|France|Paris|巴黎|(?-i:\bFR\b)"],
+    "canada": [r"🇨🇦|加拿大|Canada|Toronto|Vancouver|多伦多|多倫多|(?-i:\bCA\b)"],
+    "australia": [r"🇦🇺|澳大利亚|澳大利亞|澳洲|Australia|Sydney|Melbourne|Perth|Brisbane|悉尼|(?-i:\bAU\b)"],
 }
 
 DEFAULT_REGION_PORT_BASES = {
@@ -72,6 +72,7 @@ class ProbeConfig:
 @dataclass
 class PolicyConfig:
     stable_slots: int = 3
+    stable_unavailable_replace_after_runs: int = 3
     full_audit_top_candidates: int = 10
     full_audit_max_age_hours: int = 48
     min_full_passes_high_confidence: int = 2
@@ -212,6 +213,10 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
 def _validate_config(config: AppConfig, local_socks_raw: dict[str, Any]) -> None:
     if config.policy.stable_slots != 3:
         raise ValueError("policy.stable_slots must be 3 for the Sub-Store/OpenWrt contract")
+    if config.policy.stable_unavailable_replace_after_runs < 1:
+        raise ValueError(
+            "policy.stable_unavailable_replace_after_runs must be positive"
+        )
     if int(local_socks_raw.get("stable_slots", 3)) != 3:
         raise ValueError("local_socks.stable_slots must be 3")
     if int(local_socks_raw.get("dynamic_offset", 3)) != 3:

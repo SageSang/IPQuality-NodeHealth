@@ -4,9 +4,17 @@ This directory contains the integration boundary between the Synology
 `node-health` service, Sub-Store, and the existing OpenWrt `local-socks`
 instance. None of these files contains a subscription URL or credential.
 
+The recommended deployment is the simplified path documented in
+`deploy/DEPLOY_SIMPLE.md`: Sub-Store consumes `current.json`, and OpenWrt
+continues to consume only the resulting `healthy` subscription with the
+existing `rule_conf` converter. The direct OpenWrt poller and stable-port
+converter below are retained as an optional advanced design and are not part
+of the current rollout.
+
 ## `current.json`
 
-The Sub-Store operator and stable-port converter consume the same document:
+The Sub-Store operator, and optionally the advanced stable-port converter,
+consume the same document:
 
 ```json
 {
@@ -68,11 +76,10 @@ allow-list that matches zero input proxies throws an identity-drift error; an
 intentional all-rejected state has an empty allow-list and returns `[]`.
 
 Stable-slot membership is authoritative over a transient rejection such as
-`quick_unavailable`: if that proxy is still present in the healthy source it
-remains in its slot and keeps its fixed port. If the proxy has disappeared
-from the source, no listener is generated for that slot and later slots do not
-move forward. Hard-danger removal is represented by removing the key from
-`stable_slots` in the published state.
+`quick_unavailable` while its consecutive-failure grace period remains. At the
+configured threshold, or immediately when the identity disappears from the
+full inventory, node-health removes/replaces that key in `stable_slots`.
+Hard-danger removal uses the same published-state transition.
 
 `version` is an opaque, non-empty string. The OpenWrt poller compares it for
 equality and writes it only after a successful atomic apply.

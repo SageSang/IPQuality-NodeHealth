@@ -59,7 +59,17 @@ def test_minimal_loopback_config_is_valid(tmp_path):
     config = load_config(write_config(tmp_path / "config.yaml"))
     assert config.http.host == "127.0.0.1"
     assert config.policy.stable_slots == 3
+    assert config.policy.stable_unavailable_replace_after_runs == 3
     assert config.policy.dnsbl_redline_threshold == 3
+
+
+def test_config_rejects_non_positive_unavailable_replacement_threshold(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "policy:\n  stable_unavailable_replace_after_runs: 0\n",
+    )
+    with pytest.raises(ValueError, match="stable_unavailable_replace_after_runs"):
+        load_config(path)
 
 
 def test_config_rejects_single_dnsbl_listing_as_redline_threshold(tmp_path):
@@ -74,6 +84,26 @@ def test_config_rejects_single_dnsbl_listing_as_redline_threshold(tmp_path):
 @pytest.mark.parametrize("name", ["台北 01", "臺北 01", "Taipei IEPL"])
 def test_taipei_names_are_classified_as_taiwan(name):
     assert classify_region(name, DEFAULT_REGION_PATTERNS) == "taiwan"
+
+
+@pytest.mark.parametrize(
+    ("name", "region"),
+    [
+        ("🇺🇸 Seattle premium", "united-states"),
+        ("🇺🇸 Los Angeles 01", "united-states"),
+        ("🇯🇵 Tokyo IEPL", "japan"),
+        ("🇸🇬 Singapore 01", "singapore"),
+        ("🇰🇷 Seoul 01", "south-korea"),
+        ("🇨🇦 Vancouver 01", "canada"),
+        ("🇬🇧 Manchester 01", "united-kingdom"),
+        ("🇩🇪 Berlin 01", "germany"),
+        ("🇫🇷 Paris 01", "france"),
+        ("🇦🇺 Melbourne 01", "australia"),
+        ("🇹🇼 Hinet 01", "taiwan"),
+    ],
+)
+def test_meta_ini_country_aliases_match_fixed_regions(name, region):
+    assert classify_region(name, DEFAULT_REGION_PATTERNS) == region
 
 
 def test_deployment_config_classifies_chinese_taipei_names(monkeypatch):

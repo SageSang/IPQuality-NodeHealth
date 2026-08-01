@@ -42,6 +42,11 @@ policy:
   # maintenance keeps these identities unordered and fixed; rebuild lets all
   # fully audited candidates compete for these slots again.
   stable_slots: 3
+  # Keep a stable identity through brief connectivity failures. If the node is
+  # still present but fails this many consecutive scheduled scans, replace only
+  # that slot with the best fully qualified candidate. A node absent from the
+  # inventory is removed immediately instead of using this grace period.
+  stable_unavailable_replace_after_runs: 3
   full_audit_top_candidates: 10
   full_audit_max_age_hours: 48
   min_full_passes_high_confidence: 2
@@ -129,24 +134,24 @@ local_socks:
 
 regions:
   hong-kong:
-    - '香港|港(?!口)|\bHK\b|Hong\s*Kong'
+    - '🇭🇰|香港|港(?!口)|Hong\s*Kong|(?-i:\bHK\b)'
   taiwan:
-    - '台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|\bTW\b|Taiwan|Taipei'
+    - '🇹🇼|台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|Taiwan|Taipei|Hinet|(?-i:\bTW\b)'
   japan:
-    - '日本|\bJP\b|Japan|Tokyo|Osaka|东京|大阪'
+    - '🇯🇵|日本|Japan|Tokyo|Osaka|东京|大阪|(?-i:\bJP\b)'
   singapore:
-    - '新加坡|狮城|獅城|\bSG\b|Singapore'
+    - '🇸🇬|新加坡|狮城|獅城|Singapore|(?-i:\bSG\b)'
   united-states:
-    - '美国|美國|\bUS\b|\bUSA\b|United\s*States|洛杉矶|洛杉磯|西雅图|西雅圖|纽约|紐約|夏威夷'
+    - '🇺🇸|美国|美國|United\s*States|Los\s*Angeles|San\s*Francisco|Seattle|New\s*York|洛杉矶|洛杉磯|西雅图|西雅圖|纽约|紐約|夏威夷|(?-i:\bUS\b)|(?-i:\bUSA\b)'
   south-korea:
-    - '韩国|韓國|\bKR\b|Korea|首尔|首爾'
+    - '🇰🇷|韩国|韓國|South\s*Korea|Korea|Seoul|首尔|首爾|(?-i:\bKR\b)'
   united-kingdom:
-    - '英国|英國|\bUK\b|Britain|United\s*Kingdom|London|伦敦|倫敦'
+    - '🇬🇧|英国|英國|United\s*Kingdom|Great\s*Britain|Britain|England|London|Manchester|伦敦|倫敦|(?-i:\bUK\b)'
   germany:
-    - '德国|德國|\bDE\b|Germany|Frankfurt|法兰克福|法蘭克福'
+    - '🇩🇪|德国|德國|Germany|Deutschland|Frankfurt|Berlin|法兰克福|法蘭克福|(?-i:\bDE\b)'
   france:
-    - '法国|法國|\bFR\b|France|Paris|巴黎'
+    - '🇫🇷|法国|法國|France|Paris|巴黎|(?-i:\bFR\b)'
   canada:
-    - '加拿大|\bCA\b|Canada|Toronto|多伦多|多倫多'
+    - '🇨🇦|加拿大|Canada|Toronto|Vancouver|多伦多|多倫多|(?-i:\bCA\b)'
   australia:
-    - '澳大利亚|澳大利亞|澳洲|\bAU\b|Australia|Sydney|悉尼'
+    - '🇦🇺|澳大利亚|澳大利亞|澳洲|Australia|Sydney|Melbourne|Perth|Brisbane|悉尼|(?-i:\bAU\b)'

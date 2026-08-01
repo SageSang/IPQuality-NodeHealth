@@ -32,6 +32,7 @@ def assign_region_slots(
     assessments: Iterable[NodeAssessment],
     previous_slots: dict[str, str] | None,
     slot_count: int = 3,
+    unavailable_replace_after_runs: int = 3,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     items = list(assessments)
     eligible = {item.node.key: item for item in items if item.evaluation.eligible}
@@ -64,7 +65,13 @@ def assign_region_slots(
             slot = str(index)
             key = previous_slots.get(slot, "")
             current = by_key.get(key)
-            preserve = bool(key) and (current is None or not current.evaluation.redline)
+            preserve = bool(key) and current is not None and not current.evaluation.redline
+            if (
+                preserve
+                and not current.quick.available
+                and current.consecutive_unavailable_runs >= unavailable_replace_after_runs
+            ):
+                preserve = False
             if preserve and key not in used:
                 slots[slot] = key
                 used.add(key)
@@ -125,6 +132,11 @@ def assign_all_regions(
             grouped.get(region, []),
             previous.get(region, {}),
             region_slot_count,
+            (
+                policy.stable_unavailable_replace_after_runs
+                if policy is not None
+                else 3
+            ),
         )
         old = previous.get(region, {})
         required_slot_change = any(
@@ -175,9 +187,21 @@ def assign_all_regions(
             elif before != after:
                 before_assessment = by_key.get(before)
                 reason = (
-                    "quality-redline"
-                    if before and before_assessment and before_assessment.evaluation.redline
-                    else "vacant-slot-fill"
+                    "missing-from-inventory"
+                    if before and before_assessment is None
+                    else (
+                        "repeated-unavailable"
+                        if before_assessment
+                        and not before_assessment.quick.available
+                        and policy is not None
+                        and before_assessment.consecutive_unavailable_runs
+                        >= policy.stable_unavailable_replace_after_runs
+                        else (
+                            "quality-redline"
+                            if before_assessment and before_assessment.evaluation.redline
+                            else "vacant-slot-fill"
+                        )
+                    )
                 )
             else:
                 continue
@@ -345,6 +369,9 @@ def _stable_status(
             "last_exit_ip": str(previous.get("last_exit_ip") or ""),
             "last_full_checked_at": str(previous.get("last_full_checked_at") or ""),
             "score": float(previous.get("last_score") or 0),
+            "consecutive_unavailable_runs": int(
+                previous.get("consecutive_unavailable_runs", 0) or 0
+            ),
         }
     if not assessment.quick.available:
         status = "unavailable"
@@ -370,4 +397,5 @@ def _stable_status(
             if status == "unavailable"
             else assessment.evaluation.score
         ),
+        "consecutive_unavailable_runs": assessment.consecutive_unavailable_runs,
     }

@@ -47,7 +47,7 @@ def atomic_write_text(path: Path, content: str) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
+        _replace_with_retry(temporary_name, path)
         _fsync_directory(path.parent)
     except Exception:
         try:
@@ -55,6 +55,19 @@ def atomic_write_text(path: Path, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _replace_with_retry(source: str, destination: Path) -> None:
+    # Windows and some NAS-backed filesystems can briefly deny replacement
+    # while another thread is opening the destination for a status read.
+    for attempt in range(10):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def _fsync_directory(path: Path) -> None:
@@ -409,6 +422,7 @@ def _assessment_detail(
         "fresh_full_attempt": fresh_full_attempt,
         "evaluation": assessment.evaluation.to_dict(),
         "consecutive_full_passes": assessment.consecutive_full_passes,
+        "consecutive_unavailable_runs": assessment.consecutive_unavailable_runs,
         "fresh_full_completed": assessment.fresh_full_completed,
         "fresh_full_usable": assessment.fresh_full_usable,
     }
@@ -639,8 +653,8 @@ def build_report_markdown(
             "",
             "## Recommended top slots" if report_kind == "subscription-audit" else "## Stable slot status",
             "",
-            "| Region | Slot | Port | SOCKS5 | Node | Status | Last exit IP | Last full | Score | Reasons |",
-            "|---|---:|---:|---|---|---|---|---|---:|---|",
+            "| Region | Slot | Port | SOCKS5 | Node | Status | Unavailable runs | Last exit IP | Last full | Score | Reasons |",
+            "|---|---:|---:|---|---|---|---:|---|---|---:|---|",
         ]
     )
     for region in current.get("region_order", []):
@@ -663,7 +677,9 @@ def build_report_markdown(
             score = float(status.get("score") or 0)
             lines.append(
                 f"| {region} | {slot} | {port} | `{socks5}` | {escaped_name} | "
-                f"{status.get('status', 'unknown')} | {last_exit_ip} | {last_full} | "
+                f"{status.get('status', 'unknown')} | "
+                f"{int(status.get('consecutive_unavailable_runs', 0) or 0)} | "
+                f"{last_exit_ip} | {last_full} | "
                 f"{score:.2f} | {escaped_reasons} |"
             )
 
@@ -754,6 +770,7 @@ def build_report_markdown(
                 f"- Decision: `{item.evaluation.decision}`; confidence: "
                 f"`{item.evaluation.confidence}`; score: `{item.evaluation.score:.2f}`",
                 f"- Reasons: {_markdown_escape(reasons)}",
+                f"- Consecutive unavailable runs: `{item.consecutive_unavailable_runs}`",
                 f"- Quick checked at: `{quick.get('checked_at') or '-'}`",
                 f"- Connectivity: `{availability}`; success: "
                 f"`{float(quick.get('success_rate') or 0):.0%}`; latency: `{latency_text} ms`",

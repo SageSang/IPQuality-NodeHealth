@@ -19,17 +19,17 @@
   const NODE_KEY_PATTERN = /^[0-9a-f]{64}$/;
 
   const REGION_PORT_BLOCKS = [
-    { key: 'hong-kong', matcher: /\u9999\u6e2f|hong\s*kong|(?:^|[\s_-])hk(?:[\s_-]|$)/i },
-    { key: 'taiwan', matcher: /\u53f0\u6e7e|\u53f0\u7063|taiwan|(?:^|[\s_-])tw(?:[\s_-]|$)/i },
-    { key: 'japan', matcher: /\u65e5\u672c|japan|(?:^|[\s_-])jp(?:[\s_-]|$)/i },
-    { key: 'singapore', matcher: /\u65b0\u52a0\u5761|singapore|(?:^|[\s_-])sg(?:[\s_-]|$)/i },
-    { key: 'united-states', matcher: /\u7f8e\u56fd|\u7f8e\u570b|united\s*states|(?:^|[\s_-])us(?:[\s_-]|$)/i },
-    { key: 'south-korea', matcher: /\u97e9\u56fd|\u97d3\u570b|korea|(?:^|[\s_-])kr(?:[\s_-]|$)/i },
-    { key: 'united-kingdom', matcher: /\u82f1\u56fd|\u82f1\u570b|united\s*kingdom|(?:^|[\s_-])(?:uk|gb)(?:[\s_-]|$)/i },
-    { key: 'germany', matcher: /\u5fb7\u56fd|\u5fb7\u570b|germany|(?:^|[\s_-])de(?:[\s_-]|$)/i },
-    { key: 'france', matcher: /\u6cd5\u56fd|\u6cd5\u570b|france|(?:^|[\s_-])fr(?:[\s_-]|$)/i },
-    { key: 'canada', matcher: /\u52a0\u62ff\u5927|canada|(?:^|[\s_-])ca(?:[\s_-]|$)/i },
-    { key: 'australia', matcher: /\u6fb3\u5927\u5229\u4e9a|\u6fb3\u5927\u5229\u4e9e|australia|(?:^|[\s_-])au(?:[\s_-]|$)/i },
+    { key: 'hong-kong', matcher: /🇭🇰|\u9999\u6e2f|hong\s*kong/i, codeMatcher: /\bHK\b/ },
+    { key: 'taiwan', matcher: /🇹🇼|\u53f0\u6e7e|\u53f0\u7063|taiwan|taipei|hinet/i, codeMatcher: /\bTW\b/ },
+    { key: 'japan', matcher: /🇯🇵|\u65e5\u672c|japan|tokyo|osaka/i, codeMatcher: /\bJP\b/ },
+    { key: 'singapore', matcher: /🇸🇬|\u65b0\u52a0\u5761|singapore/i, codeMatcher: /\bSG\b/ },
+    { key: 'united-states', matcher: /🇺🇸|\u7f8e\u56fd|\u7f8e\u570b|united\s*states|los\s*angeles|san\s*francisco|seattle|new\s*york/i, codeMatcher: /\bUS\b/ },
+    { key: 'south-korea', matcher: /🇰🇷|\u97e9\u56fd|\u97d3\u570b|south\s*korea|korea|seoul/i, codeMatcher: /\bKR\b/ },
+    { key: 'united-kingdom', matcher: /🇬🇧|\u82f1\u56fd|\u82f1\u570b|united\s*kingdom|great\s*britain|britain|england|london|manchester/i, codeMatcher: /\bUK\b/ },
+    { key: 'germany', matcher: /🇩🇪|\u5fb7\u56fd|\u5fb7\u570b|germany|deutschland|frankfurt|berlin/i, codeMatcher: /\bDE\b/ },
+    { key: 'france', matcher: /🇫🇷|\u6cd5\u56fd|\u6cd5\u570b|france|paris/i, codeMatcher: /\bFR\b/ },
+    { key: 'canada', matcher: /🇨🇦|\u52a0\u62ff\u5927|canada|toronto|vancouver/i, codeMatcher: /\bCA\b/ },
+    { key: 'australia', matcher: /🇦🇺|\u6fb3\u5927\u5229\u4e9a|\u6fb3\u5927\u5229\u4e9e|\u6fb3\u6d32|australia|sydney|melbourne|perth|brisbane/i, codeMatcher: /\bAU\b/ },
     { key: 'other', matcher: null, unlimited: true },
   ];
 
@@ -337,7 +337,11 @@
   }
 
   function fallbackRegion(name) {
-    const index = REGION_PORT_BLOCKS.findIndex((region) => region.matcher && region.matcher.test(name));
+    const index = REGION_PORT_BLOCKS.findIndex(
+      (region) =>
+        (region.matcher && region.matcher.test(name)) ||
+        (region.codeMatcher && region.codeMatcher.test(name)),
+    );
     return index === -1 ? 'other' : REGION_PORT_BLOCKS[index].key;
   }
 

@@ -22,9 +22,9 @@
 
 仓库现已包含可由群晖 Container Manager 部署的节点健康服务，支持两种模式：日常 `maintenance` 保持每个地区 1-3 的固定身份，临时不可用时等待恢复，明确质量红线时只替换对应槽位，并允许连续两轮明显领先的高置信候补受控晋级；首次部署、状态丢失或手动触发 `rebuild` 时，全量检测并重新竞选每区最优 1-3。服务还提供独立的订阅审计 API，可对任意获准的 Sub-Store ClashMeta 链接执行全节点检测并归档详细报告，而不修改正式排名。
 
-node-health 始终从带 `target=ClashMeta&noCache=true` 的 Sub-Store `inventory` 获取完整节点，并发布带版本的严格健康白名单。普通客户端使用经过 Script Operator 过滤的 `healthy`；状态下载、校验或身份匹配失败时请求会失败，不会把未过滤节点冒充健康节点。OpenWrt 则独立下载 `inventory + current.json`，在本地严格过滤并原子应用到固定端口，供 AdsPower 和地区 TXT 共同使用。
+node-health 始终从带 `target=ClashMeta&noCache=true` 的 Sub-Store `inventory` 获取完整节点，并发布带版本的严格健康白名单。Sub-Store 的 `healthy` 集合通过 Script Operator 过滤并排序；状态下载、校验或身份匹配失败时请求会失败，不会把未过滤节点冒充健康节点。普通客户端与 OpenWrt 都使用 `healthy`，OpenWrt 再通过原 `rule_conf` 转换器生成固定地区端口，供 AdsPower 和地区 TXT 共同使用。
 
-完整部署、首次全量检测、Sub-Store 和 OpenWrt 接入步骤见 [群晖 Container Manager 部署与运维](deploy/DEPLOY_SYNOLOGY.md)。
+当前推荐的完整链路和操作步骤见 [群晖 + Sub-Store + OpenWrt 简化部署](deploy/DEPLOY_SIMPLE.md)。高级的 OpenWrt 直连排名方案保留在原运维文档中，但本次部署不使用。
 
 ##### 屏幕截图
 ![截图](https://raw.githubusercontent.com/xykt/IPQuality/main/res/cn_IPv4.svg)

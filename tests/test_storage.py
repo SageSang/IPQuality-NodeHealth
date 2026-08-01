@@ -97,6 +97,27 @@ def test_atomic_write_syncs_parent_directory(tmp_path, monkeypatch):
     assert synced == [tmp_path]
 
 
+def test_atomic_write_retries_transient_replace_permission_error(tmp_path, monkeypatch):
+    target = tmp_path / "state.json"
+    real_replace = storage.os.replace
+    attempts = 0
+
+    def transient_replace(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("destination is briefly busy")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(storage.os, "replace", transient_replace)
+    monkeypatch.setattr(storage.time, "sleep", lambda _: None)
+
+    storage.atomic_write_text(target, "{}\n")
+
+    assert attempts == 3
+    assert target.read_text(encoding="utf-8") == "{}\n"
+
+
 def test_retention_failure_after_commit_does_not_fail_publication(tmp_path, monkeypatch):
     store = make_store(tmp_path)
 

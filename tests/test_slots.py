@@ -17,6 +17,7 @@ def assessment(
     chatgpt: str = "Yes",
     fresh_full_completed: bool = True,
     fresh_full_usable: bool = True,
+    unavailable_runs: int = 0,
 ):
     full = FullResult(
         completed=completed,
@@ -34,6 +35,7 @@ def assessment(
             [] if decision == "eligible" else [decision],
         ),
         consecutive_full_passes=passes,
+        consecutive_unavailable_runs=unavailable_runs,
         fresh_full_completed=fresh_full_completed and completed,
         fresh_full_usable=fresh_full_usable and fresh_full_completed and completed,
         fresh_full_attempt=full,
@@ -97,14 +99,16 @@ def test_unchanged_rebuild_does_not_emit_slot_change_alerts():
     assert changes == []
 
 
-def test_missing_entire_region_keeps_ghost_slots_in_maintenance():
+def test_missing_entire_region_releases_absent_slots_in_maintenance():
     previous = {"united-states": {"1": "a", "2": "b"}}
     regions, changes = assign_all_regions(
         "maintenance", [], previous, 3, ["united-states", "other"]
     )
-    assert regions["united-states"]["stable_slots"] == {"1": "a", "2": "b"}
-    assert regions["united-states"]["stable_status"]["1"]["status"] == "absent"
-    assert changes == []
+    assert regions["united-states"]["stable_slots"] == {}
+    assert [change["reason"] for change in changes] == [
+        "missing-from-inventory",
+        "missing-from-inventory",
+    ]
 
 
 def test_unavailable_stable_is_allowlisted_but_dynamic_unavailable_is_rejected():
@@ -118,6 +122,51 @@ def test_unavailable_stable_is_allowlisted_but_dynamic_unavailable_is_rejected()
     assert "a" not in rejected
     assert rejected["c"] == "unavailable"
     assert dynamic == []
+
+
+def test_unavailable_stable_is_replaced_only_at_consecutive_failure_threshold():
+    candidate = assessment("b", 80, confidence="high", passes=3)
+    policy = PolicyConfig(stable_unavailable_replace_after_runs=3)
+    previous = {"united-states": {"1": "a"}}
+
+    for unavailable_runs in (1, 2):
+        current = assessment(
+            "a",
+            0,
+            decision="unavailable",
+            available=False,
+            unavailable_runs=unavailable_runs,
+        )
+        regions, changes = assign_all_regions(
+            "maintenance",
+            [current, candidate],
+            previous,
+            1,
+            ["united-states"],
+            {"a": {"last_score": 90}, "b": {"last_score": 80}},
+            policy,
+        )
+        assert regions["united-states"]["stable_slots"]["1"] == "a"
+        assert changes == []
+
+    current = assessment(
+        "a",
+        0,
+        decision="unavailable",
+        available=False,
+        unavailable_runs=3,
+    )
+    regions, changes = assign_all_regions(
+        "maintenance",
+        [current, candidate],
+        previous,
+        1,
+        ["united-states"],
+        {"a": {"last_score": 90}, "b": {"last_score": 80}},
+        policy,
+    )
+    assert regions["united-states"]["stable_slots"]["1"] == "b"
+    assert [change["reason"] for change in changes] == ["repeated-unavailable"]
 
 
 def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown():
