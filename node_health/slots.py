@@ -36,7 +36,19 @@ def assign_region_slots(
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     items = list(assessments)
     eligible = {item.node.key: item for item in items if item.evaluation.eligible}
-    ranked = sorted(eligible.values(), key=ranking_key)
+    ranked_eligible = sorted(eligible.values(), key=ranking_key)
+    # Unreachable nodes are retained as a degraded tail. They must not fill
+    # new stable slots, but a transient probe failure must not delete them.
+    unavailable = sorted(
+        [
+            item
+            for item in items
+            if item.evaluation.decision == "unavailable"
+            and not item.evaluation.redline
+        ],
+        key=ranking_key,
+    )
+    ranked = ranked_eligible + unavailable
     qualified = [
         item
         for item in ranked
@@ -49,7 +61,7 @@ def assign_region_slots(
     rejected = {
         item.node.key: ";".join(item.evaluation.reasons) or "rejected"
         for item in items
-        if not item.evaluation.eligible
+        if item.evaluation.redline
     }
 
     if mode == "rebuild":
@@ -76,7 +88,7 @@ def assign_region_slots(
                 slots[slot] = key
                 used.add(key)
                 # Stable temporary failures remain allowlisted. Dynamic
-                # unavailable nodes stay in rejected and are removed.
+                # unavailable nodes remain in the ranked tail.
                 rejected.pop(key, None)
             else:
                 missing.append(slot)
@@ -167,7 +179,17 @@ def assign_all_regions(
                 ),
                 key=ranking_key,
             )
-            ranked = [item.node.key for item in eligible_ranked]
+            unavailable_ranked = sorted(
+                (
+                    item
+                    for item in grouped.get(region, [])
+                    if item.evaluation.decision == "unavailable"
+                    and not item.evaluation.redline
+                    and item.node.key not in assigned
+                ),
+                key=ranking_key,
+            )
+            ranked = [item.node.key for item in eligible_ranked + unavailable_ranked]
         regions[region] = {
             "stable_slots": slots,
             "stable_status": {

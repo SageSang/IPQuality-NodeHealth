@@ -620,12 +620,10 @@ class NodeHealthService:
             quick_results = {key: value for key, value in quick_raw.items() if isinstance(value, QuickResult)}
             if len(quick_results) != len(nodes):
                 raise RuntimeError("quick scan did not return one result for every inventory node")
-            available = sum(1 for result in quick_results.values() if result.available)
-            ratio = available / len(nodes)
-            if available == 0 or ratio < self.config.policy.minimum_publish_available_ratio:
-                raise RuntimeError(
-                    f"quick scan availability {available}/{len(nodes)} is below publication guard"
-                )
+            # Availability is a node property, not a publication guard. A
+            # country (or even the whole inventory) may temporarily have no
+            # reachable nodes; those nodes are retained at the ranking tail or
+            # preserved in existing stable slots.
 
             selected = select_full_audit_nodes(
                 effective_mode,
@@ -662,38 +660,6 @@ class NodeHealthService:
                         "full audit egress changed during scan: "
                         f"{result.audited_exit_ip} != {expected_ip}"
                     )
-            if effective_mode == "rebuild":
-                completed = sum(
-                    1 for node in selected_nodes if scanned_full[node.key].completed
-                )
-                completion_ratio = completed / len(selected_nodes) if selected_nodes else 0
-                if (
-                    completed == 0
-                    or completion_ratio
-                    < self.config.policy.minimum_rebuild_full_completion_ratio
-                ):
-                    raise RuntimeError(
-                        "rebuild full audit completion "
-                        f"{completed}/{len(selected_nodes)} is below publication guard"
-                    )
-                by_region: dict[str, list[Node]] = {}
-                for node in selected_nodes:
-                    if node.region != "other":
-                        by_region.setdefault(node.region, []).append(node)
-                for region, region_nodes in by_region.items():
-                    region_completed = sum(
-                        1 for node in region_nodes if scanned_full[node.key].completed
-                    )
-                    required = math.ceil(
-                        len(region_nodes)
-                        * self.config.policy.minimum_rebuild_full_completion_ratio
-                    )
-                    if region_completed < required:
-                        raise RuntimeError(
-                            "rebuild full audit completion for region "
-                            f"{region} {region_completed}/{len(region_nodes)} "
-                            "is below publication guard"
-                        )
 
         self._set_progress("publishing", len(nodes), len(nodes), len(nodes))
         assessments = self._assess(
@@ -702,8 +668,6 @@ class NodeHealthService:
             scanned_full,
             previous,
         )
-        if effective_mode == "rebuild":
-            self._guard_rebuild_evidence(assessments)
         regions, changes = assign_all_regions(
             effective_mode,
             assessments,
@@ -849,11 +813,9 @@ class NodeHealthService:
                 was_stable=node.key in stable_keys,
             )
             if (
-                node.key not in stable_keys
-                and quick.available
-                and safe_prior_full is not None
-                and not fresh_is_trustworthy
+                not fresh_is_trustworthy
                 and prior.get("last_score") is not None
+                and (not quick.available or safe_prior_full is not None)
             ):
                 try:
                     evaluation.score = float(prior["last_score"])
@@ -889,41 +851,6 @@ class NodeHealthService:
                 )
             )
         return assessments
-
-    def _guard_rebuild_evidence(self, assessments: list[NodeAssessment]) -> None:
-        grouped: dict[str, list[NodeAssessment]] = {}
-        for item in assessments:
-            if item.quick.available:
-                grouped.setdefault(item.node.region, []).append(item)
-
-        def has_current_evidence(item: NodeAssessment) -> bool:
-            fresh = item.fresh_full_attempt
-            confirmed_full_redline = bool(
-                fresh
-                and fresh.completed
-                and full_has_confirmed_redline(fresh, self.config.policy)
-            )
-            quick_redline = any(
-                reason == "missing-public-egress-ip"
-                or reason == "egress-ip-unstable"
-                or reason.startswith("country-mismatch:")
-                for reason in item.evaluation.reasons
-            )
-            clean_reputation = (
-                item.fresh_full_usable
-                and item.evaluation.confidence in {"provisional", "high"}
-            )
-            return confirmed_full_redline or quick_redline or clean_reputation
-
-        ratio = self.config.policy.minimum_rebuild_full_completion_ratio
-        for region, items in grouped.items():
-            evidence = sum(1 for item in items if has_current_evidence(item))
-            required = math.ceil(len(items) * ratio)
-            if evidence < required:
-                raise RuntimeError(
-                    "rebuild decision evidence for region "
-                    f"{region} {evidence}/{len(items)} is below publication guard"
-                )
 
     def _build_current(
         self,

@@ -54,10 +54,11 @@ policy:
   # promotion is based on consecutive fresh evidence.
   promotion_challengers_per_region: 1
   min_full_passes_high_confidence: 2
+  # Kept for backwards-compatible config parsing. Publication no longer uses
+  # this ratio: unreachable nodes are retained at the ranking tail.
   minimum_publish_available_ratio: 0.2
-  # A rebuild still probes every available node, but isolated third-party
-  # failures do not discard the entire multi-hour run. Incomplete nodes cannot
-  # enter stable slots and remain low-confidence until a later full pass.
+  # Kept for backwards-compatible config parsing. A rebuild publishes after
+  # quick-scan completion even when individual full audits fail.
   minimum_rebuild_full_completion_ratio: 0.8
   # A JSON result is not trusted for ordering until at least this many
   # independent risk-score providers returned usable values.

@@ -111,17 +111,29 @@ def test_missing_entire_region_releases_absent_slots_in_maintenance():
     ]
 
 
-def test_unavailable_stable_is_allowlisted_but_dynamic_unavailable_is_rejected():
+def test_unavailable_nodes_are_retained_at_the_dynamic_tail():
     items = [
         assessment("a", 0, decision="unavailable", available=False),
         assessment("b", 80),
         assessment("c", 0, decision="unavailable", available=False),
     ]
-    slots, dynamic, rejected = assign_region_slots("maintenance", items, {"1": "a"}, 3)
+    slots, dynamic, rejected = assign_region_slots("maintenance", items, {"1": "a"}, 1)
     assert slots["1"] == "a"
     assert "a" not in rejected
-    assert rejected["c"] == "unavailable"
-    assert dynamic == []
+    assert rejected == {}
+    assert dynamic == ["b", "c"]
+
+
+def test_unavailable_nodes_keep_historical_scores_when_ordering_tail():
+    items = [
+        assessment("healthy", 20),
+        assessment("old-high", 90, decision="unavailable", available=False),
+        assessment("old-low", 10, decision="unavailable", available=False),
+    ]
+    slots, dynamic, rejected = assign_region_slots("maintenance", items, {"1": "healthy"}, 1)
+    assert slots == {"1": "healthy"}
+    assert dynamic == ["old-high", "old-low"]
+    assert rejected == {}
 
 
 def test_unavailable_stable_is_replaced_only_at_consecutive_failure_threshold():

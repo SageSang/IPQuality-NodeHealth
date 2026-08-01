@@ -392,7 +392,7 @@ def test_unchanged_rebuild_resets_cooldown_without_slot_change_alert(tmp_path):
     )
 
 
-def test_rebuild_is_fail_closed_when_full_completion_is_below_guard(tmp_path):
+def test_rebuild_publishes_when_some_full_audits_are_incomplete(tmp_path):
     service, _, full, _ = make_service(tmp_path, count=2)
     # Discover deterministic keys through one parser-free quick setup by marking
     # the second audit call incomplete after it starts.
@@ -406,11 +406,10 @@ def test_rebuild_is_fail_closed_when_full_completion_is_below_guard(tmp_path):
         return result
 
     full.check = fail_second
-    with pytest.raises(RuntimeError, match="below publication guard"):
-        service.run_once("rebuild")
-    assert not (tmp_path / "data" / "current.json").exists()
-    assert service.status()["status"] == "degraded"
-    assert "below publication guard" in service.status()["last_error"]
+    current = service.run_once("rebuild")
+    assert (tmp_path / "data" / "current.json").exists()
+    assert service.status()["status"] == "ok"
+    assert current["mode"] == "rebuild"
 
 
 def test_rebuild_tolerates_isolated_incomplete_audit_but_never_slots_it(tmp_path):
@@ -426,7 +425,7 @@ def test_rebuild_tolerates_isolated_incomplete_audit_but_never_slots_it(tmp_path
     assert current["nodes"][incomplete_key]["confidence"] == "low"
 
 
-def test_rebuild_does_not_replace_published_slots_with_all_null_reputation(tmp_path):
+def test_rebuild_publishes_when_reputation_providers_are_temporarily_empty(tmp_path):
     service, _, full, source = make_service(tmp_path)
     first = service.run_once("rebuild")
     for proxy in source.proxies:
@@ -436,17 +435,13 @@ def test_rebuild_does_not_replace_published_slots_with_all_null_reputation(tmp_p
         }
     service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
 
-    with pytest.raises(RuntimeError, match="decision evidence.*below publication guard"):
-        service.run_once("rebuild")
+    current = service.run_once("rebuild")
 
     persisted = json.loads(
         (tmp_path / "data" / "current.json").read_text(encoding="utf-8")
     )
-    assert persisted["version"] == first["version"]
-    assert (
-        persisted["regions"]["united-states"]["stable_slots"]
-        == first["regions"]["united-states"]["stable_slots"]
-    )
+    assert persisted["version"] == current["version"]
+    assert persisted["version"] != first["version"]
 
 
 def test_incomplete_maintenance_full_audit_breaks_consecutive_passes(tmp_path):
@@ -616,12 +611,14 @@ def test_stable_warning_is_degraded_without_changing_the_slot(tmp_path):
     assert "degraded" in latest
 
 
-def test_first_rebuild_availability_ratio_guard_prevents_bad_initial_slots(tmp_path):
+def test_first_rebuild_publishes_even_when_all_nodes_are_unavailable(tmp_path):
     service, quick, _, _ = make_service(tmp_path, count=100)
-    quick.unavailable_names.update(f"US node {index}" for index in range(1, 100))
-    with pytest.raises(RuntimeError, match="below publication guard"):
-        service.run_once("rebuild")
-    assert not (tmp_path / "data" / "current.json").exists()
+    quick.unavailable_names.update(f"US node {index}" for index in range(100))
+    current = service.run_once("rebuild")
+    assert (tmp_path / "data" / "current.json").exists()
+    region = current["regions"]["united-states"]
+    assert region["stable_slots"] == {}
+    assert len(region["ranked"]) == 100
 
 
 def test_http_endpoints_and_token(tmp_path):
