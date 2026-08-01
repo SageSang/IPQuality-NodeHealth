@@ -542,6 +542,9 @@ function testRollbackRestoresRuntimePermissions() {
     'convert-ranking.mjs',
   ), 'utf8');
   assert.ok(runner.includes('inventory has zero matches'));
+  assert.ok(runner.includes("dns.listen !== '127.0.0.1:11553'"));
+  assert.ok(runner.includes("dns['enhanced-mode'] !== 'fake-ip'"));
+  assert.ok(runner.includes('converter output must preserve the independent fake-IP DNS configuration'));
 }
 
 (async () => {

@@ -62,6 +62,20 @@ const yaml = process.env.JS_YAML_PATH
 const source = fs.readFileSync(sourcePath, 'utf8');
 const current = JSON.parse(fs.readFileSync(rankingPath, 'utf8'));
 const outputConfig = converter.convertConfig(yaml.load(source), current, startPort);
+const dns = outputConfig && outputConfig.dns;
+if (
+  !dns ||
+  dns.enable !== true ||
+  dns.listen !== '127.0.0.1:11553' ||
+  dns['enhanced-mode'] !== 'fake-ip' ||
+  dns['fake-ip-range'] !== '198.18.0.1/16' ||
+  !Array.isArray(dns['default-nameserver']) ||
+  dns['default-nameserver'].length === 0 ||
+  !Array.isArray(dns.nameserver) ||
+  dns.nameserver.length === 0
+) {
+  throw new Error('converter output must preserve the independent fake-IP DNS configuration');
+}
 const allowedKeys = new Set();
 for (const region of Object.values(current.regions || {})) {
   for (const entry of Object.values(region && region.stable_slots || {})) {
