@@ -29,8 +29,10 @@ fi
 : "${NODE_BIN:=/usr/bin/node}"
 : "${NODE_PATH:=/etc/local-socks/node_modules:/usr/lib/node_modules}"
 : "${JS_YAML_PATH:=}"
-: "${MIHOMO_BIN:=/etc/openclash/core/clash_meta}"
+: "${MIHOMO_SOURCE:=/etc/openclash/core/clash_meta}"
+: "${MIHOMO_BIN:=$WORK_DIR/bin/mihomo-local-socks}"
 : "${SERVICE_SCRIPT:=/etc/init.d/local-socks}"
+: "${SERVICE_NAME:=local-socks}"
 : "${CONFIG_PATH:=$WORK_DIR/config.yaml}"
 : "${START_PORT:=62000}"
 : "${CONFIG_OWNER:=root:nogroup}"
@@ -84,7 +86,11 @@ fi
 for readable in "$SOURCE_YAML" "$CURRENT_JSON" "$CONVERT_RUNNER" "$STABLE_CONVERTER"; do
   [ -r "$readable" ] || fail "required file is not readable: $readable"
 done
-for executable in "$NODE_BIN" "$MIHOMO_BIN" "$SERVICE_SCRIPT"; do
+MIHOMO_VALIDATE_BIN="$MIHOMO_SOURCE"
+if [ ! -x "$MIHOMO_VALIDATE_BIN" ]; then
+  MIHOMO_VALIDATE_BIN="$MIHOMO_BIN"
+fi
+for executable in "$NODE_BIN" "$MIHOMO_VALIDATE_BIN" "$SERVICE_SCRIPT"; do
   [ -x "$executable" ] || fail "required command is not executable: $executable"
 done
 
@@ -122,7 +128,7 @@ if [ -n "$CONFIG_OWNER" ]; then
   chown "$CONFIG_OWNER" "$CANDIDATE" || fail 'cannot set candidate owner'
 fi
 
-if ! "$MIHOMO_BIN" -d "$WORK_DIR" -t -f "$CANDIDATE" >/dev/null 2>&1; then
+if ! "$MIHOMO_VALIDATE_BIN" -d "$WORK_DIR" -t -f "$CANDIDATE" >/dev/null 2>&1; then
   fail 'Mihomo rejected candidate config'
 fi
 
@@ -136,11 +142,23 @@ mv -f "$CANDIDATE" "$CONFIG_PATH" || fail 'atomic config replacement failed'
 CANDIDATE=''
 REPLACED=1
 
+service_running() {
+  if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+    running="$(
+      ubus call service list "{\"name\":\"$SERVICE_NAME\"}" 2>/dev/null \
+        | jsonfilter -e '@.*.instances.*.running' 2>/dev/null
+    )"
+    [ "$running" = 'true' ]
+    return
+  fi
+  "$SERVICE_SCRIPT" status >/dev/null 2>&1
+}
+
 service_ready() {
   attempts=0
   while [ "$attempts" -lt "$READINESS_ATTEMPTS" ]; do
     sleep "$READINESS_DELAY_SECONDS"
-    if "$SERVICE_SCRIPT" status >/dev/null 2>&1; then
+    if service_running; then
       return 0
     fi
     attempts=$((attempts + 1))

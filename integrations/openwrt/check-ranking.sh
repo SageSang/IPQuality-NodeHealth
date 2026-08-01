@@ -20,7 +20,10 @@ fi
 : "${APPLY_COMMAND:=$WORK_DIR/apply-ranking.sh}"
 : "${STABLE_CONVERTER_URL:=}"
 : "${NODE_BIN:=/usr/bin/node}"
+: "${NODE_PATH:=/etc/local-socks/node_modules:/usr/lib/node_modules}"
+: "${JS_YAML_PATH:=}"
 : "${SERVICE_SCRIPT:=/etc/init.d/local-socks}"
+: "${SERVICE_NAME:=local-socks}"
 : "${CONFIG_PATH:=$WORK_DIR/config.yaml}"
 : "${EXPORT_DIR:=/root/local-socks}"
 : "${SHA256_BIN:=sha256sum}"
@@ -28,6 +31,11 @@ fi
 : "${CURL_MAX_TIME:=120}"
 : "${BACKOFF_BASE_SECONDS:=900}"
 : "${BACKOFF_MAX_SECONDS:=21600}"
+: "${READINESS_ATTEMPTS:=5}"
+: "${READINESS_DELAY_SECONDS:=2}"
+: "${LISTENER_CONNECT_TIMEOUT_MS:=1500}"
+
+export NODE_PATH JS_YAML_PATH
 
 LOCK_FILE="$CACHE_DIR/check-ranking.lock"
 LOCK_DIR='/tmp/node-health-check-ranking.lock.d'
@@ -152,6 +160,75 @@ sha256_file() {
   printf '%s' "$checksum" | tr 'A-F' 'a-f'
 }
 
+service_running() {
+  if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+    running="$(
+      ubus call service list "{\"name\":\"$SERVICE_NAME\"}" 2>/dev/null \
+        | jsonfilter -e '@.*.instances.*.running' 2>/dev/null
+    )"
+    [ "$running" = 'true' ]
+    return
+  fi
+  "$SERVICE_SCRIPT" status >/dev/null 2>&1
+}
+
+first_listener_ready() {
+  [ -r "$CONFIG_PATH" ] || return 1
+  "$NODE_BIN" - "$CONFIG_PATH" "$LISTENER_CONNECT_TIMEOUT_MS" <<'NODE'
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+
+const configPath = process.argv[2];
+const timeoutMs = Number(process.argv[3]);
+const yaml = process.env.JS_YAML_PATH
+  ? require(path.resolve(process.env.JS_YAML_PATH))
+  : require('js-yaml');
+const config = yaml.load(fs.readFileSync(configPath, 'utf8'));
+const listener = config && Array.isArray(config.listeners) ? config.listeners[0] : null;
+const port = Number(listener && listener.port);
+if (!Number.isInteger(port) || port < 1 || port > 65535) process.exit(2);
+
+const socket = net.createConnection({ host: '127.0.0.1', port });
+let settled = false;
+function finish(code) {
+  if (settled) return;
+  settled = true;
+  socket.destroy();
+  process.exitCode = code;
+}
+socket.setTimeout(timeoutMs);
+socket.once('connect', () => finish(0));
+socket.once('timeout', () => finish(1));
+socket.once('error', () => finish(1));
+NODE
+}
+
+runtime_ready() {
+  service_running && first_listener_ready
+}
+
+wait_runtime_ready() {
+  attempts=0
+  while [ "$attempts" -lt "$READINESS_ATTEMPTS" ]; do
+    sleep "$READINESS_DELAY_SECONDS"
+    if runtime_ready; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+  done
+  return 1
+}
+
+exports_match_version() {
+  expected_version="$1"
+  for region in hong-kong taiwan japan singapore united-states south-korea united-kingdom germany france canada australia other; do
+    [ -f "$EXPORT_DIR/$region.txt" ] || return 1
+  done
+  [ -r "$EXPORT_DIR/README.txt" ] \
+    && grep -F "ranking $expected_version" "$EXPORT_DIR/README.txt" >/dev/null 2>&1
+}
+
 download() {
   url="$1"
   destination="$2"
@@ -192,6 +269,33 @@ if ! command -v "$SHA256_BIN" >/dev/null 2>&1; then
   record_failure 'sha256sum command is unavailable'
 fi
 
+# Recover a killed local runtime from the already validated local artifacts.
+# This path does not depend on NAS/Sub-Store availability and does not rebuild
+# or reorder anything. A later poll will still discover ranking changes.
+cached_version=''
+[ ! -r "$APPLIED_VERSION_FILE" ] || IFS= read -r cached_version < "$APPLIED_VERSION_FILE" || true
+cached_checksum=''
+[ ! -r "$APPLIED_CHECKSUM_FILE" ] || IFS= read -r cached_checksum < "$APPLIED_CHECKSUM_FILE" || true
+current_checksum=''
+if [ -r "$CONFIG_PATH" ]; then
+  current_checksum="$(sha256_file "$CONFIG_PATH" 2>/dev/null)" || current_checksum=''
+fi
+if [ -n "$cached_version" ] \
+  && [ -n "$cached_checksum" ] \
+  && [ "$current_checksum" = "$cached_checksum" ] \
+  && exports_match_version "$cached_version" \
+  && ! runtime_ready; then
+  log "local-socks runtime is down with coherent local version $cached_version; restarting locally"
+  if [ -x "$SERVICE_SCRIPT" ] \
+    && "$SERVICE_SCRIPT" restart >/dev/null 2>&1 \
+    && wait_runtime_ready; then
+    rm -f "$BACKOFF_FILE"
+    log "local-socks runtime recovered from local version $cached_version"
+    exit 0
+  fi
+  record_failure 'local-socks runtime self-heal failed'
+fi
+
 STAGE_DIR="$(mktemp -d "$CACHE_DIR/stage.XXXXXX")" || record_failure 'cannot create staging directory'
 RANKING_FIRST="$STAGE_DIR/current.first.json"
 RANKING_FINAL="$STAGE_DIR/current.json"
@@ -217,19 +321,11 @@ if [ "$version_first" = "$applied_version" ]; then
   if [ -r "$CONFIG_PATH" ]; then
     actual_checksum="$(sha256_file "$CONFIG_PATH" 2>/dev/null)" || actual_checksum=''
   fi
-  exports_ready=1
-  for region in hong-kong taiwan japan singapore united-states south-korea united-kingdom germany france canada australia other; do
-    [ -f "$EXPORT_DIR/$region.txt" ] || exports_ready=0
-  done
-  if [ ! -r "$EXPORT_DIR/README.txt" ] \
-    || ! grep -F "ranking $version_first" "$EXPORT_DIR/README.txt" >/dev/null 2>&1; then
-    exports_ready=0
-  fi
   if [ -n "$applied_checksum" ] \
     && [ "$actual_checksum" = "$applied_checksum" ] \
-    && [ "$exports_ready" -eq 1 ] \
+    && exports_match_version "$version_first" \
     && [ -x "$SERVICE_SCRIPT" ] \
-    && "$SERVICE_SCRIPT" status >/dev/null 2>&1; then
+    && runtime_ready; then
     rm -f "$BACKOFF_FILE"
     exit 0
   fi

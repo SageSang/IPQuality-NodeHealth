@@ -432,6 +432,10 @@ integrations/openwrt/apply-ranking.sh
   -> /etc/local-socks/apply-ranking.sh
 integrations/openwrt/convert-ranking.mjs
   -> /etc/local-socks/convert-ranking.mjs
+integrations/openwrt/service-lib.sh
+  -> /etc/local-socks/service-lib.sh
+integrations/openwrt/local-socks.init
+  -> /etc/init.d/local-socks
 integrations/openwrt/node-health.env.example
   -> /etc/local-socks/node-health.env
 integrations/local-socks/convert-any-proxy-to-local-socks-stable.js
@@ -442,6 +446,7 @@ integrations/local-socks/convert-any-proxy-to-local-socks-stable.js
 
 ```bash
 chmod 0755 /etc/local-socks/check-ranking.sh /etc/local-socks/apply-ranking.sh
+chmod 0755 /etc/local-socks/service-lib.sh /etc/init.d/local-socks
 chmod 0644 /etc/local-socks/convert-ranking.mjs
 chmod 0644 /etc/local-socks/convert-any-proxy-to-local-socks-stable.js
 chmod 0600 /etc/local-socks/node-health.env
@@ -479,7 +484,9 @@ NODE_PATH=/etc/local-socks/node_modules:/usr/lib/node_modules \
 apply-command INVENTORY_YAML CURRENT_JSON VERSION
 ```
 
-仓库自带的 `apply-ranking.sh` 已经实现完整流程：调用稳定槽位转换器、执行 `clash_meta -t`、原子替换、重启、进程状态确认，并使用 Node `net` 并发确认新 YAML 中的每个 listener 都能在 `127.0.0.1` 建立 TCP；任一应存在的监听缺失都会恢复旧配置并重启旧服务。全局明确拒绝全部节点时，合法的零 listener 配置直接通过。只有全部成功才返回 0。自动确认不等同于节点真实代理出网验收，因此启用 cron 前仍必须按下文检查固定监听端口和 HTTPS 出口。不要把 `APPLY_COMMAND` 换成直接覆盖正式配置的脚本。
+仓库自带的 `apply-ranking.sh` 已经实现完整流程：调用稳定槽位转换器、执行 Mihomo 配置自检、原子替换、重启、读取 procd 的真实实例状态，并使用 Node `net` 并发确认新 YAML 中的每个 listener 都能在 `127.0.0.1` 建立 TCP；任一应存在的监听缺失都会恢复旧配置并重启旧服务。全局明确拒绝全部节点时，合法的零 listener 配置直接通过。只有全部成功才返回 0。自动确认不等同于节点真实代理出网验收，因此启用 cron 前仍必须按下文检查固定监听端口和 HTTPS 出口。不要把 `APPLY_COMMAND` 换成直接覆盖正式配置的脚本。
+
+`service-lib.sh` 会把 OpenClash 当前核心原子复制为 `/etc/local-socks/bin/mihomo-local-socks` 后再运行，并把 `nofile` 提升到 `65535`。不要把 `MIHOMO_BIN` 改回 `/etc/openclash/core/clash_meta`；独立文件和进程名可保证 OpenClash 重启、更新或清理核心时不会误杀 local-socks。轮询器也不依赖 `/etc/init.d/local-socks status` 的模糊返回值，而是读取 ubus 中实例的真实 `running` 状态并连接一个实际 listener。排名、配置和 TXT 均一致但运行时停止时，它会直接从本地配置恢复，不依赖 NAS 或 Sub-Store，也不会改变节点顺序。
 
 `apply-ranking.sh` 使用 `/etc/init.d/local-socks restart`，它只重启当前已经原子替换好的 `config.yaml`，可以继续保留。迁移后不要执行旧的 `cd /etc/local-socks && ./ctl restart`，因为该命令包含远程刷新并会覆盖健康排序。
 
@@ -522,7 +529,7 @@ apply-command INVENTORY_YAML CURRENT_JSON VERSION
 cat /etc/local-socks/cache/node-health/applied.version
 cat /etc/local-socks/cache/node-health/applied.sha256
 sha256sum /etc/local-socks/config.yaml
-/etc/init.d/local-socks status
+ubus call service list '{"name":"local-socks","verbose":true}'
 ls -l /root/local-socks/*.txt /root/local-socks/README.txt
 ```
 

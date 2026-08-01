@@ -190,9 +190,11 @@ identity-drift error instead of silently emitting the unfiltered source.
 
 ## OpenWrt poller
 
-Copy `openwrt/check-ranking.sh` and `openwrt/apply-ranking.sh` to
-`/etc/local-socks/`, copy `openwrt/convert-ranking.mjs` there as well, then copy
-`openwrt/node-health.env.example` to `/etc/local-socks/node-health.env`.
+Copy `openwrt/check-ranking.sh`, `openwrt/apply-ranking.sh`,
+`openwrt/convert-ranking.mjs`, and `openwrt/service-lib.sh` to
+`/etc/local-socks/`. Copy `openwrt/local-socks.init` to
+`/etc/init.d/local-socks`, then copy `openwrt/node-health.env.example` to
+`/etc/local-socks/node-health.env`.
 Protect the environment file with mode `0600` and make the script executable.
 Run it every ten minutes:
 
@@ -211,6 +213,14 @@ The supplied `apply-ranking.sh` implements this interface. It invokes
 `clash_meta -t -f CANDIDATE`, atomically replaces `config.yaml`, restarts
 `local-socks`, checks readiness, and rolls back on failure. Its paths are
 configured in the private environment file.
+
+The service copies the current OpenClash core to the independently named
+`/etc/local-socks/bin/mihomo-local-socks` executable before starting. This
+prevents an OpenClash core restart or process-name cleanup from terminating the
+local SOCKS runtime, and raises its file-descriptor limit for large listener
+sets. Runtime checks use the actual procd instance state plus a live listener;
+when local artifacts are coherent, a stopped runtime is recovered locally
+without downloading or reordering the subscription.
 
 The same conversion writes every region TXT file into a staging directory.
 Only after the new Mihomo process is ready does the apply script replace

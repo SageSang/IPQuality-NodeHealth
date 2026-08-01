@@ -505,7 +505,11 @@ function testPollerCacheIsolationContract() {
   assert.ok(firstRanking >= 0 && firstRanking < inventory && inventory < finalRanking);
   assert.ok(source.includes("LOCK_DIR='/tmp/node-health-check-ranking.lock.d'"));
   assert.ok(source.includes('APPLIED_CHECKSUM_FILE='));
-  assert.ok(source.includes('exports_ready=1'));
+  assert.ok(source.includes('exports_match_version()'));
+  assert.ok(source.includes("jsonfilter -e '@.*.instances.*.running'"));
+  assert.ok(source.includes('local-socks runtime self-heal failed'));
+  assert.ok(source.includes('local-socks runtime recovered from local version'));
+  assert.ok(source.includes('runtime_ready; then'));
   assert.ok(source.includes("trap 'exit 1' HUP INT TERM"));
 }
 
@@ -526,6 +530,7 @@ function testRollbackRestoresRuntimePermissions() {
   assert.ok(source.includes('rm -f -- "$restore"'));
   assert.ok(source.includes("START_PORT must be exactly 62000"));
   assert.ok(source.includes("trap 'exit 1' HUP INT TERM"));
+  assert.ok(source.includes("jsonfilter -e '@.*.instances.*.running'"));
   assert.ok(source.includes('listeners_ready()'));
   assert.ok(source.includes("net.createConnection({ host: '127.0.0.1', port })"));
   assert.ok(source.includes("fail_after_rollback 'one or more configured listeners are not reachable'"));
@@ -545,6 +550,18 @@ function testRollbackRestoresRuntimePermissions() {
   assert.ok(runner.includes("dns.listen !== '127.0.0.1:11553'"));
   assert.ok(runner.includes("dns['enhanced-mode'] !== 'fake-ip'"));
   assert.ok(runner.includes('converter output must preserve the independent fake-IP DNS configuration'));
+
+  const service = fs.readFileSync(path.join(
+    __dirname,
+    '..',
+    'integrations',
+    'openwrt',
+    'service-lib.sh',
+  ), 'utf8');
+  assert.ok(service.includes('prepare_runtime_binary()'));
+  assert.ok(service.includes('cmp -s "$MIHOMO_SOURCE" "$MIHOMO_BIN"'));
+  assert.ok(service.includes('procd_set_param limits nofile="$LOCAL_SOCKS_NOFILE"'));
+  assert.ok(service.includes('bin/mihomo-local-socks'));
 }
 
 (async () => {
