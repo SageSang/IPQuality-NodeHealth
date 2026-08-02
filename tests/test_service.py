@@ -235,6 +235,28 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     assert len(latest_txt.splitlines()) == 7
     assert "unresolved" not in latest_txt
     assert "{dynamic-" not in latest_txt
+    all_latest_txt = (
+        tmp_path
+        / "data"
+        / "reports"
+        / "local-socks"
+        / "latest"
+        / "all.txt"
+    ).read_text(encoding="utf-8")
+    all_archived_txt = (
+        tmp_path
+        / "data"
+        / "reports"
+        / "scheduled"
+        / "2026"
+        / "07"
+        / "24"
+        / current["version"]
+        / "local-socks"
+        / "all.txt"
+    ).read_text(encoding="utf-8")
+    assert all_archived_txt == all_latest_txt
+    assert all_latest_txt == latest_txt
     assert "geo" not in current["nodes"][next(iter(current["nodes"]))]
 
 
@@ -902,8 +924,14 @@ def test_subscription_audit_checks_all_nodes_without_changing_ranking_state(tmp_
         / "local-socks"
         / "united-states.txt"
     ).read_text(encoding="utf-8")
+    audit_all_txt = (
+        service.store.audit_report_dir(audit_id)
+        / "local-socks"
+        / "all.txt"
+    ).read_text(encoding="utf-8")
     assert "{US node 0}" in audit_txt
     assert "{dynamic-" not in audit_txt
+    assert audit_all_txt == audit_txt
 
 
 def test_subscription_audit_http_api_and_authenticated_report_download(tmp_path):

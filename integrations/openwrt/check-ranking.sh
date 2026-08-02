@@ -225,6 +225,7 @@ exports_match_version() {
   for region in hong-kong taiwan japan singapore united-states south-korea united-kingdom germany france canada australia other; do
     [ -f "$EXPORT_DIR/$region.txt" ] || return 1
   done
+  [ -f "$EXPORT_DIR/all.txt" ] || return 1
   [ -r "$EXPORT_DIR/README.txt" ] \
     && grep -F "ranking $expected_version" "$EXPORT_DIR/README.txt" >/dev/null 2>&1
 }

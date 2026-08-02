@@ -111,6 +111,10 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
           path.join(exportDirectory, 'united-states.txt'),
           zero ? '' : `socks5://192.0.2.4:${port}{test}\n`,
         );
+        fs.writeFileSync(
+          path.join(exportDirectory, 'all.txt'),
+          zero ? '' : `socks5://192.0.2.4:${port}{test}\n`,
+        );
         fs.writeFileSync(path.join(exportDirectory, 'README.txt'), 'ranking e2e-v1\n');
         """,
     )
@@ -244,6 +248,10 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
     if expected_success:
         assert config.read_text(encoding="utf-8").startswith("listeners:")
         assert (export / "README.txt").read_text(encoding="utf-8") == "ranking e2e-v1\n"
+        expected_all = "" if mode == "zero" else (
+            f"socks5://192.0.2.4:{listener_port}{{test}}\n"
+        )
+        assert (export / "all.txt").read_text(encoding="utf-8") == expected_all
     else:
         assert config.read_text(encoding="utf-8") == "old-config\n"
         assert (export / "sentinel.txt").read_text(encoding="utf-8") == "old-export\n"
