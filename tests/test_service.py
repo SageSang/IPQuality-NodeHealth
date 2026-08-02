@@ -257,6 +257,31 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     ).read_text(encoding="utf-8")
     assert all_archived_txt == all_latest_txt
     assert all_latest_txt == latest_txt
+    all_plain_latest_txt = (
+        tmp_path
+        / "data"
+        / "reports"
+        / "local-socks"
+        / "latest"
+        / "all-plain.txt"
+    ).read_text(encoding="utf-8")
+    all_plain_archived_txt = (
+        tmp_path
+        / "data"
+        / "reports"
+        / "scheduled"
+        / "2026"
+        / "07"
+        / "24"
+        / current["version"]
+        / "local-socks"
+        / "all-plain.txt"
+    ).read_text(encoding="utf-8")
+    assert all_plain_archived_txt == all_plain_latest_txt
+    assert all_plain_latest_txt == "".join(
+        f"{line.split('{', 1)[0]}\n" for line in all_latest_txt.splitlines()
+    )
+    assert "{" not in all_plain_latest_txt
     assert "geo" not in current["nodes"][next(iter(current["nodes"]))]
 
 
@@ -932,6 +957,14 @@ def test_subscription_audit_checks_all_nodes_without_changing_ranking_state(tmp_
     assert "{US node 0}" in audit_txt
     assert "{dynamic-" not in audit_txt
     assert audit_all_txt == audit_txt
+    audit_all_plain_txt = (
+        service.store.audit_report_dir(audit_id)
+        / "local-socks"
+        / "all-plain.txt"
+    ).read_text(encoding="utf-8")
+    assert audit_all_plain_txt == "".join(
+        f"{line.split('{', 1)[0]}\n" for line in audit_all_txt.splitlines()
+    )
 
 
 def test_subscription_audit_http_api_and_authenticated_report_download(tmp_path):

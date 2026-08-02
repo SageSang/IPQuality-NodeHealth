@@ -533,10 +533,11 @@ ubus call service list '{"name":"local-socks","verbose":true}'
 ls -l /root/local-socks/*.txt /root/local-socks/README.txt
 ```
 
-除各地区 TXT 外，`/root/local-socks/all.txt` 是按地区顺序拼接的全量
-SOCKS5 列表，可一次导入所有当前发布节点。NAS 对应文件为
-`reports/local-socks/latest/all.txt`；每次成功发布也会在定时任务或审计归档
-目录下保存一份。首次出现需要等待下一次成功扫描/审计发布。
+除各地区 TXT 外，`/root/local-socks/all.txt` 是按地区顺序拼接、带节点名的
+全量 SOCKS5 列表；`/root/local-socks/all-plain.txt` 是不带节点名的版本。
+NAS 对应文件为 `reports/local-socks/latest/all.txt` 和
+`reports/local-socks/latest/all-plain.txt`；NAS 的定时任务和审计归档会保存
+这两份，OpenWrt 只保留当前目录的最新两份。
 
 `applied.sha256` 必须等于当前 `config.yaml` 的 SHA-256，`README.txt` 必须包含相同 ranking version。再在 OpenWrt 上逐个确认美国固定端口已监听，并通过每个端口访问 HTTPS：
 

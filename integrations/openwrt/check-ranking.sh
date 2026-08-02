@@ -226,6 +226,7 @@ exports_match_version() {
     [ -f "$EXPORT_DIR/$region.txt" ] || return 1
   done
   [ -f "$EXPORT_DIR/all.txt" ] || return 1
+  [ -f "$EXPORT_DIR/all-plain.txt" ] || return 1
   [ -r "$EXPORT_DIR/README.txt" ] \
     && grep -F "ranking $expected_version" "$EXPORT_DIR/README.txt" >/dev/null 2>&1
 }

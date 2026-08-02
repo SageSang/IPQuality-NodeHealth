@@ -115,6 +115,10 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
           path.join(exportDirectory, 'all.txt'),
           zero ? '' : `socks5://192.0.2.4:${port}{test}\n`,
         );
+        fs.writeFileSync(
+          path.join(exportDirectory, 'all-plain.txt'),
+          zero ? '' : `socks5://192.0.2.4:${port}\n`,
+        );
         fs.writeFileSync(path.join(exportDirectory, 'README.txt'), 'ranking e2e-v1\n');
         """,
     )
@@ -252,6 +256,10 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
             f"socks5://192.0.2.4:{listener_port}{{test}}\n"
         )
         assert (export / "all.txt").read_text(encoding="utf-8") == expected_all
+        expected_all_plain = "" if mode == "zero" else (
+            f"socks5://192.0.2.4:{listener_port}\n"
+        )
+        assert (export / "all-plain.txt").read_text(encoding="utf-8") == expected_all_plain
     else:
         assert config.read_text(encoding="utf-8") == "old-config\n"
         assert (export / "sentinel.txt").read_text(encoding="utf-8") == "old-export\n"

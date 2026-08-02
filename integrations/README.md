@@ -114,7 +114,8 @@ lists to `reports/local-socks/latest/<region>.txt` and archives the same files
 under `reports/scheduled/YYYY/MM/DD/<version>/local-socks/`. Subscription audits
 write their lists beside the audit report in its `local-socks/` directory.
 Each of those directories also contains `all.txt`, which concatenates every
-regional list in the configured region order for one-shot full import.
+regional list in the configured region order for one-shot full import, and
+`all-plain.txt`, which contains the same endpoints without `{node-name}`.
 Each line uses `socks5://<advertise-host>:<port>{<real source node name>}`;
 internal position labels such as `dynamic-001` are never used as proxy names.
 `reports/alerts/latest-run.md` is refreshed for every publication.
@@ -224,7 +225,9 @@ sets. Runtime checks use the actual procd instance state plus a live listener;
 when local artifacts are coherent, a stopped runtime is recovered locally
 without downloading or reordering the subscription.
 
-The same conversion writes every region TXT file plus `all.txt` into a staging directory.
+The same conversion writes every region TXT file plus `all.txt` and
+`all-plain.txt` into a staging directory. The regional files are not duplicated;
+only the aggregate export has a plain endpoint-only variant.
 Only after the new Mihomo process is ready does the apply script replace
 `/root/local-socks`; a TXT publication failure rolls the service config back
 as well. `ADVERTISE_HOST` controls the LAN address written into those files.

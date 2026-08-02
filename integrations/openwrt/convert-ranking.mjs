@@ -101,15 +101,20 @@ if (exportDirectory) {
   const linesByRegion = new Map(
     converter.REGION_PORT_BLOCKS.map((region) => [region.key, []]),
   );
+  const plainLinesByRegion = new Map(
+    converter.REGION_PORT_BLOCKS.map((region) => [region.key, []]),
+  );
   for (const listener of outputConfig.listeners || []) {
     const region = converter.REGION_PORT_BLOCKS.find((candidate) =>
       String(listener.name).startsWith(`mixed-${candidate.key}-`),
     );
     if (!region) continue;
     const name = String(listener.proxy).replace(/[\r\n]+/g, ' ').trim();
+    const plainLine = `socks5://${advertiseHost}:${listener.port}`;
     linesByRegion
       .get(region.key)
-      .push(`socks5://${advertiseHost}:${listener.port}{${name}}`);
+      .push(`${plainLine}{${name}}`);
+    plainLinesByRegion.get(region.key).push(plainLine);
   }
 
   for (const [region, lines] of linesByRegion) {
@@ -120,12 +125,19 @@ if (exportDirectory) {
     });
   }
   const allLines = [];
+  const allPlainLines = [];
   for (const region of converter.REGION_PORT_BLOCKS) {
     allLines.push(...linesByRegion.get(region.key));
+    allPlainLines.push(...plainLinesByRegion.get(region.key));
   }
   fs.writeFileSync(
     path.join(exportDirectory, 'all.txt'),
     allLines.length > 0 ? `${allLines.join('\n')}\n` : '',
+    { encoding: 'utf8', mode: 0o600 },
+  );
+  fs.writeFileSync(
+    path.join(exportDirectory, 'all-plain.txt'),
+    allPlainLines.length > 0 ? `${allPlainLines.join('\n')}\n` : '',
     { encoding: 'utf8', mode: 0o600 },
   );
   fs.writeFileSync(
