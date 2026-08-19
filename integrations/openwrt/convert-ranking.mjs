@@ -61,7 +61,86 @@ const yaml = process.env.JS_YAML_PATH
   : require('js-yaml');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const current = JSON.parse(fs.readFileSync(rankingPath, 'utf8'));
-const outputConfig = converter.convertConfig(yaml.load(source), current, startPort);
+const sourceConfig = yaml.load(source);
+
+function keyFromEntry(value) {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return '';
+  return String(value.node_key || value.nodeKey || value.key || '');
+}
+
+function stableSlotEntries(state) {
+  const entries = [];
+  for (const [regionKey, region] of Object.entries(state.regions || {})) {
+    const slots = region && (region.stable_slots || region.stableSlots);
+    if (!slots || typeof slots !== 'object' || Array.isArray(slots)) continue;
+    for (const [slot, entry] of Object.entries(slots)) {
+      const key = keyFromEntry(entry);
+      if (key) entries.push({ region: regionKey, slot, key });
+    }
+  }
+  return entries;
+}
+
+function retainMissingStableProxies(config, state) {
+  const configProxies = Array.isArray(config && config.proxies) ? config.proxies : [];
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error('source subscription is not a Clash proxy object');
+  }
+  if (!Array.isArray(config.proxies)) config.proxies = configProxies;
+
+  const stableEntries = stableSlotEntries(state);
+  if (stableEntries.length === 0 || !process.env.CONFIG_PATH) return [];
+
+  const previousPath = path.resolve(process.env.CONFIG_PATH);
+  if (!fs.existsSync(previousPath)) return [];
+
+  let previousConfig;
+  try {
+    previousConfig = yaml.load(fs.readFileSync(previousPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`previous local-socks config cannot be parsed: ${error.message}`);
+  }
+  const previousProxies = Array.isArray(previousConfig && previousConfig.proxies)
+    ? previousConfig.proxies
+    : [];
+  const present = new Set();
+  for (const proxy of config.proxies) {
+    try {
+      present.add(converter.nodeKey(proxy));
+    } catch (_) {
+      // The converter performs the authoritative source validation below.
+    }
+  }
+  const previousByKey = new Map();
+  for (const proxy of previousProxies) {
+    try {
+      const key = converter.nodeKey(proxy);
+      if (!previousByKey.has(key)) previousByKey.set(key, proxy);
+    } catch (_) {
+      // Ignore malformed historical entries; they cannot safely be reused.
+    }
+  }
+
+  const retained = [];
+  for (const entry of stableEntries) {
+    if (present.has(entry.key)) continue;
+    const proxy = previousByKey.get(entry.key);
+    if (!proxy) continue;
+    config.proxies.push({ ...proxy });
+    present.add(entry.key);
+    retained.push(`${entry.region}/${entry.slot}`);
+  }
+  return retained;
+}
+
+const retainedStableSlots = retainMissingStableProxies(sourceConfig, current);
+if (retainedStableSlots.length > 0) {
+  process.stderr.write(
+    `local-socks: retained previous definitions for stable slots ${retainedStableSlots.join(', ')}\n`,
+  );
+}
+const outputConfig = converter.convertConfig(sourceConfig, current, startPort);
 const dns = outputConfig && outputConfig.dns;
 if (
   !dns ||
@@ -89,6 +168,28 @@ for (const region of Object.values(current.regions || {})) {
 }
 if (allowedKeys.size > 0 && (!Array.isArray(outputConfig.listeners) || outputConfig.listeners.length === 0)) {
   throw new Error(`inventory has zero matches for ${allowedKeys.size} allowed node(s)`);
+}
+
+const listenerPorts = new Set(
+  (outputConfig.listeners || []).map((listener) => Number(listener && listener.port)),
+);
+const missingStableSlots = [];
+for (const entry of stableSlotEntries(current)) {
+  const regionIndex = converter.REGION_PORT_BLOCKS.findIndex(
+    (region) => region.key === entry.region,
+  );
+  const region = converter.REGION_PORT_BLOCKS[regionIndex];
+  if (!region || region.unlimited) continue;
+  const slot = Number(entry.slot);
+  const expectedPort = startPort + regionIndex * converter.REGION_PORT_BLOCK_SIZE + slot - 1;
+  if (!listenerPorts.has(expectedPort)) {
+    missingStableSlots.push(`${entry.region}/${entry.slot}:${expectedPort}`);
+  }
+}
+if (missingStableSlots.length > 0) {
+  throw new Error(
+    `stable slot listeners are missing: ${missingStableSlots.join(', ')}`,
+  );
 }
 const output = yaml.dump(outputConfig);
 

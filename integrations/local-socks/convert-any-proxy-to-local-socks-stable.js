@@ -330,8 +330,10 @@
     for (const [key, node] of Object.entries(nodes)) {
       if (node && typeof node.region === 'string') keyRegion.set(key, node.region);
     }
-    // Slot membership wins over a transient quick-unavailable rejection. A
-    // missing proxy still produces no listener, preserving the port gap.
+    // Slot membership wins over a transient quick-unavailable rejection. The
+    // standalone converter still emits no listener when a stable definition
+    // is absent; the advanced OpenWrt runner may restore that definition from
+    // the previous applied config before calling convertConfig().
     for (const key of stableKeys) rejected.delete(key);
     return { allowed, keyRegion, ranked, rejected, stable, stableKeys };
   }

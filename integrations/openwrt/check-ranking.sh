@@ -34,6 +34,7 @@ fi
 : "${READINESS_ATTEMPTS:=5}"
 : "${READINESS_DELAY_SECONDS:=2}"
 : "${LISTENER_CONNECT_TIMEOUT_MS:=1500}"
+: "${LISTENER_CHECK_CONCURRENCY:=64}"
 
 export NODE_PATH JS_YAML_PATH
 
@@ -205,7 +206,109 @@ NODE
 }
 
 runtime_ready() {
-  service_running && first_listener_ready
+  service_running && all_listeners_ready
+}
+
+all_listeners_ready() {
+  [ -r "$CONFIG_PATH" ] || return 1
+  "$NODE_BIN" - "$CONFIG_PATH" "$LISTENER_CONNECT_TIMEOUT_MS" "$LISTENER_CHECK_CONCURRENCY" <<'NODE'
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+
+const configPath = process.argv[2];
+const timeoutMs = Number(process.argv[3]);
+const concurrency = Number(process.argv[4]);
+const yaml = process.env.JS_YAML_PATH
+  ? require(path.resolve(process.env.JS_YAML_PATH))
+  : require('js-yaml');
+const config = yaml.load(fs.readFileSync(configPath, 'utf8'));
+if (!config || !Array.isArray(config.listeners)) process.exit(2);
+if (config.listeners.length === 0) process.exit(0);
+if (!Number.isInteger(timeoutMs) || timeoutMs < 100) process.exit(2);
+if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 512) process.exit(2);
+
+const ports = [...new Set(config.listeners.map((listener) => Number(listener && listener.port)))];
+if (ports.some((port) => !Number.isInteger(port) || port < 1 || port > 65535)) process.exit(2);
+
+function connect(port) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
+(async () => {
+  let cursor = 0;
+  let failed = false;
+  async function worker() {
+    while (cursor < ports.length) {
+      const port = ports[cursor++];
+      if (!(await connect(port))) failed = true;
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, ports.length) }, () => worker()),
+  );
+  process.exitCode = failed ? 1 : 0;
+})().catch(() => {
+  process.exitCode = 1;
+});
+NODE
+}
+
+stable_ports_match_ranking() {
+  ranking_path="$1"
+  [ -r "$CONFIG_PATH" ] || return 1
+  [ -r "$ranking_path" ] || return 1
+  "$NODE_BIN" - "$CONFIG_PATH" "$ranking_path" "$START_PORT" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+
+const configPath = process.argv[2];
+const rankingPath = process.argv[3];
+const startPort = Number(process.argv[4]);
+const yaml = process.env.JS_YAML_PATH
+  ? require(path.resolve(process.env.JS_YAML_PATH))
+  : require('js-yaml');
+const config = yaml.load(fs.readFileSync(configPath, 'utf8'));
+const ranking = JSON.parse(fs.readFileSync(rankingPath, 'utf8'));
+const regionOrder = [
+  'hong-kong', 'taiwan', 'japan', 'singapore', 'united-states',
+  'south-korea', 'united-kingdom', 'germany', 'france', 'canada',
+  'australia', 'other',
+];
+const ports = new Set(
+  (config && Array.isArray(config.listeners) ? config.listeners : [])
+    .map((listener) => Number(listener && listener.port)),
+);
+const missing = [];
+for (const [region, payload] of Object.entries(ranking.regions || {})) {
+  const regionIndex = regionOrder.indexOf(region);
+  if (regionIndex < 0 || region === 'other') continue;
+  const slots = payload && (payload.stable_slots || payload.stableSlots);
+  if (!slots || typeof slots !== 'object' || Array.isArray(slots)) {
+    process.exit(1);
+  }
+  for (const slot of Object.keys(slots)) {
+    const slotNumber = Number(slot);
+    if (!Number.isInteger(slotNumber) || slotNumber < 1 || slotNumber > 3) process.exit(1);
+    const expected = startPort + regionIndex * 200 + slotNumber - 1;
+    if (!ports.has(expected)) missing.push(`${region}/${slot}:${expected}`);
+  }
+}
+process.exit(missing.length > 0 ? 1 : 0);
+NODE
 }
 
 wait_runtime_ready() {
@@ -326,6 +429,7 @@ if [ "$version_first" = "$applied_version" ]; then
   if [ -n "$applied_checksum" ] \
     && [ "$actual_checksum" = "$applied_checksum" ] \
     && exports_match_version "$version_first" \
+    && stable_ports_match_ranking "$RANKING_FIRST" \
     && [ -x "$SERVICE_SCRIPT" ] \
     && runtime_ready; then
     rm -f "$BACKOFF_FILE"
@@ -336,6 +440,14 @@ fi
 
 case "$SOURCE_URL" in
   *'#'*) record_failure 'SOURCE_URL must not contain a fragment' ;;
+esac
+# Collection names may be customized in Sub-Store. The configured collection
+# must nevertheless be the complete, unfiltered inventory; a filtered source
+# cannot restore a stable node that temporarily disappeared from its output.
+case "$SOURCE_URL" in
+  */download/collection/healthy\?*|*/download/collection/healthy\#*|*/download/collection/healthy)
+    record_failure 'SOURCE_URL must use the complete inventory collection, not healthy'
+    ;;
 esac
 encoded_version="$(urlencode "$version_first")" || record_failure 'ranking version URL encoding failed'
 case "$SOURCE_URL" in
