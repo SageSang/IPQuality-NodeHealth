@@ -501,6 +501,78 @@ def test_promotion_requires_previous_day_margin_even_when_current_margin_is_larg
     assert changes == []
 
 
+def test_rotated_stable_uses_fresh_score_against_two_day_challenger():
+    items = [
+        assessment("a", 75, confidence="high", passes=3),
+        assessment("b-new", 60, confidence="high", passes=1),
+        assessment("c", 70, confidence="high", passes=3),
+        assessment("fourth", 80, confidence="high", passes=2),
+    ]
+    previous_slots = {
+        "united-states": {"1": "a", "2": "b-new", "3": "c"}
+    }
+    previous_nodes = previous_day_scores(items)
+    previous_nodes["b-new"] = {
+        "last_score": 92,
+        "identity_rotated_from": "b-old",
+    }
+
+    regions, changes = assign_all_regions(
+        "maintenance",
+        items,
+        previous_slots,
+        3,
+        ["united-states"],
+        previous_nodes,
+        PolicyConfig(),
+        {"united-states": "2026-07-20T00:00:00+00:00"},
+        datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+
+    assert regions["united-states"]["stable_slots"] == {
+        "1": "a",
+        "2": "fourth",
+        "3": "c",
+    }
+    assert [change["reason"] for change in changes] == ["superior-candidate"]
+    assert changes[0]["before"] == "b-new"
+    assert changes[0]["after"] == "fourth"
+    assert changes[0]["before_score"] == "60.00"
+    assert changes[0]["after_score"] == "80.00"
+
+
+def test_rotated_stable_quality_promotion_still_respects_two_day_cooldown():
+    items = [
+        assessment("a", 75, confidence="high", passes=3),
+        assessment("b-new", 60, confidence="high", passes=1),
+        assessment("c", 70, confidence="high", passes=3),
+        assessment("fourth", 80, confidence="high", passes=2),
+    ]
+    previous_slots = {
+        "united-states": {"1": "a", "2": "b-new", "3": "c"}
+    }
+    previous_nodes = previous_day_scores(items)
+    previous_nodes["b-new"] = {
+        "last_score": 92,
+        "identity_rotated_from": "b-old",
+    }
+
+    regions, changes = assign_all_regions(
+        "maintenance",
+        items,
+        previous_slots,
+        3,
+        ["united-states"],
+        previous_nodes,
+        PolicyConfig(),
+        {"united-states": "2026-07-23T00:00:00+00:00"},
+        datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+
+    assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
+    assert changes == []
+
+
 @pytest.mark.parametrize(
     ("cooldown_at", "promotes"),
     [

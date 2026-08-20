@@ -404,6 +404,20 @@ def _apply_promotions(
         stable_previous = _previous_distinct_day_score(
             previous_nodes.get(weakest_item.node.key, {}), now
         )
+        # A safely matched logical node can keep its slot after its connection
+        # parameters rotate, but the replacement connection has no trustworthy
+        # score from yesterday.  It is nevertheless fully re-audited in this
+        # run.  Use that fresh score as the stable baseline for both margin
+        # checks, while still requiring the challenger itself to have a score
+        # from yesterday.  This lets a proven two-day challenger replace a
+        # newly degraded endpoint immediately instead of waiting an extra day.
+        weakest_previous = previous_nodes.get(weakest_item.node.key, {})
+        if (
+            stable_previous is None
+            and weakest_previous.get("identity_rotated_from")
+            and weakest_item.fresh_full_usable
+        ):
+            stable_previous = weakest_item.evaluation.score
         candidate = None
         for possible in candidates:
             if (
