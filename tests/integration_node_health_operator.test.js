@@ -52,7 +52,39 @@ function normalizeClashMetaProxy(value) {
   return item;
 }
 
+function addIdentityIndex(state) {
+  if (!state || state.schema_version !== 2 || state.identity_index) return state;
+  const identityIndex = {};
+  for (const [regionKey, region] of Object.entries(state.regions || {})) {
+    if (!region || typeof region !== 'object' || Array.isArray(region)) continue;
+    const keys = [
+      ...Object.values(region.stable_slots || {}),
+      ...(Array.isArray(region.ranked) ? region.ranked : []),
+      ...Object.keys(
+        region.rejected && typeof region.rejected === 'object' && !Array.isArray(region.rejected)
+          ? region.rejected
+          : {},
+      ),
+    ].map((entry) =>
+      typeof entry === 'string' ? entry : String((entry && entry.node_key) || ''),
+    );
+    for (const key of keys) {
+      if (!/^[0-9a-f]{64}$/.test(key)) continue;
+      identityIndex[key] = {
+        source_id: '',
+        original_name: key,
+        normalized_name: key,
+        logical_id: '',
+        region: regionKey,
+      };
+    }
+  }
+  state.identity_index = identityIndex;
+  return state;
+}
+
 function proxyUtilsFor(state, overrides = {}) {
+  addIdentityIndex(state);
   return {
     download: async () => JSON.stringify(state),
     produce: (proxies, target, type, options) => {
@@ -106,7 +138,7 @@ async function testOperatorOrderingAndCompleteFallback() {
   const rejected = proxy('US rejected', 'rejected.example');
   const unknown = proxy('Unknown', 'unknown.example');
   const state = {
-    schema_version: 1,
+    schema_version: 2,
     version: 'test-v1',
     region_order: ['united-states'],
     regions: {
@@ -202,7 +234,7 @@ async function testScriptArgumentsAndClashMetaNormalization() {
   };
   const normalized = [vmess, vless, trojan].map(normalizeClashMetaProxy);
   const state = {
-    schema_version: 1,
+    schema_version: 2,
     version: 'normalization-v1',
     regions: {
       'united-states': {
@@ -263,24 +295,24 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
   const invalidStates = [
     {
       label: 'empty regions',
-      state: { schema_version: 1, version: 'empty-regions', regions: {} },
+      state: { schema_version: 2, version: 'empty-regions', regions: {} },
     },
     {
       label: 'empty decision shell',
       state: {
-        schema_version: 1,
+        schema_version: 2,
         version: 'empty-shell',
         regions: { other: { stable_slots: {}, ranked: [], rejected: {} } },
       },
     },
     {
       label: 'non-object region payload',
-      state: { schema_version: 1, version: 'bad-region', regions: { other: [] } },
+      state: { schema_version: 2, version: 'bad-region', regions: { other: [] } },
     },
     {
       label: 'missing stable slots',
       state: {
-        schema_version: 1,
+        schema_version: 2,
         version: 'missing-slots',
         regions: { other: { ranked: [operatorModule.nodeKey(kept)], rejected: {} } },
       },
@@ -288,7 +320,7 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
     {
       label: 'ranked is not an array',
       state: {
-        schema_version: 1,
+        schema_version: 2,
         version: 'bad-ranked',
         regions: { other: { stable_slots: {}, ranked: {}, rejected: {} } },
       },
@@ -296,7 +328,7 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
     {
       label: 'rejected is not an object',
       state: {
-        schema_version: 1,
+        schema_version: 2,
         version: 'bad-rejected',
         regions: { other: { stable_slots: {}, ranked: [], rejected: [] } },
       },
@@ -304,7 +336,7 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
     {
       label: 'node decision is not a sha256 key',
       state: {
-        schema_version: 1,
+        schema_version: 2,
         version: 'bad-key',
         regions: {
           other: { stable_slots: {}, ranked: ['not-a-node-key'], rejected: {} },
@@ -314,7 +346,7 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
     {
       label: 'legacy stable slot exceeds three-slot contract',
       state: {
-        schema_version: 1,
+        schema_version: 2,
         version: 'legacy-slot-four',
         regions: {
           'united-states': {
@@ -323,6 +355,21 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
             rejected: {},
           },
         },
+      },
+    },
+    {
+      label: 'decision key missing from identity index',
+      state: {
+        schema_version: 2,
+        version: 'missing-identity-entry',
+        regions: {
+          other: {
+            stable_slots: {},
+            ranked: [operatorModule.nodeKey(kept)],
+            rejected: {},
+          },
+        },
+        identity_index: {},
       },
     },
   ];
@@ -345,7 +392,7 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
   const allRejected = await operatorModule.operator(input, 'ClashMeta', {
     options: { rankingUrl: 'http://node-health.invalid/current.json' },
     ProxyUtils: proxyUtilsFor({
-        schema_version: 1,
+        schema_version: 2,
         version: 'all-rejected',
         regions: {
           other: {
@@ -362,7 +409,7 @@ async function testOperatorPreservesInputForIncompleteRankingState() {
 async function testIdentityDriftKeepsUnknownNodes() {
   const input = [proxy('Keep original', 'source.example')];
   const state = {
-    schema_version: 1,
+    schema_version: 2,
     version: 'identity-drift',
     regions: {
       other: {
@@ -385,6 +432,174 @@ async function testIdentityDriftKeepsUnknownNodes() {
   }
 }
 
+async function testLogicalIdentityKeepsRankingAcrossConnectionRotation() {
+  const oldStable = proxy('Hong Kong 01', 'old-hk.example', {
+    _nh_source_id: 'E-IX',
+    _nh_original_name: 'Hong Kong 01',
+  });
+  const newStable = proxy('Hong Kong 01', 'new-hk.example', {
+    _nh_source_id: 'E-IX',
+    _nh_original_name: 'Hong Kong 01',
+  });
+  const ranked = proxy('Hong Kong 02', 'ranked-hk.example', {
+    _nh_source_id: 'E-IX',
+    _nh_original_name: 'Hong Kong 02',
+  });
+  const unknown = proxy('Unknown', 'unknown-rotation.example');
+  const oldKey = operatorModule.nodeKey(normalizeClashMetaProxy(oldStable));
+  const rankedKey = operatorModule.nodeKey(normalizeClashMetaProxy(ranked));
+  const oldIdentity = operatorModule.selectedIdentity(oldStable);
+  const rankedIdentity = operatorModule.selectedIdentity(ranked);
+  const state = {
+    schema_version: 2,
+    version: 'identity-rotation-v2',
+    region_order: ['hong-kong'],
+    regions: {
+      'hong-kong': {
+        stable_slots: { 1: oldKey },
+        ranked: [rankedKey],
+        rejected: {},
+      },
+    },
+    identity_index: {
+      [oldKey]: oldIdentity,
+      [rankedKey]: rankedIdentity,
+    },
+  };
+
+  const output = await operatorModule.operator(
+    [unknown, ranked, newStable],
+    'ClashMeta',
+    {
+      options: { rankingUrl: 'http://node-health.invalid/current.json' },
+      ProxyUtils: proxyUtilsFor(state),
+    },
+  );
+
+  assert.deepStrictEqual(output.map((item) => item.name), [
+    'Hong Kong 01',
+    'Hong Kong 02',
+    'Unknown',
+  ]);
+  assert.strictEqual(output.length, 3);
+}
+
+function testLogicalIdentityNeverCrossesKnownSources() {
+  const oldProxy = proxy('Hong Kong 01', 'old-source.example', {
+    _nh_source_id: 'airport-a',
+    _nh_original_name: 'Hong Kong 01',
+  });
+  const newProxy = proxy('Hong Kong 01', 'new-source.example', {
+    _nh_source_id: 'airport-b',
+    _nh_original_name: 'Hong Kong 01',
+  });
+  const oldKey = operatorModule.nodeKey(normalizeClashMetaProxy(oldProxy));
+  const state = {
+    schema_version: 2,
+    version: 'source-isolation-v2',
+    regions: {
+      'hong-kong': {
+        stable_slots: { 1: oldKey },
+        ranked: [],
+        rejected: {},
+      },
+    },
+    identity_index: { [oldKey]: operatorModule.selectedIdentity(oldProxy) },
+  };
+  const selected = [{
+    key: operatorModule.nodeKey(normalizeClashMetaProxy(newProxy)),
+    identity: operatorModule.selectedIdentity(newProxy),
+  }];
+
+  assert.deepStrictEqual([...operatorModule.resolveIdentityKeys(state, selected)], []);
+}
+
+function testNormalizedUniqueNameFallbackAndAmbiguityGuard() {
+  const oldProxy = proxy('Hong   Kong 01', 'old-normalized.example');
+  const newProxy = proxy('hong kong 01', 'new-normalized.example');
+  const duplicate = proxy('HONG KONG 01', 'duplicate-normalized.example');
+  const oldKey = operatorModule.nodeKey(normalizeClashMetaProxy(oldProxy));
+  const state = {
+    schema_version: 2,
+    version: 'normalized-name-v2',
+    regions: {
+      'hong-kong': {
+        stable_slots: { 1: oldKey },
+        ranked: [],
+        rejected: {},
+      },
+    },
+    identity_index: { [oldKey]: operatorModule.selectedIdentity(oldProxy) },
+  };
+  const one = [{
+    key: operatorModule.nodeKey(normalizeClashMetaProxy(newProxy)),
+    identity: operatorModule.selectedIdentity(newProxy),
+  }];
+  assert.strictEqual(operatorModule.resolveIdentityKeys(state, one).get(0), oldKey);
+
+  const ambiguous = [newProxy, duplicate].map((item) => ({
+    key: operatorModule.nodeKey(normalizeClashMetaProxy(item)),
+    identity: operatorModule.selectedIdentity(item),
+  }));
+  assert.deepStrictEqual([...operatorModule.resolveIdentityKeys(state, ambiguous)], []);
+}
+
+function testExactConnectionIdentityPrecedesLogicalSourceMismatch() {
+  const oldProxy = proxy('Hong Kong old', 'exact.example', {
+    _nh_source_id: 'airport-a',
+  });
+  const renamed = proxy('Hong Kong renamed', 'exact.example', {
+    _nh_source_id: 'airport-b',
+  });
+  const oldKey = operatorModule.nodeKey(normalizeClashMetaProxy(oldProxy));
+  const state = {
+    schema_version: 2,
+    version: 'exact-precedence-v2',
+    regions: {
+      'hong-kong': { stable_slots: { 1: oldKey }, ranked: [], rejected: {} },
+    },
+    identity_index: { [oldKey]: operatorModule.selectedIdentity(oldProxy) },
+  };
+  const selected = [{
+    key: operatorModule.nodeKey(normalizeClashMetaProxy(renamed)),
+    identity: operatorModule.selectedIdentity(renamed),
+  }];
+
+  assert.strictEqual(selected[0].key, oldKey);
+  assert.strictEqual(operatorModule.resolveIdentityKeys(state, selected).get(0), oldKey);
+}
+
+async function testOperatorPreservesAll250InputsAndUnknownTailOrder() {
+  const stable = proxy('US stable bulk', 'bulk-stable.example');
+  const stableKey = operatorModule.nodeKey(normalizeClashMetaProxy(stable));
+  const unknown = Array.from({ length: 249 }, (_, index) =>
+    proxy(`Unknown bulk ${String(index).padStart(3, '0')}`, `bulk-${index}.example`),
+  );
+  const input = [...unknown, stable];
+  const state = {
+    schema_version: 2,
+    version: 'bulk-250-v2',
+    regions: {
+      'united-states': {
+        stable_slots: { 1: stableKey },
+        ranked: [],
+        rejected: {},
+      },
+    },
+    identity_index: { [stableKey]: operatorModule.selectedIdentity(stable) },
+  };
+
+  const output = await operatorModule.operator(input, 'ClashMeta', {
+    options: { rankingUrl: 'http://node-health.invalid/current.json' },
+    ProxyUtils: proxyUtilsFor(state),
+  });
+
+  assert.strictEqual(output.length, 250);
+  assert.strictEqual(output[0], stable);
+  assert.deepStrictEqual(output.slice(1), unknown);
+  assert.strictEqual(new Set(output).size, 250);
+}
+
 async function testStablePortGaps() {
   const stableOne = proxy('US one', 'one.example');
   const stableUnavailable = proxy('US unavailable', 'unavailable.example');
@@ -399,7 +614,7 @@ async function testStablePortGaps() {
     other: converter.nodeKey(other),
   };
   const state = {
-    schema_version: 1,
+    schema_version: 2,
     version: 'test-v2',
     regions: {
       'united-states': {
@@ -420,6 +635,7 @@ async function testStablePortGaps() {
       [keys.other]: { region: 'other' },
     },
   };
+  addIdentityIndex(state);
   const ordering = operatorModule.buildOrdering(
     state,
     new Set([keys.stableOne, keys.stableUnavailable, keys.dynamicOne, keys.other]),
@@ -465,7 +681,7 @@ function testDuplicateNodeAliasesAreAllPreserved() {
     assert.strictEqual(converter.nodeKey(alias), sharedKey);
   }
   const state = {
-    schema_version: 1,
+    schema_version: 2,
     version: 'duplicate-aliases',
     regions: {
       'united-states': {
@@ -493,21 +709,21 @@ function testDuplicateNodeAliasesAreAllPreserved() {
 function testStableConverterRejectsIncompleteRankingState() {
   const input = { proxies: [proxy('Keep existing', 'keep-existing.example')] };
   const invalidStates = [
-    { schema_version: 1, version: 'empty-regions', regions: {} },
+    { schema_version: 2, version: 'empty-regions', regions: {} },
     {
-      schema_version: 1,
+      schema_version: 2,
       version: 'empty-shell',
       regions: { other: { stable_slots: {}, ranked: [], rejected: {} } },
     },
     {
-      schema_version: 1,
+      schema_version: 2,
       version: 'bad-key',
       regions: {
         other: { stable_slots: {}, ranked: ['not-a-node-key'], rejected: {} },
       },
     },
     {
-      schema_version: 1,
+      schema_version: 2,
       version: 'legacy-slot-four',
       regions: {
         'united-states': {
@@ -608,6 +824,11 @@ function testRollbackRestoresRuntimePermissions() {
   await testScriptArgumentsAndClashMetaNormalization();
   await testOperatorPreservesInputForIncompleteRankingState();
   await testIdentityDriftKeepsUnknownNodes();
+  await testLogicalIdentityKeepsRankingAcrossConnectionRotation();
+  testLogicalIdentityNeverCrossesKnownSources();
+  testNormalizedUniqueNameFallbackAndAmbiguityGuard();
+  testExactConnectionIdentityPrecedesLogicalSourceMismatch();
+  await testOperatorPreservesAll250InputsAndUnknownTailOrder();
   await testStablePortGaps();
   testDuplicateNodeAliasesAreAllPreserved();
   testStableConverterRejectsIncompleteRankingState();

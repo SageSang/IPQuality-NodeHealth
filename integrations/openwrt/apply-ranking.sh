@@ -104,7 +104,7 @@ case "$CONFIG_PATH" in
   "$EXPORT_DIR"|"$EXPORT_DIR"/*) fail 'CONFIG_PATH must not be inside EXPORT_DIR' ;;
 esac
 
-actual_version="$($NODE_BIN -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(value.schema_version!==1||typeof value.version!=="string"||!value.version)process.exit(2);process.stdout.write(value.version);' "$CURRENT_JSON")" \
+actual_version="$($NODE_BIN -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(value.schema_version!==2||typeof value.version!=="string"||!value.version)process.exit(2);process.stdout.write(value.version);' "$CURRENT_JSON")" \
   || fail 'current.json is invalid'
 if [ "$actual_version" != "$EXPECTED_VERSION" ]; then
   fail 'current.json version does not match poller version'

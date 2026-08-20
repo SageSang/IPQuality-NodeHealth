@@ -27,7 +27,9 @@ def ranking_key(assessment: NodeAssessment) -> tuple[object, ...]:
     )
 
 
-def complete_ranking_key(assessment: NodeAssessment) -> tuple[object, ...]:
+def complete_ranking_key(
+    assessment: NodeAssessment, unavailable_replace_after_runs: int = 3
+) -> tuple[object, ...]:
     """Order every inventory node without turning health into a filter.
 
     Reachability is the first fallback concern because the fixed listeners are
@@ -39,6 +41,13 @@ def complete_ranking_key(assessment: NodeAssessment) -> tuple[object, ...]:
     """
 
     return (
+        1
+        if (
+            not assessment.quick.available
+            and assessment.consecutive_unavailable_runs
+            >= max(1, unavailable_replace_after_runs)
+        )
+        else 0,
         0 if assessment.quick.available else 1,
         1 if assessment.evaluation.redline else 0,
         len(assessment.evaluation.reasons) if assessment.evaluation.redline else 0,
@@ -66,7 +75,12 @@ def assign_region_slots(
     unavailable_replace_after_runs: int = 3,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     items = list(assessments)
-    ranked = sorted(items, key=complete_ranking_key)
+    ranked = sorted(
+        items,
+        key=lambda item: complete_ranking_key(
+            item, unavailable_replace_after_runs
+        ),
+    )
     qualified = sorted(
         (item for item in items if _qualified_stable_candidate(item)),
         key=ranking_key,
@@ -97,10 +111,22 @@ def assign_region_slots(
                 slot = str(index)
                 key = previous_slots.get(slot, "")
                 current = by_key.get(key)
-                # A connection failure is not a quality redline. Preserve the
-                # identity and listener for as long as the node remains in the
-                # successful inventory snapshot; it may recover later.
-                preserve = bool(key) and current is not None and not current.evaluation.redline
+                # A transient connection failure is not a quality redline and
+                # keeps its slot. Three consecutive failed rounds are treated
+                # as operationally stale: the node moves to the tail and the
+                # best qualified dynamic candidate fills its former slot.
+                exhausted_failures = bool(
+                    current is not None
+                    and not current.quick.available
+                    and current.consecutive_unavailable_runs
+                    >= max(1, unavailable_replace_after_runs)
+                )
+                preserve = bool(
+                    key
+                    and current is not None
+                    and not current.evaluation.redline
+                    and not exhausted_failures
+                )
                 if preserve and key not in used:
                     slots[slot] = key
                     used.add(key)
@@ -126,7 +152,7 @@ def assign_all_regions(
     region_order: list[str] | None = None,
     previous_nodes: dict[str, dict[str, object]] | None = None,
     policy: PolicyConfig | None = None,
-    previous_slot_changed_at: dict[str, dict[str, str]] | None = None,
+    previous_promotion_cooldown_at: dict[str, str] | None = None,
     now: datetime | None = None,
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, str]]]:
     grouped: dict[str, list[NodeAssessment]] = {}
@@ -134,7 +160,7 @@ def assign_all_regions(
         grouped.setdefault(assessment.node.region, []).append(assessment)
     by_key = {assessment.node.key: assessment for assessment in assessments}
     previous_nodes = previous_nodes or {}
-    previous_slot_changed_at = previous_slot_changed_at or {}
+    previous_promotion_cooldown_at = previous_promotion_cooldown_at or {}
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -186,7 +212,7 @@ def assign_all_regions(
             slots, promotion_slots = _apply_promotions(
                 slots,
                 grouped.get(region, []),
-                previous_slot_changed_at.get(region, {}),
+                previous_promotion_cooldown_at.get(region, ""),
                 previous_nodes,
                 policy,
                 now,
@@ -200,7 +226,9 @@ def assign_all_regions(
                         for item in grouped.get(region, [])
                         if item.node.key not in assigned
                     ),
-                    key=complete_ranking_key,
+                    key=lambda item: complete_ranking_key(
+                        item, policy.stable_unavailable_replace_after_runs
+                    ),
                 )
             ]
         regions[region] = {
@@ -228,9 +256,23 @@ def assign_all_regions(
                         "quality-redline"
                         if before_assessment and before_assessment.evaluation.redline
                         else (
-                            "degraded-quality-rerank"
-                            if degraded_rerank
-                            else "vacant-slot-fill"
+                            "consecutive-unavailable"
+                            if (
+                                before_assessment
+                                and not before_assessment.quick.available
+                                and before_assessment.consecutive_unavailable_runs
+                                >= max(
+                                    1,
+                                    policy.stable_unavailable_replace_after_runs
+                                    if policy is not None
+                                    else 3,
+                                )
+                            )
+                            else (
+                                "degraded-quality-rerank"
+                                if degraded_rerank
+                                else "vacant-slot-fill"
+                            )
                         )
                     )
                 )
@@ -297,7 +339,7 @@ def _parse_changed_at(value: str) -> datetime | None:
 def _apply_promotions(
     original_slots: dict[str, str],
     assessments: list[NodeAssessment],
-    changed_at: dict[str, str],
+    promotion_cooldown_at: str,
     previous_nodes: dict[str, dict[str, object]],
     policy: PolicyConfig,
     now: datetime,
@@ -308,9 +350,10 @@ def _apply_promotions(
     by_key = {item.node.key: item for item in assessments}
     promoted: set[str] = set()
     cooldown = timedelta(days=max(0, policy.promotion_cooldown_days))
-    if any(
-        changed is not None and now.astimezone(timezone.utc) - changed < cooldown
-        for changed in (_parse_changed_at(value) for value in changed_at.values())
+    last_promotion = _parse_changed_at(promotion_cooldown_at)
+    if (
+        last_promotion is not None
+        and now.astimezone(timezone.utc) - last_promotion < cooldown
     ):
         return slots, promoted
 
@@ -325,9 +368,6 @@ def _apply_promotions(
                 or not item.quick.available
                 or not item.evaluation.eligible
             ):
-                continue
-            changed = _parse_changed_at(changed_at.get(slot, ""))
-            if changed is not None and now.astimezone(timezone.utc) - changed < cooldown:
                 continue
             weakest.append((item.evaluation.score, slot, item))
         if not weakest:
@@ -361,7 +401,9 @@ def _apply_promotions(
         )
         if not candidates:
             break
-        stable_previous = previous_nodes.get(weakest_item.node.key, {}).get("last_score")
+        stable_previous = _previous_distinct_day_score(
+            previous_nodes.get(weakest_item.node.key, {}), now
+        )
         candidate = None
         for possible in candidates:
             if (
@@ -369,7 +411,9 @@ def _apply_promotions(
                 < weakest_item.evaluation.score + policy.promotion_score_margin
             ):
                 continue
-            candidate_previous = previous_nodes.get(possible.node.key, {}).get("last_score")
+            candidate_previous = _previous_distinct_day_score(
+                previous_nodes.get(possible.node.key, {}), now
+            )
             try:
                 was_also_better = float(candidate_previous) >= (
                     float(stable_previous) + policy.promotion_score_margin
@@ -384,6 +428,25 @@ def _apply_promotions(
         slots[weakest_slot] = candidate.node.key
         promoted.add(weakest_slot)
     return slots, promoted
+
+
+def _previous_distinct_day_score(
+    payload: dict[str, object], now: datetime
+) -> float | None:
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    score_day = str(payload.get("score_day") or "")
+    previous_score_day = str(payload.get("previous_score_day") or "")
+    if score_day == yesterday.isoformat():
+        value = payload.get("last_score")
+    elif score_day == today.isoformat() and previous_score_day == yesterday.isoformat():
+        value = payload.get("previous_day_score")
+    else:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _stable_status(

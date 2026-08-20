@@ -41,6 +41,7 @@ from .probe import (
     QuickProbe,
     run_parallel,
 )
+from .reconcile import SCHEMA_VERSION, reconcile_previous_state
 from .slots import assign_all_regions
 from .storage import StateStore
 
@@ -103,6 +104,27 @@ def _stable_region_by_key(state: dict[str, Any]) -> dict[str, str]:
 
 def _has_usable_slots(state: dict[str, Any]) -> bool:
     return bool(_all_stable_keys(state))
+
+
+def _updated_promotion_cooldown(
+    previous: dict[str, Any],
+    changes: list[dict[str, str]],
+    generated_at: str,
+) -> dict[str, str]:
+    prior = previous.get("promotion_cooldown_at", {})
+    cooldowns = (
+        {
+            str(region): str(value)
+            for region, value in prior.items()
+            if value
+        }
+        if isinstance(prior, dict)
+        else {}
+    )
+    for change in changes:
+        if change.get("reason") == "superior-candidate":
+            cooldowns[change["region"]] = generated_at
+    return cooldowns
 
 
 class NodeHealthService:
@@ -525,6 +547,7 @@ class NodeHealthService:
             assessments,
             regions,
             {},
+            [],
         )
         current.update(
             {
@@ -604,8 +627,9 @@ class NodeHealthService:
             self._task_started_at = started_iso
         self._set_progress("downloading")
         previous = self.store.load_state()
-        effective_mode = requested_mode if _has_usable_slots(previous) else "rebuild"
         nodes, source_digest = fetch_inventory(self.config, self.downloader)
+        nodes, previous, identity_events = reconcile_previous_state(nodes, previous)
+        effective_mode = requested_mode if _has_usable_slots(previous) else "rebuild"
 
         with self.environment.open(nodes) as ports:
             self._set_progress("quick-scan", 0, len(nodes), len(nodes))
@@ -632,6 +656,15 @@ class NodeHealthService:
                 previous,
                 self.config.policy,
                 started_at.astimezone(timezone.utc),
+            )
+            # A safely reconciled logical node has new connection parameters.
+            # Always rebuild its reputation immediately instead of waiting for
+            # the maintenance rotation sample. If it is unreachable, the full
+            # attempt still records that this mandatory audit was attempted.
+            selected.update(
+                event["after"]
+                for event in identity_events
+                if event.get("after") in quick_results
             )
             selected_nodes = [node for node in nodes if node.key in selected]
             self._set_progress("full-scan", 0, len(selected_nodes), len(nodes))
@@ -676,7 +709,7 @@ class NodeHealthService:
             self.config.region_order,
             previous.get("nodes", {}),
             self.config.policy,
-            previous.get("slot_changed_at", {}),
+            previous.get("promotion_cooldown_at", {}),
             started_at,
         )
         generated_at = self.clock()
@@ -695,6 +728,7 @@ class NodeHealthService:
             assessments,
             regions,
             previous,
+            identity_events,
         )
         state = self._build_state(current, previous, assessments, regions, changes)
         self.store.publish(current, state, assessments, changes, generated_at.astimezone())
@@ -742,6 +776,10 @@ class NodeHealthService:
                     name=node.name,
                     region=stable_regions[node.key],
                     proxy=node.proxy,
+                    source_id=node.source_id,
+                    original_name=node.original_name,
+                    normalized_name=node.normalized_name,
+                    logical_id=node.logical_id,
                 )
             quick = quick_results[node.key]
             prior = prior_nodes.get(node.key, {})
@@ -790,15 +828,24 @@ class NodeHealthService:
 
             passes = int(prior.get("consecutive_full_passes", 0) or 0)
             if full_has_usable_reputation(fresh_full, self.config.policy):
-                if prior_full_exit_ip == quick.exit_ip and passes > 0:
+                fresh_pass_day = str(fresh_full.checked_at or "")[:10]
+                prior_pass_day = str(prior.get("last_full_pass_day") or "")
+                if (
+                    prior_full_exit_ip == quick.exit_ip
+                    and passes > 0
+                    and fresh_pass_day
+                    and fresh_pass_day != prior_pass_day
+                ):
                     passes += 1
+                elif prior_full_exit_ip == quick.exit_ip and passes > 0:
+                    passes = max(1, passes)
                 else:
                     passes = 1
             elif fresh_full is not None:
                 passes = 0
 
             unavailable_runs = 0
-            if not quick.available and node.key in stable_keys:
+            if not quick.available:
                 unavailable_runs = int(
                     prior.get("consecutive_unavailable_runs", 0) or 0
                 ) + 1
@@ -863,11 +910,16 @@ class NodeHealthService:
         assessments: list[NodeAssessment],
         regions: dict[str, dict[str, object]],
         previous: dict[str, Any],
+        identity_events: list[dict[str, str]],
     ) -> dict[str, Any]:
         node_payload = {
             item.node.key: {
                 "name": item.node.name,
                 "region": item.node.region,
+                "source_id": item.node.source_id,
+                "original_name": item.node.original_name,
+                "normalized_name": item.node.normalized_name,
+                "logical_id": item.node.logical_id,
                 "score": item.evaluation.score,
                 "confidence": item.evaluation.confidence,
                 "decision": item.evaluation.decision,
@@ -891,7 +943,7 @@ class NodeHealthService:
                     "reasons": ["missing-from-inventory"],
                 }
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "version": version,
             "generated_at": generated_at,
             "requested_mode": requested_mode,
@@ -900,6 +952,17 @@ class NodeHealthService:
             "region_order": self.config.region_order,
             "regions": regions,
             "nodes": node_payload,
+            "identity_index": {
+                item.node.key: {
+                    "source_id": item.node.source_id,
+                    "original_name": item.node.original_name,
+                    "normalized_name": item.node.normalized_name,
+                    "logical_id": item.node.logical_id,
+                    "region": item.node.region,
+                }
+                for item in assessments
+            },
+            "identity_events": identity_events,
         }
 
     def _build_state(
@@ -918,6 +981,7 @@ class NodeHealthService:
             if key
         }
         node_state: dict[str, Any] = {}
+        current_score_day = str(current.get("generated_at") or "")[:10]
         for item in assessments:
             prior = prior_nodes.get(item.node.key, {})
             fresh_cacheworthy = bool(
@@ -938,9 +1002,32 @@ class NodeHealthService:
                 or ""
             )
             trusted_full = item.fresh_full_attempt if fresh_cacheworthy else prior_full
+            effective_score = (
+                prior.get("last_score", item.evaluation.score)
+                if item.node.key in assigned_keys
+                and item.evaluation.decision == "unavailable"
+                else item.evaluation.score
+            )
+            prior_score_day = str(prior.get("score_day") or "")
+            if prior_score_day and prior_score_day != current_score_day:
+                previous_day_score = prior.get("last_score")
+                previous_score_day = prior_score_day
+            else:
+                previous_day_score = prior.get("previous_day_score")
+                previous_score_day = str(prior.get("previous_score_day") or "")
+            if item.fresh_full_usable and item.fresh_full_attempt:
+                last_full_pass_day = str(item.fresh_full_attempt.checked_at or "")[:10]
+            elif item.fresh_full_attempt is not None:
+                last_full_pass_day = ""
+            else:
+                last_full_pass_day = str(prior.get("last_full_pass_day") or "")
             node_state[item.node.key] = {
                 "name": item.node.name,
                 "region": item.node.region,
+                "source_id": item.node.source_id,
+                "original_name": item.node.original_name,
+                "normalized_name": item.node.normalized_name,
+                "logical_id": item.node.logical_id,
                 "last_exit_ip": item.quick.exit_ip or prior.get("last_exit_ip", ""),
                 "last_quick_checked_at": item.quick.checked_at,
                 "last_full_checked_at": (
@@ -971,13 +1058,12 @@ class NodeHealthService:
                     else prior.get("last_full_attempt_error", "")
                 ),
                 "consecutive_full_passes": item.consecutive_full_passes,
+                "last_full_pass_day": last_full_pass_day,
                 "consecutive_unavailable_runs": item.consecutive_unavailable_runs,
-                "last_score": (
-                    prior.get("last_score", item.evaluation.score)
-                    if item.node.key in assigned_keys
-                    and item.evaluation.decision == "unavailable"
-                    else item.evaluation.score
-                ),
+                "last_score": effective_score,
+                "score_day": current_score_day,
+                "previous_day_score": previous_day_score,
+                "previous_score_day": previous_score_day,
                 "last_decision": item.evaluation.decision,
                 "current_status": item.evaluation.decision,
             }
@@ -988,10 +1074,10 @@ class NodeHealthService:
                 "name": str(prior.get("name") or "unknown"),
                 "current_status": "absent",
             }
-        # Keep confirmed danger history even for non-stable nodes that
-        # temporarily disappear from the inventory. If the same identity
-        # returns, an ambiguous audit must not make it eligible again; a
-        # trustworthy clean result is required to clear the latch.
+        # Preserve only confirmed danger history for a dynamic identity that
+        # temporarily leaves the inventory. It is state, not subscription
+        # output, and prevents an ambiguous result from clearing a redline if
+        # that same node later returns.
         for key, prior in prior_nodes.items():
             if key in node_state:
                 continue
@@ -1024,8 +1110,11 @@ class NodeHealthService:
             slot_changed_at.setdefault(change["region"], {})[change["slot"]] = current[
                 "generated_at"
             ]
+        promotion_cooldown_at = _updated_promotion_cooldown(
+            previous, changes, current["generated_at"]
+        )
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "version": current["version"],
             "updated_at": current["generated_at"],
             "source": current["source"],
@@ -1033,5 +1122,7 @@ class NodeHealthService:
                 region: payload["stable_slots"] for region, payload in regions.items()
             },
             "slot_changed_at": slot_changed_at,
+            "promotion_cooldown_at": promotion_cooldown_at,
             "nodes": node_state,
+            "identity_events": current.get("identity_events", []),
         }

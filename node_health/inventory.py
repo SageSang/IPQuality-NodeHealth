@@ -10,7 +10,13 @@ from typing import Any
 import yaml
 
 from .config import AppConfig
-from .identity import node_key
+from .identity import (
+    logical_id,
+    node_key,
+    normalize_original_name,
+    original_name,
+    source_id,
+)
 from .models import Node
 
 
@@ -60,12 +66,40 @@ def parse_clash_inventory(payload: bytes | str, patterns: dict[str, list[str]]) 
                 f"inventory proxy {name!r} has unsupported _region {explicit_region!r}"
             )
         region = explicit_region or classify_region(name, patterns)
-        nodes.append(Node(key=key, name=name, region=region, proxy=dict(proxy)))
+        node_source_id = source_id(proxy)
+        node_original_name = original_name(proxy)
+        node_normalized_name = normalize_original_name(node_original_name)
+        nodes.append(
+            Node(
+                key=key,
+                name=name,
+                region=region,
+                proxy=dict(proxy),
+                source_id=node_source_id,
+                original_name=node_original_name,
+                normalized_name=node_normalized_name,
+                logical_id=logical_id(node_source_id, node_normalized_name),
+            )
+        )
     return nodes
 
 
 def inventory_digest(nodes: list[Node]) -> str:
-    payload = json.dumps(sorted(node.key for node in nodes), separators=(",", ":"))
+    payload = json.dumps(
+        sorted(
+            (
+                node.key,
+                node.source_id,
+                node.original_name,
+                node.normalized_name,
+                node.logical_id,
+                node.region,
+            )
+            for node in nodes
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

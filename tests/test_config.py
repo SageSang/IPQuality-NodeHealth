@@ -119,9 +119,9 @@ def test_deployment_config_classifies_chinese_taipei_names(monkeypatch):
     assert config.schedule.time == "03:30"
     assert config.policy.full_audit_daily_fraction == 0.25
     assert config.policy.promotion_challengers_per_region == 1
-    assert config.policy.promotion_min_full_passes == 3
+    assert config.policy.promotion_min_full_passes == 2
     assert config.policy.promotion_score_margin == 10
-    assert config.policy.promotion_cooldown_days == 3
+    assert config.policy.promotion_cooldown_days == 2
     assert config.report.retention_days == 30
 
 

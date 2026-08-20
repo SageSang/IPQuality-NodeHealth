@@ -186,7 +186,7 @@
   function validateState(state) {
     if (
       !state ||
-      state.schema_version !== 1 ||
+      state.schema_version !== 2 ||
       typeof state.version !== 'string' ||
       !state.version ||
       !state.regions ||

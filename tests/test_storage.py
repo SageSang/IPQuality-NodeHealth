@@ -27,7 +27,7 @@ def make_store(tmp_path, *, retention_days=180):
 
 def ranking(version, generated_at):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "version": version,
         "generated_at": generated_at.isoformat(),
         "requested_mode": "maintenance",
@@ -41,7 +41,7 @@ def ranking(version, generated_at):
 
 def state(version, stable_key):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "version": version,
         "updated_at": "2026-07-25T00:00:00+00:00",
         "stable_slots": {"united-states": {"1": stable_key}},

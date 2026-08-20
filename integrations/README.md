@@ -18,7 +18,7 @@ consume the same document:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "version": "20260723T215800Z-a1b2c3d4",
   "generated_at": "2026-07-24T05:58:00+08:00",
   "mode": "maintenance",
@@ -38,20 +38,34 @@ consume the same document:
         "60aa...": "country-mismatch:JP!=US"
       }
     }
+  },
+  "identity_index": {
+    "2af9...64 hex characters...": {
+      "source_id": "e-ix",
+      "original_name": "Hong Kong 01",
+      "normalized_name": "hong kong 01",
+      "logical_id": "7d21...64 hex characters...",
+      "region": "hong-kong"
+    }
   }
 }
 ```
 
 The HTTP `/current.json` response intentionally contains only this integration
-surface. Detailed node names, scores, stable status, exit IPs, and raw probe
-results stay in the private persisted state and reports; Sub-Store and OpenWrt
-must not depend on those private fields.
+surface. `identity_index` exposes source/name matching metadata but never proxy
+credentials or connection parameters. Scores, stable status, exit IPs, and raw
+probe results stay in the private persisted state and reports.
 
 After a valid document is loaded, `regions.*.stable_slots` followed by
 `regions.*.ranked` define ordering only. `rejected` is risk metadata, not a
 deletion list. Every proxy in the complete Sub-Store input is returned exactly
 once; keys missing from the ranking remain at the tail in their source order.
-An invalid or unavailable document preserves the complete input order.
+An invalid or unavailable document preserves the complete input order. A
+connection-key miss is reconciled one-to-one by source plus original name, then
+by unique regional name; known different sources never inherit each other's
+position. Upstream may attach `_nh_source_id` and `_nh_original_name` metadata
+for the strongest airport isolation. These underscore fields do not affect the
+connection hash and are stripped from client output by normal production.
 
 A valid document has at least one region. Every region payload must be an
 object containing an object `stable_slots`, an array `ranked`, and an object

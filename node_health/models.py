@@ -10,6 +10,10 @@ class Node:
     name: str
     region: str
     proxy: dict[str, Any] = field(repr=False, compare=False)
+    source_id: str = ""
+    original_name: str = ""
+    normalized_name: str = ""
+    logical_id: str = ""
 
 
 @dataclass

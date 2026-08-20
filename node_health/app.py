@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from .config import AppConfig, load_config
 from .service import NodeHealthService, ScanStartError
 
-SOFTWARE_VERSION = "0.2.0"
+SOFTWARE_VERSION = "0.3.0"
 MAX_API_BODY_BYTES = 16 * 1024
 LOGGER = logging.getLogger("node_health")
 
@@ -44,6 +44,7 @@ def public_ranking_document(current: dict[str, Any]) -> dict[str, Any]:
             "mode",
             "source",
             "region_order",
+            "identity_index",
         )
         if key in current
     } | {"regions": regions}

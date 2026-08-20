@@ -409,7 +409,7 @@ SOURCE_YAML="$STAGE_DIR/inventory.yaml"
 download "$RANKING_URL" "$RANKING_FIRST" || record_failure 'ranking download failed'
 schema="$(json_value "$RANKING_FIRST" schema_version 2>/dev/null)" || record_failure 'ranking JSON is invalid'
 version_first="$(json_value "$RANKING_FIRST" version 2>/dev/null)" || record_failure 'ranking version is missing'
-if [ "$schema" != '1' ] || [ -z "$version_first" ]; then
+if [ "$schema" != '2' ] || [ -z "$version_first" ]; then
   record_failure 'ranking schema is unsupported'
 fi
 
@@ -463,7 +463,7 @@ fi
 download "$RANKING_URL" "$RANKING_FINAL" || record_failure 'ranking consistency download failed'
 version_final="$(json_value "$RANKING_FINAL" version 2>/dev/null)" || record_failure 'final ranking version is missing'
 schema_final="$(json_value "$RANKING_FINAL" schema_version 2>/dev/null)" || record_failure 'final ranking JSON is invalid'
-if [ "$schema_final" != '1' ] || [ "$version_first" != "$version_final" ]; then
+if [ "$schema_final" != '2' ] || [ "$version_first" != "$version_final" ]; then
   record_failure 'ranking changed during download'
 fi
 

@@ -42,14 +42,15 @@ policy:
   # maintenance keeps these identities unordered and fixed; rebuild lets all
   # fully audited candidates compete for these slots again.
   stable_slots: 3
-  # Retained for backwards-compatible config parsing and unavailable counters.
-  # Connectivity failure alone no longer replaces or empties a stable slot.
+  # A node moves to the regional tail only after this many consecutive failed
+  # quick-scan rounds. A stable node is then replaced by the best candidate;
+  # any successful round resets the counter to zero.
   stable_unavailable_replace_after_runs: 3
   # Deep-audit one node from each four-node ranking block, preferring the
   # least-recently audited member. This covers the dynamic pool in about 4 days.
   full_audit_daily_fraction: 0.25
   # Recheck the best non-stable node in every region each day so a sustained
-  # promotion is based on consecutive fresh evidence.
+  # promotion is based on fresh evidence from two different calendar days.
   promotion_challengers_per_region: 1
   min_full_passes_high_confidence: 2
   # Kept for backwards-compatible config parsing. Publication no longer uses
@@ -70,10 +71,10 @@ policy:
   # Controlled maintenance promotion. A transiently unavailable or missing
   # stable identity is never used as the weakest comparison target.
   promotion_enabled: true
-  promotion_min_full_passes: 3
+  promotion_min_full_passes: 2
   promotion_score_margin: 10
   promotion_max_per_region_per_run: 1
-  promotion_cooldown_days: 3
+  promotion_cooldown_days: 2
   expected_country:
     hong-kong: HK
     taiwan: TW

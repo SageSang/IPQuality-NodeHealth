@@ -1,4 +1,4 @@
-from node_health.identity import canonical_proxy_json, node_key
+from node_health.identity import canonical_proxy_json, logical_id, node_key
 from node_health.inventory import parse_clash_inventory
 
 
@@ -78,3 +78,26 @@ proxies:
         assert "unsupported _region 'mars'" in str(error)
     else:
         raise AssertionError("unknown explicit regions must fail before slot assignment")
+
+
+def test_inventory_builds_normalized_non_secret_logical_identity_metadata():
+    payload = """
+proxies:
+  - name: Display Name #2
+    type: ss
+    server: one.example
+    port: 443
+    password: secret
+    _nh_source_id: "  Ｅ-ＩＸ  "
+    _nh_original_name: " Hong   Kong 01 "
+"""
+
+    parsed = parse_clash_inventory(payload, {"hong-kong": [r"Hong\s+Kong"]})
+
+    assert len(parsed) == 1
+    node = parsed[0]
+    assert node.source_id == "e-ix"
+    assert node.original_name == "Hong Kong 01"
+    assert node.normalized_name == "hong kong 01"
+    assert node.logical_id == logical_id("e-ix", "hong kong 01")
+    assert "secret" not in node.logical_id

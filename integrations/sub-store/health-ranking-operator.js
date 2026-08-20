@@ -7,7 +7,7 @@
  * nodes. Invalid or unavailable health data falls back to the input order.
  */
 
-const NODE_HEALTH_SCHEMA_VERSION = 1;
+const NODE_HEALTH_SCHEMA_VERSION = 2;
 const STABLE_SLOT_COUNT = 3;
 const NODE_KEY_PATTERN = /^[0-9a-f]{64}$/;
 const REGION_ORDER = [
@@ -198,6 +198,73 @@ function nodeKey(proxy) {
   return sha256Hex(canonicalJson(proxy, true));
 }
 
+function normalizeIdentityText(value) {
+  return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+}
+
+function normalizeOriginalName(value) {
+  return String(value || '').trim().replace(/\s+/gu, ' ');
+}
+
+function sourceId(proxy) {
+  if (!proxy || typeof proxy !== 'object') return '';
+  for (const field of ['_nh_source_id', '_source_id']) {
+    const value = normalizeIdentityText(proxy[field]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function originalName(proxy) {
+  if (!proxy || typeof proxy !== 'object') return '';
+  for (const field of ['_nh_original_name', '_original_name']) {
+    const value = normalizeOriginalName(proxy[field]);
+    if (value) return value;
+  }
+  return normalizeOriginalName(proxy.name);
+}
+
+function logicalId(source, normalizedName) {
+  if (!source || !normalizedName) return '';
+  return sha256Hex(`${source}\0${normalizedName}`);
+}
+
+const REGION_MATCHERS = [
+  ['hong-kong', /(?:🇭🇰|香港|hong\s*kong|(?:^|\W)hk(?:\W|$))/iu],
+  ['taiwan', /(?:🇹🇼|台湾|臺灣|台北|臺北|taiwan|taipei|hinet|(?:^|\W)tw(?:\W|$))/iu],
+  ['japan', /(?:🇯🇵|日本|东京|東京|大阪|japan|tokyo|osaka|(?:^|\W)jp(?:\W|$))/iu],
+  ['singapore', /(?:🇸🇬|新加坡|狮城|獅城|singapore|(?:^|\W)sg(?:\W|$))/iu],
+  ['united-states', /(?:🇺🇸|美国|美國|united\s*states|los\s*angeles|san\s*francisco|seattle|new\s*york|(?:^|\W)us(?:a)?(?:\W|$))/iu],
+  ['south-korea', /(?:🇰🇷|韩国|韓國|south\s*korea|korea|seoul|首尔|首爾|(?:^|\W)kr(?:\W|$))/iu],
+  ['united-kingdom', /(?:🇬🇧|英国|英國|united\s*kingdom|great\s*britain|britain|england|london|manchester|(?:^|\W)uk(?:\W|$))/iu],
+  ['germany', /(?:🇩🇪|德国|德國|germany|deutschland|frankfurt|berlin|(?:^|\W)de(?:\W|$))/iu],
+  ['france', /(?:🇫🇷|法国|法國|france|paris|巴黎|(?:^|\W)fr(?:\W|$))/iu],
+  ['canada', /(?:🇨🇦|加拿大|canada|toronto|vancouver|(?:^|\W)ca(?:\W|$))/iu],
+  ['australia', /(?:🇦🇺|澳大利亚|澳大利亞|澳洲|australia|sydney|melbourne|perth|brisbane|悉尼|(?:^|\W)au(?:\W|$))/iu],
+];
+
+function identityRegion(proxy, name) {
+  const explicit = String((proxy && proxy._region) || '').trim();
+  if (REGION_ORDER.includes(explicit)) return explicit;
+  for (const [region, matcher] of REGION_MATCHERS) {
+    if (matcher.test(name)) return region;
+  }
+  return 'other';
+}
+
+function selectedIdentity(proxy) {
+  const source = sourceId(proxy);
+  const original = originalName(proxy);
+  const normalized = normalizeIdentityText(original);
+  return {
+    source_id: source,
+    original_name: original,
+    normalized_name: normalized,
+    logical_id: logicalId(source, normalized),
+    region: identityRegion(proxy, original),
+  };
+}
+
 function operatorOptions(context) {
   const candidates = [];
   if (context && typeof context === 'object') {
@@ -306,7 +373,8 @@ function validateRankingState(state) {
     state.schema_version !== NODE_HEALTH_SCHEMA_VERSION ||
     typeof state.version !== 'string' ||
     !state.version ||
-    !isRecord(state.regions)
+    !isRecord(state.regions) ||
+    !isRecord(state.identity_index)
   ) {
     throw new Error('unsupported ranking schema');
   }
@@ -315,6 +383,7 @@ function validateRankingState(state) {
   if (regions.length === 0) throw new Error('ranking regions are empty');
 
   let decisionKeys = 0;
+  const decided = new Set();
   for (const [regionKey, region] of regions) {
     if (!regionKey || !isRecord(region)) {
       throw new Error(`invalid ranking region: ${regionKey || '<empty>'}`);
@@ -339,22 +408,123 @@ function validateRankingState(state) {
         throw new Error(`invalid stable slot in ranking region: ${regionKey}`);
       }
       decisionKeys += 1;
+      decided.add(keyFromEntry(entry));
     }
     for (const entry of region.ranked) {
       if (!NODE_KEY_PATTERN.test(keyFromEntry(entry))) {
         throw new Error(`invalid ranked key in ranking region: ${regionKey}`);
       }
       decisionKeys += 1;
+      decided.add(keyFromEntry(entry));
     }
     for (const key of Object.keys(region.rejected)) {
       if (!NODE_KEY_PATTERN.test(key)) {
         throw new Error(`invalid rejected key in ranking region: ${regionKey}`);
       }
       decisionKeys += 1;
+      decided.add(key);
     }
   }
 
   if (decisionKeys === 0) throw new Error('ranking contains no node decisions');
+
+  for (const [key, identity] of Object.entries(state.identity_index)) {
+    if (
+      !NODE_KEY_PATTERN.test(key) ||
+      !isRecord(identity) ||
+      typeof identity.source_id !== 'string' ||
+      typeof identity.original_name !== 'string' ||
+      typeof identity.normalized_name !== 'string' ||
+      typeof identity.logical_id !== 'string' ||
+      (identity.logical_id && !NODE_KEY_PATTERN.test(identity.logical_id)) ||
+      typeof identity.region !== 'string' ||
+      !identity.region
+    ) {
+      throw new Error(`invalid identity index entry: ${key}`);
+    }
+  }
+  for (const key of decided) {
+    if (!Object.prototype.hasOwnProperty.call(state.identity_index, key)) {
+      throw new Error(`ranking decision is missing identity metadata: ${key}`);
+    }
+  }
+}
+
+function identityTuple(identity, fields) {
+  const values = fields.map((field) => String(identity[field] || ''));
+  if (values.some((value) => !value)) return '';
+  return JSON.stringify(values);
+}
+
+function uniqueIdentityMatches(unmatchedOld, unmatchedNew, oldIdentities, selected, fields) {
+  const oldBuckets = new Map();
+  const newBuckets = new Map();
+  for (const key of unmatchedOld) {
+    const group = identityTuple(oldIdentities[key], fields);
+    if (!group) continue;
+    if (!oldBuckets.has(group)) oldBuckets.set(group, []);
+    oldBuckets.get(group).push(key);
+  }
+  for (const index of unmatchedNew) {
+    const group = identityTuple(selected[index].identity, fields);
+    if (!group) continue;
+    if (!newBuckets.has(group)) newBuckets.set(group, []);
+    newBuckets.get(group).push(index);
+  }
+
+  const matches = [];
+  for (const [group, oldKeys] of oldBuckets) {
+    const newIndexes = newBuckets.get(group) || [];
+    if (oldKeys.length === 1 && newIndexes.length === 1) {
+      matches.push([oldKeys[0], newIndexes[0]]);
+    }
+  }
+  return matches;
+}
+
+function resolveIdentityKeys(state, selected) {
+  validateRankingState(state);
+  const oldIdentities = state.identity_index;
+  const resolved = new Map();
+  const unmatchedOld = new Set(Object.keys(oldIdentities));
+  const unmatchedNew = new Set(selected.map((_, index) => index));
+
+  // Connection identity is authoritative and can legitimately be shared by
+  // multiple display aliases. Preserve every alias in the returned list.
+  selected.forEach((entry, index) => {
+    if (Object.prototype.hasOwnProperty.call(oldIdentities, entry.key)) {
+      resolved.set(index, entry.key);
+      unmatchedOld.delete(entry.key);
+      unmatchedNew.delete(index);
+    }
+  });
+
+  const stages = [
+    ['source_id', 'logical_id'],
+    ['source_id', 'region', 'original_name'],
+    ['region', 'original_name'],
+    ['region', 'normalized_name'],
+  ];
+  stages.forEach((fields, stageIndex) => {
+    const matches = uniqueIdentityMatches(
+      unmatchedOld,
+      unmatchedNew,
+      oldIdentities,
+      selected,
+      fields,
+    );
+    for (const [oldKey, newIndex] of matches) {
+      if (stageIndex >= 2) {
+        const oldSource = String(oldIdentities[oldKey].source_id || '');
+        const newSource = String(selected[newIndex].identity.source_id || '');
+        if (oldSource && newSource && oldSource !== newSource) continue;
+      }
+      resolved.set(newIndex, oldKey);
+      unmatchedOld.delete(oldKey);
+      unmatchedNew.delete(newIndex);
+    }
+  });
+  return resolved;
 }
 
 function buildOrdering(state, availableKeys = null) {
@@ -466,14 +636,18 @@ async function operator(proxies, targetPlatform, context) {
       return {
         proxy,
         key,
+        identity: selectedIdentity(proxy),
         originalIndex,
       };
     });
     const state = JSON.parse(await downloadRanking(rankingUrl, context));
-    const { order } = buildOrdering(state, new Set(selected.map((entry) => entry.key)));
+    const resolved = resolveIdentityKeys(state, selected);
+    const availableStateKeys = new Set(resolved.values());
+    const { order } = buildOrdering(state, availableStateKeys);
 
-    selected.forEach((entry) => {
-      entry.healthOrder = order.has(entry.key) ? order.get(entry.key) : Number.MAX_SAFE_INTEGER;
+    selected.forEach((entry, index) => {
+      const stateKey = resolved.get(index) || entry.key;
+      entry.healthOrder = order.has(stateKey) ? order.get(stateKey) : Number.MAX_SAFE_INTEGER;
     });
     selected.sort(
       (left, right) =>
@@ -496,9 +670,16 @@ if (typeof module === 'object' && module.exports) {
     buildOrdering,
     canonicalJson,
     clashMetaNodeKey,
+    identityRegion,
+    logicalId,
     nodeKey,
+    normalizeIdentityText,
     operator,
+    originalName,
+    resolveIdentityKeys,
+    selectedIdentity,
     sha256Hex,
+    sourceId,
     validateRankingState,
   };
 }

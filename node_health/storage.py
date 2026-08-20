@@ -15,6 +15,7 @@ from typing import Any
 from .config import AppConfig
 from .models import NodeAssessment
 from .audit import audit_day_parts, validate_audit_id
+from .reconcile import SCHEMA_VERSION
 
 
 _FIXED_REGION_PORT_BLOCK_SIZE = 200
@@ -174,9 +175,13 @@ class StateStore:
         return self.snapshots_dir / f"{version}.json"
 
     def load_state(self) -> dict[str, Any]:
-        empty = {"schema_version": 1, "stable_slots": {}, "nodes": {}}
+        empty = {"schema_version": SCHEMA_VERSION, "stable_slots": {}, "nodes": {}}
         state = read_json(self.state_path, empty)
         current = read_json(self.current_path, {})
+        if state.get("schema_version") != SCHEMA_VERSION:
+            state = empty
+        if current and current.get("schema_version") != SCHEMA_VERSION:
+            current = {}
         current_version = str(current.get("version") or "")
         snapshot_path = self._snapshot_path(current_version)
         if snapshot_path is not None:
@@ -184,7 +189,10 @@ class StateStore:
                 snapshot = read_json(snapshot_path, {})
             except ValueError:
                 snapshot = {}
-            if snapshot.get("version") == current_version:
+            if (
+                snapshot.get("schema_version") == SCHEMA_VERSION
+                and snapshot.get("version") == current_version
+            ):
                 return snapshot
         if not current_version:
             return state if not state.get("version") else empty

@@ -74,7 +74,7 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
 
     source.write_text("proxies: []\n", encoding="utf-8")
     current.write_text(
-        json.dumps({"schema_version": 1, "version": "e2e-v1", "regions": {}}),
+        json.dumps({"schema_version": 2, "version": "e2e-v1", "regions": {}}),
         encoding="utf-8",
     )
     config.write_text("old-config\n", encoding="utf-8")

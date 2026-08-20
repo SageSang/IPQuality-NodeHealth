@@ -12,7 +12,11 @@ from node_health.app import DailyScheduler, create_server
 from node_health.config import AppConfig, HttpConfig, InventoryConfig, PolicyConfig, ProbeConfig, ScheduleConfig
 from node_health.identity import node_key
 from node_health.models import FullResult, QuickResult
-from node_health.service import NodeHealthService, ScanStartError
+from node_health.service import (
+    NodeHealthService,
+    ScanStartError,
+    _updated_promotion_cooldown,
+)
 
 
 def inventory(count=7):
@@ -40,6 +44,14 @@ class InventorySource:
 
     def remove_name(self, name):
         self.proxies = [proxy for proxy in self.proxies if proxy["name"] != name]
+
+    def rotate_connection(self, name):
+        for proxy in self.proxies:
+            if proxy["name"] == name:
+                proxy["server"] = "rotated-" + proxy["server"]
+                proxy["password"] = "rotated-" + proxy["password"]
+                return
+        raise AssertionError(f"unknown test node: {name}")
 
 
 class FakeEnvironment:
@@ -83,6 +95,7 @@ class FakeFull:
         self.calls = []
         self.started_event = None
         self.release_event = None
+        self.checked_at = "2026-07-24T00:01:00+00:00"
 
     def check(self, node, port):
         self.calls.append(node.key)
@@ -125,7 +138,7 @@ class FakeFull:
             }
             if completed
             else {},
-            checked_at="2026-07-24T00:01:00+00:00",
+            checked_at=self.checked_at,
             error="" if completed else "provider timeout",
         )
 
@@ -163,12 +176,52 @@ def make_service(tmp_path, count=7):
     return service, quick, full, source
 
 
+def test_only_quality_promotion_starts_or_resets_promotion_cooldown():
+    previous = {
+        "promotion_cooldown_at": {
+            "united-states": "2026-07-23T00:00:00+00:00"
+        }
+    }
+    generated_at = "2026-07-24T00:02:00+00:00"
+
+    for reason in (
+        "quality-redline",
+        "consecutive-unavailable",
+        "missing-from-inventory",
+        "degraded-quality-rerank",
+        "rebuild",
+    ):
+        assert _updated_promotion_cooldown(
+            previous,
+            [{"region": "united-states", "reason": reason}],
+            generated_at,
+        ) == previous["promotion_cooldown_at"]
+
+    assert _updated_promotion_cooldown(
+        previous,
+        [{"region": "united-states", "reason": "superior-candidate"}],
+        generated_at,
+    ) == {"united-states": generated_at}
+
+
 def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_path):
     service, _, full, _ = make_service(tmp_path)
     service.config.local_socks_advertise_host = "192.0.2.4"
     current = service.run_once("maintenance")
     assert current["requested_mode"] == "maintenance"
     assert current["mode"] == "rebuild"
+    assert current["schema_version"] == 2
+    assert len(current["identity_index"]) == 7
+    published_keys = [
+        key
+        for region in current["regions"].values()
+        for key in [
+            *region["stable_slots"].values(),
+            *region["ranked"],
+        ]
+    ]
+    assert len(published_keys) == current["source"]["node_count"] == 7
+    assert len(set(published_keys)) == 7
     assert len(full.calls) == 7
     assert len(current["regions"]["united-states"]["stable_slots"]) == 3
     assert (tmp_path / "data" / "current.json").exists()
@@ -322,6 +375,118 @@ def test_unsampled_dynamic_nodes_keep_their_previous_score(tmp_path):
     )
 
 
+def test_rotated_connection_is_forced_into_same_round_full_audit(tmp_path):
+    service, _, full, source = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    stable = set(first["regions"]["united-states"]["stable_slots"].values())
+    old_key = next(
+        key
+        for key in first["regions"]["united-states"]["ranked"]
+        if key not in stable
+    )
+    name = first["nodes"][old_key]["name"]
+    source.rotate_connection(name)
+    rotated_proxy = next(proxy for proxy in source.proxies if proxy["name"] == name)
+    new_key = node_key(rotated_proxy)
+    service.config.policy.full_audit_daily_fraction = 0
+    service.config.policy.promotion_challengers_per_region = 0
+    full.calls.clear()
+
+    current = service.run_once("maintenance")
+
+    assert new_key in full.calls
+    assert old_key not in current["nodes"]
+    assert new_key in current["nodes"]
+    assert current["identity_events"] == [
+        {
+            "event": "identity-rotated-name-match",
+            "method": "region-original-name",
+            "source_id": "",
+            "name": name,
+            "region": "united-states",
+            "before": old_key,
+            "after": new_key,
+        }
+    ]
+
+
+def test_rotated_stable_connection_keeps_slot_and_is_forced_into_full_audit(tmp_path):
+    service, _, full, source = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    slot = "2"
+    old_key = first["regions"]["united-states"]["stable_slots"][slot]
+    name = first["nodes"][old_key]["name"]
+    first_state = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+    old_changed_at = first_state["slot_changed_at"]["united-states"][slot]
+    source.rotate_connection(name)
+    rotated_proxy = next(proxy for proxy in source.proxies if proxy["name"] == name)
+    new_key = node_key(rotated_proxy)
+    full.calls.clear()
+
+    current = service.run_once("maintenance")
+    state = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+
+    assert current["regions"]["united-states"]["stable_slots"][slot] == new_key
+    assert new_key in full.calls
+    assert state["slot_changed_at"]["united-states"][slot] == old_changed_at
+    assert current["identity_events"][0]["before"] == old_key
+    assert current["identity_events"][0]["after"] == new_key
+    report = json.loads(
+        (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["slot_changes"] == []
+
+
+def test_full_passes_count_distinct_calendar_days_not_same_day_reruns(tmp_path):
+    service, _, full, _ = make_service(tmp_path, count=1)
+    first = service.run_once("rebuild")
+    key = first["regions"]["united-states"]["stable_slots"]["1"]
+
+    service.run_once("maintenance")
+    same_day = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+    assert same_day["nodes"][key]["consecutive_full_passes"] == 1
+    assert same_day["nodes"][key]["last_full_pass_day"] == "2026-07-24"
+
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    service.run_once("maintenance")
+    next_day = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+    assert next_day["nodes"][key]["consecutive_full_passes"] == 2
+    assert next_day["nodes"][key]["last_full_pass_day"] == "2026-07-25"
+
+
+def test_dynamic_unavailable_counter_is_consecutive_and_resets_on_recovery(tmp_path):
+    service, quick, _, _ = make_service(tmp_path, count=4)
+    first = service.run_once("rebuild")
+    key = first["regions"]["united-states"]["ranked"][0]
+    quick.unavailable.add(key)
+
+    for expected in (1, 2):
+        current = service.run_once("maintenance")
+        state = json.loads(
+            (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+        )
+        assert state["nodes"][key]["consecutive_unavailable_runs"] == expected
+        assert current["regions"]["united-states"]["ranked"][-1] == key
+
+    quick.unavailable.remove(key)
+    service.run_once("maintenance")
+    recovered = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+    assert recovered["nodes"][key]["consecutive_unavailable_runs"] == 0
+
+
 def test_unchanged_runtime_projection_keeps_version_stable(tmp_path):
     service, _, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
@@ -405,7 +570,7 @@ def test_missing_inventory_node_is_immediately_replaced(tmp_path):
     assert "节点已从订阅中消失" in changes
 
 
-def test_consecutive_unavailable_runs_never_remove_stable_slot(tmp_path):
+def test_three_consecutive_unavailable_runs_replace_stable_and_move_it_to_tail(tmp_path):
     service, quick, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     before = first["regions"]["united-states"]["stable_slots"]
@@ -423,13 +588,17 @@ def test_consecutive_unavailable_runs_never_remove_stable_slot(tmp_path):
 
     current = service.run_once("maintenance")
     after = current["regions"]["united-states"]["stable_slots"]
-    assert after == before
+    assert after[failed_slot] != failed_key
+    assert current["regions"]["united-states"]["ranked"][-1] == failed_key
     report = json.loads(
         (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
             encoding="utf-8"
         )
     )
-    assert report["slot_changes"] == []
+    changes = [
+        change for change in report["slot_changes"] if change["slot"] == failed_slot
+    ]
+    assert [change["reason"] for change in changes] == ["consecutive-unavailable"]
 
 
 def test_reachable_stable_node_resets_unavailable_counter(tmp_path):
@@ -446,7 +615,7 @@ def test_reachable_stable_node_resets_unavailable_counter(tmp_path):
     assert state["nodes"][key]["consecutive_unavailable_runs"] == 0
 
 
-def test_unchanged_rebuild_resets_cooldown_without_slot_change_alert(tmp_path):
+def test_unchanged_rebuild_refreshes_slot_timestamps_without_slot_change_alert(tmp_path):
     service, _, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     first_slots = first["regions"]["united-states"]["stable_slots"]
@@ -716,6 +885,11 @@ def test_http_endpoints_and_token(tmp_path):
             assert "nodes" not in ranking
             assert "stable_status" not in ranking["regions"]["united-states"]
             assert ranking["regions"]["united-states"]["stable_slots"]
+            assert len(ranking["identity_index"]) == 1
+            assert all(
+                "server" not in identity and "password" not in identity
+                for identity in ranking["identity_index"].values()
+            )
 
         unauthorized = urllib.request.Request(base + "/api/run?mode=maintenance", data=b"", method="POST")
         with pytest.raises(urllib.error.HTTPError) as error:
