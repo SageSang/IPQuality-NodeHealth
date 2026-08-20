@@ -18,7 +18,7 @@ Mihomo 控制器和探测端口都不映射到群晖宿主机。群晖只开放 
   -> OpenWrt 下载 healthy -> 原 rule_conf 转换器 -> local-socks / AdsPower / TXT
 ```
 
-扫描输入必须是 `inventory`，普通订阅客户端与当前简化部署的 OpenWrt 都使用 `healthy`。不要让 node-health 读取 `healthy`，否则会形成反馈循环，已经被过滤的节点无法重新恢复。本文后半部分保留的 `inventory + current.json` OpenWrt 轮询器只是可选高级方案，本次不部署。
+扫描输入必须是原始 `inventory`，普通订阅客户端与当前简化部署的 OpenWrt 都使用只做排序的 `healthy`。不要让 node-health 读取 `healthy`，否则会形成上一版排序影响下一轮扫描输入的反馈循环。本文后半部分保留的 `inventory + current.json` OpenWrt 轮询器只是可选高级方案，本次不部署。
 
 日常排序不需要再通过 `rule_conf` 或其他 Git 仓库反复拉取、覆盖、提交和推送。`current.json` 就是带版本的实时排序源，Sub-Store Script Operator 在服务端读取它；若你习惯用 `rule_conf` 托管脚本，只需一次性托管静态的 `health-ranking-operator.js`，动态排名数据仍直接读取群晖 API。
 
@@ -175,7 +175,7 @@ curl -fsS http://192.0.2.2:18887/current.json
 /volume1/docker/YOUR_PROJECT_DIR/reports/alerts/YYYY-MM-DD-版本号.md
 ```
 
-`data/current.json` 是服务内部的完整当期结果；HTTP `/current.json` 只公开 Sub-Store/OpenWrt 所需的版本、地区稳定槽、动态白名单和拒绝列表，不公开节点名称、出口 IP 或原始检测详情。`state.json` 保存下一轮决策需要的连续通过次数、可信深检和槽位冷却信息；`state-snapshots` 默认只保留最近三个，并通过版本与 `current.json` 配对。
+`data/current.json` 是服务内部的完整当期结果；HTTP `/current.json` 只公开 Sub-Store/OpenWrt 所需的版本、地区稳定槽、完整动态顺序和风险标记，不公开节点名称、出口 IP 或原始检测详情。`state.json` 保存下一轮决策需要的连续通过次数、可信深检和槽位冷却信息；`state-snapshots` 默认只保留最近三个，并通过版本与 `current.json` 配对。
 
 每日 `YYYY-MM-DD.md/.json` 是该日期最后一次写入的完整报告，同一天重复运行会覆盖同名日报。`latest-run.md` 每次发布都会更新，展示当前 degraded/unavailable/absent 槽位；`slot-changes-latest.md` 首次创建后只在真实身份变化时更新，因此不会被下一轮“无变化”覆盖。每日完整报告默认保留 30 天，带日期和版本号的槽位变更历史不随它清理。
 
@@ -193,16 +193,16 @@ POST /api/run?mode=maintenance
 
 它会对全部节点快速检测；完整检测所有稳定槽位、全部新节点和出口 IP 变化节点，并按每个地区的当前动态排名分段抽检约四分之一。每个四节点排名段优先选择最久未深检的成员，因此正常情况下约四天覆盖一轮，不会再在 48 小时时集中触发整批深检。每区当前最高分的动态候补每天额外深检，用于积累连续晋级证据。
 
-稳定槽位 `001-003` 是三个无序的固定身份，不是“001 比 003 更优”的实时排名。`maintenance` 以身份稳定为第一优先级：
+稳定槽位 `001-003` 正常情况下是三个固定身份；合格可用节点不足三个时则放弃历史身份顺序，按整体质量重排以保证固定入口优先可用：
 
 | 检测情况 | 稳定槽位处理 | 固定端口结果 |
 |---|---|---|
 | 新候补仅略高于当前节点 | 不替换 | 继续指向原身份 |
 | 高置信候补满足全部自动晋级门槛 | 每区本轮最多替换一个可比较的最弱稳定节点 | 仅被选中的固定端口改变身份 |
-| 单次超时或连续第 1-2 次不可用 | 保留原 `node_key`，恢复后计数归零 | 端口可能暂时不可用，但不改指向 |
-| 仍在 `inventory` 但连续第 3 次不可用 | 用最高质量合格候补替换该槽位 | 只改变对应固定端口的身份 |
-| 节点从 `inventory` 消失 | 当轮释放，并尽量用最高质量合格候补替换 | 只改变对应固定端口；无候补则留空 |
-| 明确触发质量红线 | 只用本轮重新深检通过的最高分合格候补替换这个槽位 | 仅该端口变更身份，其他两个槽位不动 |
+| 任意次数连接不可用但仍在 `inventory` | 保留原 `node_key`，恢复后计数归零 | listener 和原指向始终保留，出口可能暂时不可用 |
+| 节点从 `inventory` 消失 | 当轮释放并用最高质量候补补齐 | 地区至少还有三个节点时不留空 |
+| 明确触发质量红线且合格候补充足 | 只用最高分合格候补替换这个槽位 | 仅该端口变更身份，其他两个槽位不动 |
+| 合格可用节点不足三个 | 全地区所有节点按可用性、风险和质量重排 | 风险或不可达节点也可补槽，最优节点从 `001` 开始 |
 
 质量红线必须是明确结论，例如地区不匹配、出口采样不稳定、Tor/DNSBL、多个风险源同时高风险，或 AI 服务明确返回 `Block/WebOnly/APPOnly` 等不可用或受限状态。单次稳定节点出口 IP 变化只会重置置信度并强制绑定新 IP 深检，不会单凭变化换槽。普通超时、第三方风险接口失败以及 AI 检测返回 `Failed/Unknown` 都不是新的红线；此前健康的槽位会保留但标记为 `degraded`，也不能作为新槽位候选。如果同一出口 IP 已有可信红线，模糊结果不能解除它，节点继续被拒绝，直到新的可信 clean 深检通过。
 
@@ -211,17 +211,17 @@ POST /api/run?mode=maintenance
 - 至少连续 `3` 次完整检测通过，达到高置信度；
 - 至少 `2` 个风险评分源返回有效数据，AI 可用性为明确通过；
 - 默认 3 次出口采样至少成功 2 次，出口 IP 一致，实际地区与节点地区一致；
-- 综合分至少比当前“可比较的最弱稳定节点”高 `20` 分；
+- 综合分至少比当前“可比较的最弱稳定节点”高 `10` 分；
 - 同一地区本轮最多晋级 `1` 个节点；
 - 该地区任一稳定槽位距离上次身份变化，至少已经冷却 `3` 天。
 
-“可比较”只包含当前存在、可用且检测数据足以比较的稳定节点。阈值内的 unavailable 稳定节点不参与“最弱节点”比较，因此自动晋级不能借一次掉线清退它；从 inventory 消失的身份则按缺失规则立即释放。如果该地区尚在冷却期，或没有可比较的稳定节点，本轮不执行性能晋级。
+“可比较”只包含当前存在、可用且检测数据足以比较的稳定节点。unavailable 稳定节点不参与“最弱节点”比较，因此自动晋级不能借连接失败清退它；从 inventory 消失的身份则按缺失规则立即释放。如果该地区尚在冷却期，或没有可比较的稳定节点，本轮不执行性能晋级。
 
-除了当前分差，服务还会核对上一轮可比得分是否同样至少领先 `20` 分，以过滤单日偶然峰值。冷却期只限制“为了更高质量而晋级”，不阻止明确质量红线的安全替换。每次晋级、红线替换或 `rebuild` 后，都会重新计算该地区的 3 天晋级冷却期；同一地区仍然遵守每轮最多晋级一个节点。
+除了当前分差，服务还会核对上一轮可比得分是否同样至少领先 `10` 分，以过滤单日偶然峰值。冷却期只限制“为了更高质量而晋级”，不阻止明确质量红线的安全替换。每次晋级、红线替换或 `rebuild` 后，都会重新计算该地区的 3 天晋级冷却期；同一地区仍然遵守每轮最多晋级一个节点。
 
-稳定槽位之后的动态节点，也就是逻辑上的第 4 名及以后，只有本轮可信深检成功的节点才更新质量分；未轮到的节点保留上一轮可信分数和相对质量依据。动态节点确认不可用或触发红线时仍可直接从 `healthy` 输出移除。
+稳定槽位之后的动态节点，也就是逻辑上的第 4 名及以后，只有本轮可信深检成功的节点才更新质量分；未轮到的节点保留上一轮可信分数和相对质量依据。风险、不可达、证据不足和未匹配节点全部继续输出，只根据状态移动到更靠后的位置。
 
-这项策略的明确代价是：某个 AdsPower 固定端口可能在节点恢复前暂时不可用。但它不会因为一次网络波动或普通分数变化悄悄指向另一个身份；只有明确质量红线、满足全部门槛的受控晋级或手动 `rebuild` 才能改变槽位身份。
+这项策略的明确代价是：固定 listener 虽然持续存在，所绑定节点仍可能在连接恢复前无法代理。但它不会因为网络波动悄悄指向另一个身份；只有明确质量红线、合格节点不足触发整体重排、满足全部门槛的受控晋级、节点从 inventory 消失或手动 `rebuild` 才能改变槽位身份。
 
 这些门槛都可以在 `deploy/config/config.example.yaml` 的 `policy` 中调整：
 
@@ -230,7 +230,7 @@ promotion_enabled: true
 full_audit_daily_fraction: 0.25
 promotion_challengers_per_region: 1
 promotion_min_full_passes: 3
-promotion_score_margin: 20
+promotion_score_margin: 10
 promotion_max_per_region_per_run: 1
 promotion_cooldown_days: 3
 min_valid_risk_sources: 2
@@ -262,7 +262,7 @@ curl -fsS -X POST \
   "http://192.0.2.2:18887/api/run?mode=rebuild"
 ```
 
-`rebuild` 会全量深检所有可用节点，并允许每区所有合格节点重新竞争三个稳定槽位；原来健康的 1-3 也不保留特权。它不使用日常晋级的 `12` 分差、每轮一个和冷却期限制，仍然直接选出当次全量检测中最优的三个节点。
+`rebuild` 会全量深检所有可用节点，并允许每区所有合格节点重新竞争三个稳定槽位；原来健康的 1-3 也不保留特权。它不使用日常晋级的 `10` 分差、每轮一个和冷却期限制；合格节点不足三个时改为按全部节点的可用性、风险和质量选择前三。
 
 `rebuild` 不会边测边改变线上结果。旧 `current.json` 一直有效，只有全量扫描、评分和文件写入全部成功后才切换到新版本。
 
@@ -272,7 +272,7 @@ curl -fsS -X POST \
 
 - 稳定槽位按 `001-003` 展示固定身份、端口、当前健康状态、最后成功时间和详细检测结果，不把槽位号解释成质量名次。
 - 动态节点从第 4 名开始按当日质量顺序展示。
-- 阈值内临时不可用的稳定槽位标记为“保留等待恢复”，并显示连续不可用次数；从 inventory 消失或连续达到阈值的节点会记录实际换槽原因。
+- 临时不可用的稳定槽位始终标记为“保留等待恢复”，并显示连续不可用次数；只有从 inventory 消失、命中红线、整体降级重排或受控晋级才记录实际换槽原因。
 - 真正发生替换时，记录地区、槽位、旧节点、新节点、触发原因以及运行模式是 `maintenance` 还是 `rebuild`。
 - 自动晋级还会记录候补连续完整通过次数、晋级前后分数和实际分差；地区冷却时间保存在 `data/state.json` 的 `slot_changed_at` 中。
 
@@ -338,7 +338,7 @@ reports/audits/YYYY/MM/DD/<id>/report.json
 
 在 Sub-Store 中建立两个集合：
 
-三类消费者不要混用 URL：node-health 的 `SUB_STORE_INVENTORY_URL` 和 OpenWrt 的 `SOURCE_URL` 都读取完整 `inventory?target=ClashMeta&noCache=true`；只有 OpenClash、subconverter、手机和电脑等普通订阅客户端读取经过严格过滤的 `healthy?target=ClashMeta&noCache=true`。node-health 读取 `healthy` 会形成检测反馈循环，OpenWrt 读取 `healthy` 则会失去本地严格校验和全拒绝时生成零监听的能力。
+三类消费者不要混用 URL：node-health 的 `SUB_STORE_INVENTORY_URL` 和 OpenWrt 的 `SOURCE_URL` 都读取完整 `inventory?target=ClashMeta&noCache=true`；OpenClash、subconverter、手机和电脑等普通订阅客户端读取只做质量排序的 `healthy?target=ClashMeta&noCache=true`。node-health 读取 `healthy` 会形成排序反馈循环，OpenWrt 读取 `healthy` 则会失去本地完整性校验和固定槽补位能力。
 
 ### inventory
 
@@ -357,7 +357,7 @@ reports/audits/YYYY/MM/DD/<id>/report.json
 - OpenClash、subconverter、手机、电脑等所有实际订阅都改为从 `healthy` 派生。
 - 下载 URL 使用 `http://群晖局域网IP:3001/download/collection/healthy?target=ClashMeta&noCache=true`。
 
-健康脚本采用两层保护：成功读取有效 `current.json` 时，稳定槽位按固定身份顺序输出，只有第 4 名以后的节点才按 `ranked` 健康排序。动态节点确认不可用、触发红线或不再位于本轮白名单时会删除；稳定槽位在连续不可用阈值内保持身份，达到阈值或从 `inventory` 消失时由 node-health 发布替换后的槽位。
+健康脚本只改变顺序：成功读取有效 `current.json` 时，先输出稳定槽位，再按 `ranked` 输出其余节点；风险、不可达、证据不足和未检测节点全部保留。排名中暂未出现的输入节点放在末尾并保持原顺序。固定节点连接失败时保持身份；命中红线且合格候补充足时由最佳动态候补原槽替换，候补不足时全地区重排并补满前三槽。
 
 如果 Script Operator 使用远程脚本链接而界面没有单独的 arguments 输入框，把 URL 编码后的 JSON 放到脚本链接 fragment，例如：
 
@@ -365,13 +365,13 @@ reports/audits/YYYY/MM/DD/<id>/report.json
 https://你的代码地址/health-ranking-operator.js#%7B%22rankingUrl%22%3A%22http%3A%2F%2F192.0.2.2%3A18887%2Fcurrent.json%22%7D
 ```
 
-脚本会先用 Sub-Store 自身的 `ProxyUtils.produce(..., 'ClashMeta', 'internal')` 规范化 VMess/VLESS/Trojan 等内部对象，再计算与 inventory YAML/OpenWrt 完全一致的 `node_key`。只要状态已成功下载并通过校验，排序白名单就是权威结果：状态中存在允许节点但一个身份都匹配不到时会抛出 identity-drift 错误，不会把未检测节点原样放行。这通常说明 healthy 与 inventory 的处理链不一致，必须先修复再切换客户端；OpenWrt 会因零匹配校验失败而继续使用上一版配置。
+脚本会先用 Sub-Store 自身的 `ProxyUtils.produce(..., 'ClashMeta', 'internal')` 规范化 VMess/VLESS/Trojan 等内部对象，再计算与 inventory YAML/OpenWrt 完全一致的 `node_key`。身份匹配只决定排序位置，不决定节点是否输出；即使 healthy 与 inventory 短暂不同步，未匹配节点也会完整保留在末尾。
 
 有效状态必须至少包含一个地区；每个地区都必须包含对象类型的 `stable_slots`、数组类型的 `ranked` 和对象类型的 `rejected`，并且整份状态至少记录一个节点决策。单个地区可以为空。`regions: {}`、所有地区均为空壳、字段缺失或类型错误则视为不完整状态。
 
-当全局所有节点都被明确拒绝时，排序逻辑本身会得到空数组，但当前 Sub-Store 在 collection processor 后会拒绝生成零节点工件，因此直接请求 `healthy` 通常返回 HTTP 错误，客户端可能继续保留自己的旧缓存。OpenWrt 不依赖该行为：它下载完整 inventory 并在本地生成零监听配置，从而不会继续暴露已确认危险的代理端口。
+当全局所有节点都命中红线时，仍然输出全部节点，并按可用性、风险程度和质量从优到劣排序；最没风险、最可用的节点优先占固定槽位。
 
-状态下载、参数或校验失败时，脚本直接抛错，让本次 `healthy` 请求失败，不会把完整输入误标成健康节点。手机和电脑通常继续使用客户端自己的上一份订阅缓存；OpenWrt 则有独立的状态校验和应用回滚，无法验证时继续运行上一版 local-socks 配置。
+状态下载、参数或校验失败时，脚本记录错误并原样返回完整输入，不进行健康排序或删除。OpenWrt 仍有独立的状态校验和应用回滚，无法验证时继续运行上一版 local-socks 配置。
 
 当前 Sub-Store 的 `/download/collection` 每次请求都会重新执行 `produceArtifact` 和 Script Operator；但机场等上游资源默认仍可能缓存一小时，因此 `inventory`、`healthy` 两个下载 URL 都必须带 `noCache=true`。排序脚本内部再用 `#noCache` 读取 `current.json`，OpenWrt 还会追加 `_node_health_version` 参数并发送 no-cache 请求头，用于把请求与本次排序版本绑定并规避中间缓存。
 
@@ -484,7 +484,7 @@ NODE_PATH=/etc/local-socks/node_modules:/usr/lib/node_modules \
 apply-command INVENTORY_YAML CURRENT_JSON VERSION
 ```
 
-仓库自带的 `apply-ranking.sh` 已经实现完整流程：调用稳定槽位转换器、执行 Mihomo 配置自检、原子替换、重启、读取 procd 的真实实例状态，并使用 Node `net` 并发确认新 YAML 中的每个 listener 都能在 `127.0.0.1` 建立 TCP；任一应存在的监听缺失都会恢复旧配置并重启旧服务。全局明确拒绝全部节点时，合法的零 listener 配置直接通过。只有全部成功才返回 0。自动确认不等同于节点真实代理出网验收，因此启用 cron 前仍必须按下文检查固定监听端口和 HTTPS 出口。不要把 `APPLY_COMMAND` 换成直接覆盖正式配置的脚本。
+仓库自带的 `apply-ranking.sh` 已经实现完整流程：调用稳定槽位转换器、执行 Mihomo 配置自检、原子替换、重启、读取 procd 的真实实例状态，并使用 Node `net` 并发确认新 YAML 中的每个 listener 都能在 `127.0.0.1` 建立 TCP；任一应存在的监听缺失或任一 inventory 节点未生成 listener，都会恢复旧配置并重启旧服务。即使全部节点命中红线也必须保留完整 listener 集合。只有全部成功才返回 0。自动确认不等同于节点真实代理出网验收，因此启用 cron 前仍必须按下文检查固定监听端口和 HTTPS 出口。不要把 `APPLY_COMMAND` 换成直接覆盖正式配置的脚本。
 
 `service-lib.sh` 会把 OpenClash 当前核心原子复制为 `/etc/local-socks/bin/mihomo-local-socks` 后再运行，并把 `nofile` 提升到 `65535`。不要把 `MIHOMO_BIN` 改回 `/etc/openclash/core/clash_meta`；独立文件和进程名可保证 OpenClash 重启、更新或清理核心时不会误杀 local-socks。轮询器也不依赖 `/etc/init.d/local-socks status` 的模糊返回值，而是读取 ubus 中实例的真实 `running` 状态并连接一个实际 listener。排名、配置和 TXT 均一致但运行时停止时，它会直接从本地配置恢复，不依赖 NAS 或 Sub-Store，也不会改变节点顺序。
 
@@ -518,7 +518,7 @@ apply-command INVENTORY_YAML CURRENT_JSON VERSION
 62803 起 = 美国动态候选
 ```
 
-如果 `002` 只是连续第 1-2 次不可用，`62801` 不会改绑候补；恢复后计数归零。连续第 3 次仍不可用、节点从订阅消失、明确触发质量红线、被满足全部门槛的候补受控晋级替换，或运行全量 `rebuild` 时，才允许更换身份。发生单槽替换时只更新 `62801`，其他稳定端口不移动；没有合格候补时该端口留空，动态候选仍从 `62803` 开始。
+如果 `002` 连接不可用，不论连续多少次，`62801` 都保持原节点和 listener，恢复后计数归零。节点从订阅消失、明确触发质量红线、被满足全部门槛的候补受控晋级替换，或运行全量 `rebuild` 时才允许更换身份。红线替换且合格候补充足时只更新对应端口；合格可用节点不足三个时，所有节点按整体质量重排并重新占据 `001-003`。只要该地区仍有至少三个不同节点，固定端口就不得留空；风险节点仍保留在固定或动态端口中。
 
 ### 启用 cron 前的真实验收
 
@@ -572,12 +572,12 @@ uci commit firewall
 ## 10. 失败保护和回滚
 
 - inventory 下载失败：本轮任务失败，不发布新状态。
-- 稳定节点连续第 1-2 次不可用：保留槽位身份；连续第 3 次或从 inventory 缺失：替换对应槽位或在无候补时留空。
+- 稳定节点连接不可用：无论连续多少次都保留槽位身份和 listener；从 inventory 缺失时用剩余节点补位。
 - Mihomo 配置加载失败：本轮任务失败，保留上一版 `current.json`。
 - 深检出口 IP 与快速检测出口 IP 不一致、地区证据覆盖不足或风险源大量返回空值：整轮 `rebuild` 不发布。
 - IPQuality 第三方接口超时：标记不确定，不把节点误判为危险。
 - 报告或状态无法原子写入：不推进当前版本。
-- Sub-Store 状态读取、校验或身份匹配失败：本次 healthy 请求失败，不输出未过滤 inventory；客户端通常保留自己的旧缓存。
+- Sub-Store 状态读取、校验或身份匹配失败：记录错误并原样输出完整 inventory，不删除节点。
 - OpenWrt 下载、转换或 Mihomo 自检失败：继续运行旧 local-socks 配置，不记录新版本。
 - OpenWrt 发现同版本配置、服务或 TXT 被人工覆盖/删除：自动重新应用该版本。
 

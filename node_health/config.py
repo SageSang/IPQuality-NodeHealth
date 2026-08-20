@@ -85,7 +85,7 @@ class PolicyConfig:
     minimum_candidate_success_rate: float = 0.6666
     promotion_enabled: bool = True
     promotion_min_full_passes: int = 3
-    promotion_score_margin: float = 20.0
+    promotion_score_margin: float = 10.0
     promotion_max_per_region_per_run: int = 1
     promotion_cooldown_days: int = 3
     expected_country: dict[str, str] = field(default_factory=dict)

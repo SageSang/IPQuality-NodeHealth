@@ -27,6 +27,37 @@ def ranking_key(assessment: NodeAssessment) -> tuple[object, ...]:
     )
 
 
+def complete_ranking_key(assessment: NodeAssessment) -> tuple[object, ...]:
+    """Order every inventory node without turning health into a filter.
+
+    Reachability is the first fallback concern because the fixed listeners are
+    operational endpoints.  Confirmed danger is considered next, followed by
+    the existing confidence/score/latency ordering.  Consequently a reachable
+    rejected node can still keep a fixed listener alive when there are fewer
+    than three safe usable nodes, while the least risky/highest-quality member
+    of an all-rejected group remains first.
+    """
+
+    return (
+        0 if assessment.quick.available else 1,
+        1 if assessment.evaluation.redline else 0,
+        len(assessment.evaluation.reasons) if assessment.evaluation.redline else 0,
+        *ranking_key(assessment),
+    )
+
+
+def _qualified_stable_candidate(assessment: NodeAssessment) -> bool:
+    return bool(
+        assessment.quick.available
+        and assessment.evaluation.eligible
+        and assessment.full is not None
+        and assessment.full.completed
+        and assessment.fresh_full_completed
+        and chatgpt_explicitly_allowed(assessment.full)
+        and assessment.evaluation.confidence in {"high", "provisional"}
+    )
+
+
 def assign_region_slots(
     mode: str,
     assessments: Iterable[NodeAssessment],
@@ -35,67 +66,50 @@ def assign_region_slots(
     unavailable_replace_after_runs: int = 3,
 ) -> tuple[dict[str, str], list[str], dict[str, str]]:
     items = list(assessments)
-    eligible = {item.node.key: item for item in items if item.evaluation.eligible}
-    ranked_eligible = sorted(eligible.values(), key=ranking_key)
-    # Unreachable nodes are retained as a degraded tail. They must not fill
-    # new stable slots, but a transient probe failure must not delete them.
-    unavailable = sorted(
-        [
-            item
-            for item in items
-            if item.evaluation.decision == "unavailable"
-            and not item.evaluation.redline
-        ],
+    ranked = sorted(items, key=complete_ranking_key)
+    qualified = sorted(
+        (item for item in items if _qualified_stable_candidate(item)),
         key=ranking_key,
     )
-    ranked = ranked_eligible + unavailable
-    qualified = [
-        item
-        for item in ranked
-        if item.full is not None
-        and item.full.completed
-        and item.fresh_full_completed
-        and chatgpt_explicitly_allowed(item.full)
-        and item.evaluation.confidence in {"high", "provisional"}
-    ]
     rejected = {
         item.node.key: ";".join(item.evaluation.reasons) or "rejected"
         for item in items
         if item.evaluation.redline
     }
+    degraded_rerank = slot_count > 0 and len(qualified) < slot_count
 
     if mode == "rebuild":
-        chosen = qualified[:slot_count]
+        chosen = (ranked if degraded_rerank else qualified)[:slot_count]
         slots = {str(index + 1): item.node.key for index, item in enumerate(chosen)}
     elif mode == "maintenance":
-        previous_slots = previous_slots or {}
-        by_key = {item.node.key: item for item in items}
-        slots: dict[str, str] = {}
-        used: set[str] = set()
-        missing: list[str] = []
-        for index in range(1, slot_count + 1):
-            slot = str(index)
-            key = previous_slots.get(slot, "")
-            current = by_key.get(key)
-            preserve = bool(key) and current is not None and not current.evaluation.redline
-            if (
-                preserve
-                and not current.quick.available
-                and current.consecutive_unavailable_runs >= unavailable_replace_after_runs
-            ):
-                preserve = False
-            if preserve and key not in used:
-                slots[slot] = key
-                used.add(key)
-                # Stable temporary failures remain allowlisted. Dynamic
-                # unavailable nodes remain in the ranked tail.
-                rejected.pop(key, None)
-            else:
-                missing.append(slot)
-        candidates = [item for item in qualified if item.node.key not in used]
-        for slot, candidate in zip(missing, candidates):
-            slots[slot] = candidate.node.key
-            used.add(candidate.node.key)
+        if degraded_rerank:
+            # With fewer than three safe usable nodes, slot identity is less
+            # important than keeping every possible fixed endpoint occupied.
+            chosen = ranked[:slot_count]
+            slots = {str(index + 1): item.node.key for index, item in enumerate(chosen)}
+        else:
+            previous_slots = previous_slots or {}
+            by_key = {item.node.key: item for item in items}
+            slots = {}
+            used: set[str] = set()
+            missing: list[str] = []
+            for index in range(1, slot_count + 1):
+                slot = str(index)
+                key = previous_slots.get(slot, "")
+                current = by_key.get(key)
+                # A connection failure is not a quality redline. Preserve the
+                # identity and listener for as long as the node remains in the
+                # successful inventory snapshot; it may recover later.
+                preserve = bool(key) and current is not None and not current.evaluation.redline
+                if preserve and key not in used:
+                    slots[slot] = key
+                    used.add(key)
+                else:
+                    missing.append(slot)
+            candidates = [item for item in qualified if item.node.key not in used]
+            for slot, candidate in zip(missing, candidates):
+                slots[slot] = candidate.node.key
+                used.add(candidate.node.key)
     else:
         raise ValueError(f"unsupported mode: {mode}")
 
@@ -151,6 +165,12 @@ def assign_all_regions(
             ),
         )
         old = previous.get(region, {})
+        qualified_count = sum(
+            1 for item in grouped.get(region, []) if _qualified_stable_candidate(item)
+        )
+        degraded_rerank = bool(
+            region_slot_count and qualified_count < region_slot_count
+        )
         required_slot_change = any(
             old.get(str(index), "") != slots.get(str(index), "")
             for index in range(1, region_slot_count + 1)
@@ -161,6 +181,7 @@ def assign_all_regions(
             and region_slot_count
             and policy is not None
             and not required_slot_change
+            and not degraded_rerank
         ):
             slots, promotion_slots = _apply_promotions(
                 slots,
@@ -171,25 +192,17 @@ def assign_all_regions(
                 now,
             )
             assigned = set(slots.values())
-            eligible_ranked = sorted(
-                (
-                    item
-                    for item in grouped.get(region, [])
-                    if item.evaluation.eligible and item.node.key not in assigned
-                ),
-                key=ranking_key,
-            )
-            unavailable_ranked = sorted(
-                (
-                    item
-                    for item in grouped.get(region, [])
-                    if item.evaluation.decision == "unavailable"
-                    and not item.evaluation.redline
-                    and item.node.key not in assigned
-                ),
-                key=ranking_key,
-            )
-            ranked = [item.node.key for item in eligible_ranked + unavailable_ranked]
+            ranked = [
+                item.node.key
+                for item in sorted(
+                    (
+                        item
+                        for item in grouped.get(region, [])
+                        if item.node.key not in assigned
+                    ),
+                    key=complete_ranking_key,
+                )
+            ]
         regions[region] = {
             "stable_slots": slots,
             "stable_status": {
@@ -212,15 +225,11 @@ def assign_all_regions(
                     "missing-from-inventory"
                     if before and before_assessment is None
                     else (
-                        "repeated-unavailable"
-                        if before_assessment
-                        and not before_assessment.quick.available
-                        and policy is not None
-                        and before_assessment.consecutive_unavailable_runs
-                        >= policy.stable_unavailable_replace_after_runs
+                        "quality-redline"
+                        if before_assessment and before_assessment.evaluation.redline
                         else (
-                            "quality-redline"
-                            if before_assessment and before_assessment.evaluation.redline
+                            "degraded-quality-rerank"
+                            if degraded_rerank
                             else "vacant-slot-fill"
                         )
                     )

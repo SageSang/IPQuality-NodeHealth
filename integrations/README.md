@@ -33,7 +33,7 @@ consume the same document:
         "1": "2af9...64 hex characters...",
         "2": "88d1...64 hex characters..."
       },
-      "ranked": ["8a02...", "fa93..."],
+      "ranked": ["8a02...", "fa93...", "60aa..."],
       "rejected": {
         "60aa...": "country-mismatch:JP!=US"
       }
@@ -47,39 +47,31 @@ surface. Detailed node names, scores, stable status, exit IPs, and raw probe
 results stay in the private persisted state and reports; Sub-Store and OpenWrt
 must not depend on those private fields.
 
-After a valid document is loaded, `regions.*.stable_slots` plus
-`regions.*.ranked` form the complete allow-list. Explicitly rejected keys and
-keys missing from that allow-list are removed. An invalid or unavailable
-document makes the collection request fail closed; it must never cause
-Sub-Store to label the unfiltered source as healthy.
+After a valid document is loaded, `regions.*.stable_slots` followed by
+`regions.*.ranked` define ordering only. `rejected` is risk metadata, not a
+deletion list. Every proxy in the complete Sub-Store input is returned exactly
+once; keys missing from the ranking remain at the tail in their source order.
+An invalid or unavailable document preserves the complete input order.
 
 A valid document has at least one region. Every region payload must be an
 object containing an object `stable_slots`, an array `ranked`, and an object
 `rejected`. Individual regions may contain no nodes, but the document as a
 whole must contain at least one node key in one of those three decision sets.
-An explicit all-rejected document is valid and intentionally returns an empty
-proxy array. Current Sub-Store collection downloads reject a zero-proxy
-artifact and normally answer with an HTTP error, so direct clients may retain
-their own previous cache. OpenWrt avoids that ambiguity by filtering the full
-inventory locally and can publish a deliberate zero-listener config. An empty
-`regions` object or an all-empty shell is invalid.
+An explicit all-rejected document is valid and returns every proxy, with the
+least risky/highest-quality nodes first. An empty `regions` object or an
+all-empty shell remains invalid and therefore falls back to source order.
 
-Fetch, validation, missing-argument, and identity-drift failures are
-fail-closed: the Script Operator throws, so Sub-Store must not expose the
-unfiltered source as a healthy subscription. Direct clients normally keep
-their own prior subscription cache. The OpenWrt poller has an independent
-state-validation layer and keeps its last applied configuration when a new
-pair cannot be validated.
+Fetch, validation, missing-argument, and identity-drift failures are fail-open
+for completeness: the Script Operator logs the problem and returns its input
+without filtering. The OpenWrt poller retains its independent validation layer
+and keeps the last applied configuration when a new pair cannot be validated.
 
-After a state has passed validation, its allow-list is strict. A non-empty
-allow-list that matches zero input proxies throws an identity-drift error; an
-intentional all-rejected state has an empty allow-list and returns `[]`.
-
-Stable-slot membership is authoritative over a transient rejection such as
-`quick_unavailable` while its consecutive-failure grace period remains. At the
-configured threshold, or immediately when the identity disappears from the
-full inventory, node-health removes/replaces that key in `stable_slots`.
-Hard-danger removal uses the same published-state transition.
+Stable-slot membership is authoritative over connectivity failure for as long
+as the identity remains in the successful inventory snapshot. Confirmed danger
+immediately replaces only that slot when three safe usable candidates exist.
+When fewer than three such candidates exist, the complete regional inventory
+is reranked and its best available three fill the fixed slots, including risky
+or unavailable nodes when necessary. No health result removes a node.
 
 `version` is an opaque, non-empty string. The OpenWrt poller compares it for
 equality and writes it only after a successful atomic apply.
@@ -175,8 +167,8 @@ http://SYNOLOGY_LAN_IP:3001/download/collection/healthy?target=ClashMeta&noCache
 The scanner's `SUB_STORE_INVENTORY_URL` and the OpenWrt poller's `SOURCE_URL`
 must both use the first URL. Only ordinary subscription clients use the second
 URL; pointing either scanner or OpenWrt source at `healthy` creates an
-unnecessary filtered feedback path and prevents local recovery of omitted
-nodes.
+unnecessary ranking feedback path and weakens the poller's independent source
+validation and vacant-slot recovery.
 
 In the current Sub-Store implementation, every `/download/collection` request
 runs `produceArtifact`, including the Script Operator. Source-resource
@@ -187,9 +179,9 @@ verify in its logs that the operator ran twice, then publish a real slot change
 and verify the returned first three regional nodes match `current.json`.
 
 The operator always derives identities through fixed ClashMeta internal
-production, regardless of the client target requested from Sub-Store. If a
-non-empty ranking allow-list matches zero source identities, it throws an
-identity-drift error instead of silently emitting the unfiltered source.
+production, regardless of the client target requested from Sub-Store. Ranking
+identities that do not match the current source do not remove current proxies;
+unmatched source proxies remain at the tail in their original order.
 
 ## OpenWrt poller
 
@@ -273,9 +265,10 @@ converter.nodeKey(proxy)
 ```
 
 For every fixed region, slots 1 through 3 map to `base + slot - 1`.
-Candidates start at `base + 3`; empty stable slots remain empty and never
-shift another slot. Explicitly rejected keys are omitted. Unknown proxies are
-also omitted after a valid state is loaded. A state fetch/validation failure is
-handled before conversion and leaves the last working OpenWrt config active.
+Candidates start at `base + 3`. If an older ranking contains an empty or
+unresolvable stable slot, the converter fills it from the best remaining source
+node instead of creating a port gap. Rejected and unknown proxies remain in the
+dynamic sequence. A state fetch/validation failure is handled before
+conversion and leaves the last working OpenWrt config active.
 The heterogeneous `other` region has no stable slots and starts
 at its block base (`64200` with the default start port).

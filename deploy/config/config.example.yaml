@@ -42,10 +42,8 @@ policy:
   # maintenance keeps these identities unordered and fixed; rebuild lets all
   # fully audited candidates compete for these slots again.
   stable_slots: 3
-  # Keep a stable identity through brief connectivity failures. If the node is
-  # still present but fails this many consecutive scheduled scans, replace only
-  # that slot with the best fully qualified candidate. A node absent from the
-  # inventory is removed immediately instead of using this grace period.
+  # Retained for backwards-compatible config parsing and unavailable counters.
+  # Connectivity failure alone no longer replaces or empties a stable slot.
   stable_unavailable_replace_after_runs: 3
   # Deep-audit one node from each four-node ranking block, preferring the
   # least-recently audited member. This covers the dynamic pool in about 4 days.
@@ -73,7 +71,7 @@ policy:
   # stable identity is never used as the weakest comparison target.
   promotion_enabled: true
   promotion_min_full_passes: 3
-  promotion_score_margin: 20
+  promotion_score_margin: 10
   promotion_max_per_region_per_run: 1
   promotion_cooldown_days: 3
   expected_country:

@@ -825,6 +825,7 @@ _CHANGE_REASON_ZH = {
     "missing-from-inventory": "节点已从订阅中消失",
     "repeated-unavailable": "连续多次不可达",
     "quality-redline": "触发质量红线",
+    "degraded-quality-rerank": "合格可用节点不足，按整体质量重排",
     "vacant-slot-fill": "填补空槽位",
 }
 

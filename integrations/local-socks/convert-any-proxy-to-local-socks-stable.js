@@ -281,9 +281,6 @@
 
   function stateIndex(state) {
     const keyRegion = new Map();
-    const allowed = new Set();
-    const rejected = new Set();
-    const stableKeys = new Set();
     const stable = new Map();
     const ranked = new Map();
 
@@ -295,7 +292,6 @@
           ? Object.keys(rejectedEntries)
           : [];
       for (const key of rejectedKeys.filter(Boolean)) {
-        rejected.add(key);
         keyRegion.set(key, regionKey);
       }
 
@@ -305,8 +301,6 @@
         const key = keyFromEntry(slots && slots[String(slot)]);
         if (key) {
           slotMap.set(slot, key);
-          stableKeys.add(key);
-          allowed.add(key);
           keyRegion.set(key, regionKey);
         }
       }
@@ -318,10 +312,14 @@
           const key = keyFromEntry(entry);
           if (key && !ordered.includes(key)) {
             ordered.push(key);
-            allowed.add(key);
             keyRegion.set(key, regionKey);
           }
         }
+      }
+      // Compatibility with older ranking documents that kept rejected nodes
+      // only in the metadata object. They remain usable entries at the tail.
+      for (const key of rejectedKeys.filter(Boolean)) {
+        if (!ordered.includes(key)) ordered.push(key);
       }
       ranked.set(regionKey, ordered);
     }
@@ -330,12 +328,7 @@
     for (const [key, node] of Object.entries(nodes)) {
       if (node && typeof node.region === 'string') keyRegion.set(key, node.region);
     }
-    // Slot membership wins over a transient quick-unavailable rejection. The
-    // standalone converter still emits no listener when a stable definition
-    // is absent; the advanced OpenWrt runner may restore that definition from
-    // the previous applied config before calling convertConfig().
-    for (const key of stableKeys) rejected.delete(key);
-    return { allowed, keyRegion, ranked, rejected, stable, stableKeys };
+    return { keyRegion, ranked, stable };
   }
 
   function fallbackRegion(name) {
@@ -353,7 +346,6 @@
 
     proxies.forEach((proxy, originalIndex) => {
       const key = nodeKey(proxy);
-      if (index.rejected.has(key) || !index.allowed.has(key)) return;
       const indexedRegion = index.keyRegion.get(key);
       const regionKey = entriesByRegion.has(indexedRegion) ? indexedRegion : fallbackRegion(proxy.name);
       entriesByRegion.get(regionKey).push({ key, proxy, originalIndex });
@@ -374,15 +366,43 @@
       }
 
       const available = entriesByRegion.get(region.key);
+      if (available.length > blockCapacity) {
+        throw new Error(
+          `${region.key} has ${available.length} nodes but its port block only holds ${blockCapacity}`,
+        );
+      }
       const stableKeys = new Set();
       const slotMap = index.stable.get(region.key) || new Map();
+      const reservedStableKeys = new Set(
+        [...slotMap.values()].filter((key) => available.some((entry) => entry.key === key)),
+      );
+      const rankPosition = new Map(
+        (index.ranked.get(region.key) || []).map((key, position) => [key, position]),
+      );
+      const orderedAvailable = [...available].sort((left, right) => {
+        const leftRank = rankPosition.has(left.key) ? rankPosition.get(left.key) : Number.MAX_SAFE_INTEGER;
+        const rightRank = rankPosition.has(right.key) ? rankPosition.get(right.key) : Number.MAX_SAFE_INTEGER;
+        return leftRank - rightRank || left.originalIndex - right.originalIndex;
+      });
 
       for (let slot = 1; slot <= regionStableSlotCount; slot += 1) {
-        const key = slotMap.get(slot);
-        if (!key || index.rejected.has(key)) continue;
-        const entry = available.find((candidate) => candidate.key === key);
+        const requestedKey = slotMap.get(slot);
+        let entry = requestedKey
+          ? available.find(
+              (candidate) => candidate.key === requestedKey && !stableKeys.has(candidate.key),
+            )
+          : undefined;
+        if (!entry) {
+          entry = orderedAvailable.find(
+            (candidate) =>
+              !stableKeys.has(candidate.key) && !reservedStableKeys.has(candidate.key),
+          );
+        }
+        if (!entry) {
+          entry = orderedAvailable.find((candidate) => !stableKeys.has(candidate.key));
+        }
         if (!entry) continue;
-        stableKeys.add(key);
+        stableKeys.add(entry.key);
         if (!selectedNames.has(entry.proxy.name)) {
           selectedProxies.push(entry.proxy);
           selectedNames.add(entry.proxy.name);
@@ -395,16 +415,8 @@
         });
       }
 
-      const rankPosition = new Map(
-        (index.ranked.get(region.key) || []).map((key, position) => [key, position]),
-      );
-      const dynamic = available
+      const dynamic = orderedAvailable
         .filter((entry) => !stableKeys.has(entry.key))
-        .sort((left, right) => {
-          const leftRank = rankPosition.has(left.key) ? rankPosition.get(left.key) : Number.MAX_SAFE_INTEGER;
-          const rightRank = rankPosition.has(right.key) ? rankPosition.get(right.key) : Number.MAX_SAFE_INTEGER;
-          return leftRank - rightRank || left.originalIndex - right.originalIndex;
-        })
         .slice(0, blockCapacity - regionStableSlotCount);
 
       dynamic.forEach((entry, dynamicIndex) => {
@@ -421,6 +433,11 @@
       });
     });
 
+    if (listeners.length !== proxies.length) {
+      throw new Error(
+        `converter retained ${listeners.length} of ${proxies.length} inventory nodes`,
+      );
+    }
     return { listeners, proxies: selectedProxies };
   }
 

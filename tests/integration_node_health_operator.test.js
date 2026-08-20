@@ -98,7 +98,7 @@ async function testIdentityVector() {
   assert.strictEqual(converter.nodeKey(hopping), converter.nodeKey(alternatePort));
 }
 
-async function testOperatorOrderingAndFailClosed() {
+async function testOperatorOrderingAndCompleteFallback() {
   const stable = proxy('US stable', 'stable.example');
   const stableUnavailable = proxy('US stable unavailable', 'stable-unavailable.example');
   const stableLater = proxy('US stable three', 'stable-three.example');
@@ -136,20 +136,20 @@ async function testOperatorOrderingAndFailClosed() {
     'US stable unavailable',
     'US stable three',
     'US ranked',
+    'US rejected',
+    'Unknown',
   ]);
 
   const originalError = console.error;
   console.error = () => {};
   try {
-    await assert.rejects(
-      () => operatorModule.operator(input, 'ClashMeta', {
-        options: context.options,
-        ProxyUtils: proxyUtilsFor(state, {
-          download: async () => { throw new Error('offline'); },
-        }),
+    const fallback = await operatorModule.operator(input, 'ClashMeta', {
+      options: context.options,
+      ProxyUtils: proxyUtilsFor(state, {
+        download: async () => { throw new Error('offline'); },
       }),
-      /offline/,
-    );
+    });
+    assert.deepStrictEqual(fallback, input);
   } finally {
     console.error = originalError;
   }
@@ -257,7 +257,7 @@ async function testScriptArgumentsAndClashMetaNormalization() {
   }
 }
 
-async function testOperatorRejectsIncompleteRankingState() {
+async function testOperatorPreservesInputForIncompleteRankingState() {
   const kept = proxy('Keep original', 'keep.example');
   const input = [kept];
   const invalidStates = [
@@ -331,14 +331,11 @@ async function testOperatorRejectsIncompleteRankingState() {
   console.error = () => {};
   try {
     for (const item of invalidStates) {
-      await assert.rejects(
-        () => operatorModule.operator(input, 'ClashMeta', {
+      const output = await operatorModule.operator(input, 'ClashMeta', {
           options: { rankingUrl: 'http://node-health.invalid/current.json' },
           ProxyUtils: proxyUtilsFor(item.state),
-        }),
-        undefined,
-        `${item.label} must fail the collection request`,
-      );
+        });
+      assert.deepStrictEqual(output, input, `${item.label} must preserve the collection`);
     }
   } finally {
     console.error = originalError;
@@ -359,10 +356,10 @@ async function testOperatorRejectsIncompleteRankingState() {
         },
       }),
   });
-  assert.deepStrictEqual(allRejected, [], 'an explicit all-rejected state is valid');
+  assert.deepStrictEqual(allRejected, input, 'an explicit all-rejected state keeps every node');
 }
 
-async function testIdentityDriftFailsClosed() {
+async function testIdentityDriftKeepsUnknownNodes() {
   const input = [proxy('Keep original', 'source.example')];
   const state = {
     schema_version: 1,
@@ -378,13 +375,11 @@ async function testIdentityDriftFailsClosed() {
   const originalError = console.error;
   console.error = () => {};
   try {
-    await assert.rejects(
-      () => operatorModule.operator(input, 'ClashMeta', {
+    const output = await operatorModule.operator(input, 'ClashMeta', {
         options: { rankingUrl: 'http://node-health.invalid/current.json' },
         ProxyUtils: proxyUtilsFor(state),
-      }),
-      /matched no ClashMeta proxy identities/,
-    );
+      });
+    assert.deepStrictEqual(output, input);
   } finally {
     console.error = originalError;
   }
@@ -425,6 +420,13 @@ async function testStablePortGaps() {
       [keys.other]: { region: 'other' },
     },
   };
+  const ordering = operatorModule.buildOrdering(
+    state,
+    new Set([keys.stableOne, keys.stableUnavailable, keys.dynamicOne, keys.other]),
+  ).order;
+  assert.strictEqual(ordering.get(keys.stableOne), 0);
+  assert.strictEqual(ordering.get(keys.dynamicOne), 1);
+  assert.strictEqual(ordering.get(keys.stableUnavailable), 2);
   const output = converter.convertConfig(
     { proxies: [dynamicOne, unknown, other, stableUnavailable, stableOne] },
     state,
@@ -433,15 +435,14 @@ async function testStablePortGaps() {
   const ports = Object.fromEntries(output.listeners.map((listener) => [listener.proxy, listener.port]));
   assert.strictEqual(ports['US one'], 62800);
   assert.strictEqual(ports['US unavailable'], 62802);
-  assert.strictEqual(ports['US candidate'], 62803);
+  assert.strictEqual(ports['US candidate'], 62801);
   assert.strictEqual(ports['Brazil node'], 64200);
-  assert.strictEqual(ports['US untested'], undefined);
-  assert.ok(!output.listeners.some((listener) => listener.port === 62801));
+  assert.strictEqual(ports['US untested'], 62803);
   const exported = output.listeners.map(
     (listener) => `socks5://192.0.2.4:${listener.port}{${listener.proxy}}`,
   );
   assert.ok(exported.includes('socks5://192.0.2.4:62800{US one}'));
-  assert.ok(exported.includes('socks5://192.0.2.4:62803{US candidate}'));
+  assert.ok(exported.includes('socks5://192.0.2.4:62801{US candidate}'));
   assert.ok(!exported.some((line) => line.includes('{unresolved}') || line.includes('{dynamic-')));
   assert.deepStrictEqual(output.dns, {
     enable: true,
@@ -568,11 +569,11 @@ function testRollbackRestoresRuntimePermissions() {
 
 (async () => {
   await testIdentityVector();
-  await testOperatorOrderingAndFailClosed();
+  await testOperatorOrderingAndCompleteFallback();
   await testOperatorRejectsNonArrayInput();
   await testScriptArgumentsAndClashMetaNormalization();
-  await testOperatorRejectsIncompleteRankingState();
-  await testIdentityDriftFailsClosed();
+  await testOperatorPreservesInputForIncompleteRankingState();
+  await testIdentityDriftKeepsUnknownNodes();
   await testStablePortGaps();
   testStableConverterRejectsIncompleteRankingState();
   testPollerCacheIsolationContract();

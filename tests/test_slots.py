@@ -49,15 +49,15 @@ def test_maintenance_preserves_healthy_slots_and_replaces_only_failed_slot():
     previous = {"1": "a", "2": "b", "3": "c"}
     slots, dynamic, rejected = assign_region_slots("maintenance", items, previous, 3)
     assert slots == {"1": "a", "2": "d", "3": "c"}
-    assert dynamic == ["e", "f", "g"]
+    assert dynamic == ["e", "f", "g", "b"]
     assert rejected == {"b": "rejected"}
 
 
-def test_low_confidence_node_never_fills_stable_slot():
+def test_low_confidence_node_fills_stable_slot_in_degraded_mode():
     items = [assessment("a", 90, completed=False), assessment("b", 80)]
     slots, dynamic, _ = assign_region_slots("maintenance", items, {}, 3)
-    assert slots == {"1": "b"}
-    assert dynamic == ["a"]
+    assert slots == {"1": "b", "2": "a"}
+    assert dynamic == []
 
 
 def test_rebuild_reselects_top_three_without_old_slot_bias():
@@ -68,7 +68,7 @@ def test_rebuild_reselects_top_three_without_old_slot_bias():
     assert dynamic == ["c", "b", "a"]
 
 
-def test_fresh_full_failure_cannot_fill_or_rebuild_a_stable_slot():
+def test_fresh_full_failure_fills_slot_only_when_no_safe_candidate_exists():
     old = assessment("old", 10, decision="rejected")
     cached_candidate = assessment(
         "candidate",
@@ -80,14 +80,14 @@ def test_fresh_full_failure_cannot_fill_or_rebuild_a_stable_slot():
     slots, dynamic, _ = assign_region_slots(
         "maintenance", [old, cached_candidate], {"1": "old"}, 1
     )
-    assert slots == {}
-    assert dynamic == ["candidate"]
+    assert slots == {"1": "candidate"}
+    assert dynamic == ["old"]
 
     slots, dynamic, _ = assign_region_slots(
         "rebuild", [cached_candidate], {"1": "old"}, 1
     )
-    assert slots == {}
-    assert dynamic == ["candidate"]
+    assert slots == {"1": "candidate"}
+    assert dynamic == []
 
 
 def test_unchanged_rebuild_does_not_emit_slot_change_alerts():
@@ -136,7 +136,7 @@ def test_unavailable_nodes_keep_historical_scores_when_ordering_tail():
     assert rejected == {}
 
 
-def test_unavailable_stable_is_replaced_only_at_consecutive_failure_threshold():
+def test_unavailable_stable_is_preserved_regardless_of_failure_count():
     candidate = assessment("b", 80, confidence="high", passes=3)
     policy = PolicyConfig(stable_unavailable_replace_after_runs=3)
     previous = {"united-states": {"1": "a"}}
@@ -177,8 +177,8 @@ def test_unavailable_stable_is_replaced_only_at_consecutive_failure_threshold():
         {"a": {"last_score": 90}, "b": {"last_score": 80}},
         policy,
     )
-    assert regions["united-states"]["stable_slots"]["1"] == "b"
-    assert [change["reason"] for change in changes] == ["repeated-unavailable"]
+    assert regions["united-states"]["stable_slots"]["1"] == "a"
+    assert changes == []
 
 
 def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown():
@@ -237,7 +237,7 @@ def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown(
     assert changes == []
 
 
-def test_default_promotion_requires_three_passes_and_twenty_point_margin():
+def test_default_promotion_requires_three_passes_and_ten_point_margin():
     previous_slots = {"united-states": {"1": "a", "2": "b", "3": "c"}}
     policy = PolicyConfig()
 
@@ -267,13 +267,53 @@ def test_default_promotion_requires_three_passes_and_twenty_point_margin():
     assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
     assert changes == []
 
-    regions, changes = run(79, 3)
+    regions, changes = run(69, 3)
     assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
     assert changes == []
 
-    regions, changes = run(80, 3)
+    regions, changes = run(70, 3)
     assert regions["united-states"]["stable_slots"]["1"] == "f"
     assert [change["reason"] for change in changes] == ["superior-candidate"]
+
+
+def test_degraded_rerank_fills_three_slots_and_keeps_rejected_nodes():
+    items = [
+        assessment("safe", 80, confidence="high", passes=3),
+        assessment("risk-low", 70, decision="rejected", confidence="rejected"),
+        assessment("risk-high", 30, decision="rejected", confidence="rejected"),
+        assessment(
+            "offline",
+            99,
+            decision="unavailable",
+            confidence="unavailable",
+            available=False,
+        ),
+    ]
+    slots, dynamic, rejected = assign_region_slots(
+        "maintenance",
+        items,
+        {"1": "risk-high", "2": "safe", "3": "offline"},
+        3,
+    )
+
+    assert slots == {"1": "safe", "2": "risk-low", "3": "risk-high"}
+    assert dynamic == ["offline"]
+    assert set(rejected) == {"risk-low", "risk-high"}
+
+
+def test_all_rejected_nodes_fill_slots_by_risk_then_score():
+    items = [
+        assessment("worst", 95, decision="rejected", confidence="rejected"),
+        assessment("best", 90, decision="rejected", confidence="rejected"),
+        assessment("middle", 50, decision="rejected", confidence="rejected"),
+    ]
+    items[0].evaluation.reasons = ["tor-exit", "multiple-high-risk-sources:a,b"]
+
+    slots, dynamic, rejected = assign_region_slots("maintenance", items, {}, 3)
+
+    assert slots == {"1": "best", "2": "middle", "3": "worst"}
+    assert dynamic == []
+    assert set(rejected) == {"best", "middle", "worst"}
 
 
 def test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence():

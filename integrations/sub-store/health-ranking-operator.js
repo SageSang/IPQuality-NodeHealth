@@ -1,9 +1,10 @@
 /**
  * Sub-Store Script Operator for node-health ordering.
  *
- * Configure with $arguments.rankingUrl (or $arguments.url). The operator fails
- * closed: an unavailable or invalid health decision makes the collection
- * request fail instead of exposing unfiltered proxies.
+ * Configure with $arguments.rankingUrl (or $arguments.url). Health data only
+ * changes ordering: every proxy supplied by the complete collection is
+ * returned exactly once, including rejected, unavailable and not-yet-ranked
+ * nodes. Invalid or unavailable health data falls back to the input order.
  */
 
 const NODE_HEALTH_SCHEMA_VERSION = 1;
@@ -356,7 +357,7 @@ function validateRankingState(state) {
   if (decisionKeys === 0) throw new Error('ranking contains no node decisions');
 }
 
-function buildOrdering(state) {
+function buildOrdering(state, availableKeys = null) {
   validateRankingState(state);
 
   const rejected = new Set();
@@ -382,77 +383,108 @@ function buildOrdering(state) {
 
   for (const regionKey of regionKeys) {
     const region = state.regions[regionKey];
-    for (const key of rejectedKeys(region)) rejected.add(key);
+    const regionRejected = rejectedKeys(region);
+    for (const key of regionRejected) rejected.add(key);
 
     const slots = region && (region.stable_slots || region.stableSlots);
-    if (slots && typeof slots === 'object') {
+    const slotKeys = new Map();
+    const reservedSlotKeys = new Set();
+    if (slots && typeof slots === 'object' && regionKey !== 'other') {
       for (let slot = 1; slot <= STABLE_SLOT_COUNT; slot += 1) {
         const key = keyFromEntry(slots[String(slot)]);
-        if (key) {
-          stableKeys.add(key);
-          if (!order.has(key)) {
-            order.set(key, position);
-            position += 1;
-          }
+        if (key && (!availableKeys || availableKeys.has(key))) {
+          slotKeys.set(slot, key);
+          reservedSlotKeys.add(key);
         }
       }
     }
 
+    const regionalTail = [];
     const ranked = region && region.ranked;
     if (Array.isArray(ranked)) {
       for (const entry of ranked) {
         const key = keyFromEntry(entry);
-        if (key && !order.has(key)) {
+        if (key && !regionalTail.includes(key)) regionalTail.push(key);
+      }
+    }
+
+    // Rankings published before rejected nodes joined `ranked` still carry
+    // their identities here. Keep them at the regional tail; `rejected` is
+    // risk metadata and never a deletion list.
+    for (const key of regionRejected) {
+      if (!regionalTail.includes(key)) regionalTail.push(key);
+    }
+
+    if (regionKey !== 'other') {
+      const usedSlotKeys = new Set();
+      for (let slot = 1; slot <= STABLE_SLOT_COUNT; slot += 1) {
+        let key = slotKeys.get(slot);
+        if (!key) {
+          key = regionalTail.find(
+            (candidate) =>
+              (!availableKeys || availableKeys.has(candidate)) &&
+              !usedSlotKeys.has(candidate) &&
+              !reservedSlotKeys.has(candidate),
+          );
+        }
+        if (!key) {
+          key = regionalTail.find(
+            (candidate) =>
+              (!availableKeys || availableKeys.has(candidate)) && !usedSlotKeys.has(candidate),
+          );
+        }
+        if (!key || usedSlotKeys.has(key)) continue;
+        usedSlotKeys.add(key);
+        stableKeys.add(key);
+        if (!order.has(key)) {
           order.set(key, position);
           position += 1;
         }
       }
     }
+
+    for (const key of regionalTail) {
+      if (!order.has(key)) {
+        order.set(key, position);
+        position += 1;
+      }
+    }
   }
 
-  // Stable slots are authoritative in maintenance mode. A transient quick
-  // failure may also appear in rejected, but must not remap that slot.
-  for (const key of stableKeys) rejected.delete(key);
-  for (const key of rejected) order.delete(key);
   return { order, rejected, stableKeys };
 }
 
 async function operator(proxies, targetPlatform, context) {
+  if (!Array.isArray(proxies)) throw new TypeError('proxy input must be an array');
   try {
-    if (!Array.isArray(proxies)) throw new TypeError('proxy input must be an array');
     const options = operatorOptions(context);
     const rankingUrl = String(options.rankingUrl || options.url || '').trim();
     if (!rankingUrl) throw new Error('rankingUrl argument is required');
 
+    const selected = proxies.map((proxy, originalIndex) => {
+      const key = clashMetaNodeKey(proxy, context);
+      return {
+        proxy,
+        key,
+        originalIndex,
+      };
+    });
     const state = JSON.parse(await downloadRanking(rankingUrl, context));
-    const { order, rejected } = buildOrdering(state);
+    const { order } = buildOrdering(state, new Set(selected.map((entry) => entry.key)));
 
-    const selected = proxies
-      .map((proxy, originalIndex) => {
-        const key = clashMetaNodeKey(proxy, context);
-        return {
-          proxy,
-          key,
-          originalIndex,
-          healthOrder: order.has(key) ? order.get(key) : Number.MAX_SAFE_INTEGER,
-        };
-      })
-      .filter((entry) => order.has(entry.key) && !rejected.has(entry.key))
-      .sort(
-        (left, right) =>
-          left.healthOrder - right.healthOrder || left.originalIndex - right.originalIndex,
-      );
-    if (order.size > 0 && proxies.length > 0 && selected.length === 0) {
-      throw new Error('ranking allow-list matched no ClashMeta proxy identities');
-    }
-    // Once a valid state has been loaded, its allow-list is authoritative.
-    // An intentional all-rejected state has an empty order and returns [].
+    selected.forEach((entry) => {
+      entry.healthOrder = order.has(entry.key) ? order.get(entry.key) : Number.MAX_SAFE_INTEGER;
+    });
+    selected.sort(
+      (left, right) =>
+        left.healthOrder - right.healthOrder || left.originalIndex - right.originalIndex,
+    );
     return selected.map((entry) => entry.proxy);
   } catch (error) {
     if (typeof console !== 'undefined' && typeof console.error === 'function') {
-      console.error(`[node-health] ranking unavailable; refusing unfiltered output: ${error.message}`);
+      console.error(`[node-health] ranking unavailable; preserving complete input order: ${error.message}`);
     }
-    throw error;
+    return proxies;
   }
 }
 

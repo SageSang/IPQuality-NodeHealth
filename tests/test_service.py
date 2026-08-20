@@ -405,7 +405,7 @@ def test_missing_inventory_node_is_immediately_replaced(tmp_path):
     assert "节点已从订阅中消失" in changes
 
 
-def test_three_consecutive_unavailable_runs_replace_only_that_slot(tmp_path):
+def test_consecutive_unavailable_runs_never_remove_stable_slot(tmp_path):
     service, quick, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     before = first["regions"]["united-states"]["stable_slots"]
@@ -423,19 +423,13 @@ def test_three_consecutive_unavailable_runs_replace_only_that_slot(tmp_path):
 
     current = service.run_once("maintenance")
     after = current["regions"]["united-states"]["stable_slots"]
-    assert after[failed_slot] != failed_key
-    assert after["1"] == before["1"]
-    assert after["3"] == before["3"]
+    assert after == before
     report = json.loads(
         (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
             encoding="utf-8"
         )
     )
-    assert any(
-        change["slot"] == failed_slot
-        and change["reason"] == "repeated-unavailable"
-        for change in report["slot_changes"]
-    )
+    assert report["slot_changes"] == []
 
 
 def test_reachable_stable_node_resets_unavailable_counter(tmp_path):
@@ -520,7 +514,7 @@ def test_rebuild_publishes_when_reputation_providers_are_temporarily_empty(tmp_p
         (tmp_path / "data" / "current.json").read_text(encoding="utf-8")
     )
     assert persisted["version"] == current["version"]
-    assert persisted["version"] != first["version"]
+    assert persisted["generated_at"] != first["generated_at"]
 
 
 def test_incomplete_maintenance_full_audit_breaks_consecutive_passes(tmp_path):
@@ -618,7 +612,8 @@ def test_chatgpt_redline_remains_latched_until_a_fresh_clean_full(tmp_path):
 
     assert key not in full.calls
     assert still_blocked["nodes"][key]["decision"] == "rejected"
-    assert key not in still_blocked["regions"]["united-states"]["ranked"]
+    assert key in still_blocked["regions"]["united-states"]["ranked"]
+    assert key in still_blocked["regions"]["united-states"]["rejected"]
     assert (
         state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
         == "Block"
@@ -637,7 +632,8 @@ def test_ambiguous_fresh_full_cannot_clear_a_latched_redline(tmp_path):
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
 
     assert ambiguous["nodes"][key]["decision"] == "rejected"
-    assert key not in ambiguous["regions"]["united-states"]["ranked"]
+    assert key in ambiguous["regions"]["united-states"]["ranked"]
+    assert key in ambiguous["regions"]["united-states"]["rejected"]
     assert (
         state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
         == "Block"
@@ -665,7 +661,8 @@ def test_absent_dynamic_redline_is_remembered_when_node_returns(tmp_path):
     returned = service.run_once("maintenance")
 
     assert returned["nodes"][key]["decision"] == "rejected"
-    assert key not in returned["regions"]["united-states"]["ranked"]
+    assert key in returned["regions"]["united-states"]["ranked"]
+    assert key in returned["regions"]["united-states"]["rejected"]
 
 
 def test_stable_warning_is_degraded_without_changing_the_slot(tmp_path):
@@ -696,8 +693,8 @@ def test_first_rebuild_publishes_even_when_all_nodes_are_unavailable(tmp_path):
     current = service.run_once("rebuild")
     assert (tmp_path / "data" / "current.json").exists()
     region = current["regions"]["united-states"]
-    assert region["stable_slots"] == {}
-    assert len(region["ranked"]) == 100
+    assert len(region["stable_slots"]) == 3
+    assert len(region["ranked"]) == 97
 
 
 def test_http_endpoints_and_token(tmp_path):
