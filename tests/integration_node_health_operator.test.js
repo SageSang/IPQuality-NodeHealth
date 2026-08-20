@@ -692,6 +692,7 @@ function testDuplicateNodeAliasesAreAllPreserved() {
     },
     nodes: { [sharedKey]: { region: 'united-states' } },
   };
+  addIdentityIndex(state);
 
   const output = converter.convertConfig({ proxies: aliases }, state, 62000);
   assert.strictEqual(output.listeners.length, aliases.length);
@@ -704,6 +705,65 @@ function testDuplicateNodeAliasesAreAllPreserved() {
     output.listeners.map((listener) => listener.port),
     [62800, 62801, 62802, 62803],
   );
+}
+
+function testStableConverterKeepsSlotAcrossConnectionRotation() {
+  const oldStable = proxy('Hong Kong 01', 'old-hk.example', {
+    _nh_source_id: 'E-IX',
+    _nh_original_name: 'Hong Kong 01',
+  });
+  const rotatedStable = proxy('Hong Kong 01', 'new-hk.example', {
+    _nh_source_id: 'E-IX',
+    _nh_original_name: 'Hong Kong 01',
+  });
+  const candidate = proxy('Hong Kong 02', 'candidate-hk.example', {
+    _nh_source_id: 'E-IX',
+    _nh_original_name: 'Hong Kong 02',
+  });
+  const oldKey = converter.nodeKey(oldStable);
+  const candidateKey = converter.nodeKey(candidate);
+  assert.notStrictEqual(converter.nodeKey(rotatedStable), oldKey);
+
+  const state = {
+    schema_version: 2,
+    version: 'converter-identity-rotation-v2',
+    region_order: ['hong-kong'],
+    regions: {
+      'hong-kong': {
+        stable_slots: { 1: oldKey },
+        ranked: [candidateKey],
+        rejected: {},
+      },
+    },
+    identity_index: {
+      [oldKey]: converter.selectedIdentity(oldStable),
+      [candidateKey]: converter.selectedIdentity(candidate),
+    },
+  };
+
+  const output = converter.convertConfig(
+    { proxies: [candidate, rotatedStable] },
+    state,
+    62000,
+  );
+  const ports = Object.fromEntries(output.listeners.map((listener) => [listener.proxy, listener.port]));
+  assert.strictEqual(ports['Hong Kong 01'], 62000);
+  assert.strictEqual(ports['Hong Kong 02'], 62001);
+
+  const wrongSource = {
+    ...rotatedStable,
+    _nh_source_id: 'airport-b',
+  };
+  const guarded = converter.convertConfig(
+    { proxies: [wrongSource, candidate] },
+    state,
+    62000,
+  );
+  const guardedPorts = Object.fromEntries(
+    guarded.listeners.map((listener) => [listener.proxy, listener.port]),
+  );
+  assert.strictEqual(guardedPorts['Hong Kong 02'], 62000);
+  assert.strictEqual(guardedPorts['Hong Kong 01'], 62001);
 }
 
 function testStableConverterRejectsIncompleteRankingState() {
@@ -831,6 +891,7 @@ function testRollbackRestoresRuntimePermissions() {
   await testOperatorPreservesAll250InputsAndUnknownTailOrder();
   await testStablePortGaps();
   testDuplicateNodeAliasesAreAllPreserved();
+  testStableConverterKeepsSlotAcrossConnectionRotation();
   testStableConverterRejectsIncompleteRankingState();
   testPollerCacheIsolationContract();
   testRollbackRestoresRuntimePermissions();

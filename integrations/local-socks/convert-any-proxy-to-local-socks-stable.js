@@ -16,6 +16,7 @@
   const MAX_PORT = 65535;
   const REGION_PORT_BLOCK_SIZE = 200;
   const STABLE_SLOT_COUNT = 3;
+  const NODE_HEALTH_SCHEMA_VERSION = 2;
   const NODE_KEY_PATTERN = /^[0-9a-f]{64}$/;
 
   const REGION_PORT_BLOCKS = [
@@ -183,14 +184,141 @@
     return sha256Hex(canonicalJson(proxy, true));
   }
 
+  function isRecord(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function normalizeIdentityText(value) {
+    return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+  }
+
+  function normalizeOriginalName(value) {
+    return String(value || '').trim().replace(/\s+/gu, ' ');
+  }
+
+  function sourceId(proxy) {
+    if (!isRecord(proxy)) return '';
+    for (const field of ['_nh_source_id', '_source_id']) {
+      const value = normalizeIdentityText(proxy[field]);
+      if (value) return value;
+    }
+    return '';
+  }
+
+  function originalName(proxy) {
+    if (!isRecord(proxy)) return '';
+    for (const field of ['_nh_original_name', '_original_name']) {
+      const value = normalizeOriginalName(proxy[field]);
+      if (value) return value;
+    }
+    return normalizeOriginalName(proxy.name);
+  }
+
+  function logicalId(source, normalizedName) {
+    if (!source || !normalizedName) return '';
+    return sha256Hex(`${source}\0${normalizedName}`);
+  }
+
+  function selectedIdentity(proxy) {
+    const source = sourceId(proxy);
+    const original = originalName(proxy);
+    const normalized = normalizeIdentityText(original);
+    const explicitRegion = String((proxy && proxy._region) || '').trim();
+    const region = REGION_PORT_BLOCKS.some((entry) => entry.key === explicitRegion)
+      ? explicitRegion
+      : fallbackRegion(original);
+    return {
+      source_id: source,
+      original_name: original,
+      normalized_name: normalized,
+      logical_id: logicalId(source, normalized),
+      region,
+    };
+  }
+
+  function identityTuple(identity, fields) {
+    const values = fields.map((field) => String((identity && identity[field]) || ''));
+    if (values.some((value) => !value)) return '';
+    return JSON.stringify(values);
+  }
+
+  function uniqueIdentityMatches(unmatchedOld, unmatchedNew, oldIdentities, selected, fields) {
+    const oldBuckets = new Map();
+    const newBuckets = new Map();
+    for (const key of unmatchedOld) {
+      const group = identityTuple(oldIdentities[key], fields);
+      if (!group) continue;
+      if (!oldBuckets.has(group)) oldBuckets.set(group, []);
+      oldBuckets.get(group).push(key);
+    }
+    for (const index of unmatchedNew) {
+      const group = identityTuple(selected[index].identity, fields);
+      if (!group) continue;
+      if (!newBuckets.has(group)) newBuckets.set(group, []);
+      newBuckets.get(group).push(index);
+    }
+
+    const matches = [];
+    for (const [group, oldKeys] of oldBuckets) {
+      const newIndexes = newBuckets.get(group) || [];
+      if (oldKeys.length === 1 && newIndexes.length === 1) {
+        matches.push([oldKeys[0], newIndexes[0]]);
+      }
+    }
+    return matches;
+  }
+
+  function resolveIdentityKeys(state, selected) {
+    validateState(state);
+    const oldIdentities = state.identity_index;
+    const resolved = new Map();
+    const unmatchedOld = new Set(Object.keys(oldIdentities));
+    const unmatchedNew = new Set(selected.map((_, index) => index));
+
+    selected.forEach((entry, index) => {
+      if (Object.prototype.hasOwnProperty.call(oldIdentities, entry.connectionKey)) {
+        resolved.set(index, entry.connectionKey);
+        unmatchedOld.delete(entry.connectionKey);
+        unmatchedNew.delete(index);
+      }
+    });
+
+    const stages = [
+      ['source_id', 'logical_id'],
+      ['source_id', 'region', 'original_name'],
+      ['region', 'original_name'],
+      ['region', 'normalized_name'],
+    ];
+    stages.forEach((fields, stageIndex) => {
+      const matches = uniqueIdentityMatches(
+        unmatchedOld,
+        unmatchedNew,
+        oldIdentities,
+        selected,
+        fields,
+      );
+      for (const [oldKey, newIndex] of matches) {
+        if (stageIndex >= 2) {
+          const oldSource = String(oldIdentities[oldKey].source_id || '');
+          const newSource = String(selected[newIndex].identity.source_id || '');
+          if (oldSource && newSource && oldSource !== newSource) continue;
+        }
+        resolved.set(newIndex, oldKey);
+        unmatchedOld.delete(oldKey);
+        unmatchedNew.delete(newIndex);
+      }
+    });
+    return resolved;
+  }
+
   function validateState(state) {
     if (
       !state ||
-      state.schema_version !== 2 ||
+      state.schema_version !== NODE_HEALTH_SCHEMA_VERSION ||
       typeof state.version !== 'string' ||
       !state.version ||
-      !state.regions ||
-      typeof state.regions !== 'object'
+      !isRecord(state.regions) ||
+      !isRecord(state.identity_index)
     ) {
       throw new Error('a valid node-health current.json is required');
     }
@@ -199,19 +327,16 @@
     if (regions.length === 0) throw new Error('ranking regions are empty');
 
     let decisionKeys = 0;
+    const decided = new Set();
     for (const [regionKey, region] of regions) {
-      if (!regionKey || !region || typeof region !== 'object' || Array.isArray(region)) {
+      if (!regionKey || !isRecord(region)) {
         throw new Error(`invalid ranking region: ${regionKey || '<empty>'}`);
       }
       const slots = region.stable_slots || region.stableSlots;
       if (
-        !slots ||
-        typeof slots !== 'object' ||
-        Array.isArray(slots) ||
+        !isRecord(slots) ||
         !Array.isArray(region.ranked) ||
-        !region.rejected ||
-        typeof region.rejected !== 'object' ||
-        Array.isArray(region.rejected)
+        !isRecord(region.rejected)
       ) {
         throw new Error(`incomplete ranking region: ${regionKey}`);
       }
@@ -227,21 +352,45 @@
           throw new Error(`invalid stable slot in ranking region: ${regionKey}`);
         }
         decisionKeys += 1;
+        decided.add(keyFromEntry(entry));
       }
       for (const entry of region.ranked) {
         if (!NODE_KEY_PATTERN.test(keyFromEntry(entry))) {
           throw new Error(`invalid ranked key in ranking region: ${regionKey}`);
         }
         decisionKeys += 1;
+        decided.add(keyFromEntry(entry));
       }
       for (const key of Object.keys(region.rejected)) {
         if (!NODE_KEY_PATTERN.test(key)) {
           throw new Error(`invalid rejected key in ranking region: ${regionKey}`);
         }
         decisionKeys += 1;
+        decided.add(key);
       }
     }
     if (decisionKeys === 0) throw new Error('ranking contains no node decisions');
+
+    for (const [key, identity] of Object.entries(state.identity_index)) {
+      if (
+        !NODE_KEY_PATTERN.test(key) ||
+        !isRecord(identity) ||
+        typeof identity.source_id !== 'string' ||
+        typeof identity.original_name !== 'string' ||
+        typeof identity.normalized_name !== 'string' ||
+        typeof identity.logical_id !== 'string' ||
+        (identity.logical_id && !NODE_KEY_PATTERN.test(identity.logical_id)) ||
+        typeof identity.region !== 'string' ||
+        !identity.region
+      ) {
+        throw new Error(`invalid identity index entry: ${key}`);
+      }
+    }
+    for (const key of decided) {
+      if (!Object.prototype.hasOwnProperty.call(state.identity_index, key)) {
+        throw new Error(`ranking decision is missing identity metadata: ${key}`);
+      }
+    }
   }
 
   function normalizeStartPort(startPort) {
@@ -344,11 +493,20 @@
     const index = stateIndex(state);
     const entriesByRegion = new Map(REGION_PORT_BLOCKS.map((region) => [region.key, []]));
 
-    proxies.forEach((proxy, originalIndex) => {
-      const key = nodeKey(proxy);
+    const selected = proxies.map((proxy, originalIndex) => ({
+      proxy,
+      originalIndex,
+      connectionKey: nodeKey(proxy),
+      identity: selectedIdentity(proxy),
+    }));
+    const resolved = resolveIdentityKeys(state, selected);
+    selected.forEach((entry, originalIndex) => {
+      const key = resolved.get(originalIndex) || entry.connectionKey;
       const indexedRegion = index.keyRegion.get(key);
-      const regionKey = entriesByRegion.has(indexedRegion) ? indexedRegion : fallbackRegion(proxy.name);
-      entriesByRegion.get(regionKey).push({ key, proxy, originalIndex });
+      const regionKey = entriesByRegion.has(indexedRegion)
+        ? indexedRegion
+        : fallbackRegion(entry.proxy.name);
+      entriesByRegion.get(regionKey).push({ key, ...entry });
     });
 
     const listeners = [];
@@ -506,13 +664,21 @@
 
   return Object.freeze({
     DEFAULT_START_PORT,
+    NODE_HEALTH_SCHEMA_VERSION,
     REGION_PORT_BLOCKS,
     REGION_PORT_BLOCK_SIZE,
     STABLE_SLOT_COUNT,
     canonicalJson,
     convertConfig,
     convertYaml,
+    logicalId,
     nodeKey,
+    normalizeIdentityText,
+    originalName,
+    resolveIdentityKeys,
+    selectedIdentity,
     sha256Hex,
+    sourceId,
+    validateState,
   });
 });
