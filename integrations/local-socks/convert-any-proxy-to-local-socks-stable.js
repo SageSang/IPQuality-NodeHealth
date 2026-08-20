@@ -371,7 +371,13 @@
           `${region.key} has ${available.length} nodes but its port block only holds ${blockCapacity}`,
         );
       }
-      const stableKeys = new Set();
+      // Node-health deliberately ignores the display name when calculating a
+      // node key. Sub-Store may therefore expose multiple subscription entries
+      // (aliases) for the same endpoint. Track the exact inventory occurrence
+      // selected for a stable slot so those aliases remain available for their
+      // own dynamic listeners instead of being discarded by a key-wide filter.
+      const stableEntryIndexes = new Set();
+      const stableNodeKeys = new Set();
       const slotMap = index.stable.get(region.key) || new Map();
       const reservedStableKeys = new Set(
         [...slotMap.values()].filter((key) => available.some((entry) => entry.key === key)),
@@ -389,20 +395,38 @@
         const requestedKey = slotMap.get(slot);
         let entry = requestedKey
           ? available.find(
-              (candidate) => candidate.key === requestedKey && !stableKeys.has(candidate.key),
+              (candidate) =>
+                candidate.key === requestedKey &&
+                !stableEntryIndexes.has(candidate.originalIndex) &&
+                !stableNodeKeys.has(candidate.key),
             )
           : undefined;
         if (!entry) {
           entry = orderedAvailable.find(
             (candidate) =>
-              !stableKeys.has(candidate.key) && !reservedStableKeys.has(candidate.key),
+              !stableEntryIndexes.has(candidate.originalIndex) &&
+              !stableNodeKeys.has(candidate.key) &&
+              !reservedStableKeys.has(candidate.key),
           );
         }
         if (!entry) {
-          entry = orderedAvailable.find((candidate) => !stableKeys.has(candidate.key));
+          entry = orderedAvailable.find(
+            (candidate) =>
+              !stableEntryIndexes.has(candidate.originalIndex) &&
+              !stableNodeKeys.has(candidate.key),
+          );
+        }
+        // If the complete inventory has fewer than three distinct endpoints,
+        // aliases may still occupy the remaining fixed slots. The highest
+        // priority invariant is that every possible fixed slot has a node.
+        if (!entry) {
+          entry = orderedAvailable.find(
+            (candidate) => !stableEntryIndexes.has(candidate.originalIndex),
+          );
         }
         if (!entry) continue;
-        stableKeys.add(entry.key);
+        stableEntryIndexes.add(entry.originalIndex);
+        stableNodeKeys.add(entry.key);
         if (!selectedNames.has(entry.proxy.name)) {
           selectedProxies.push(entry.proxy);
           selectedNames.add(entry.proxy.name);
@@ -416,7 +440,7 @@
       }
 
       const dynamic = orderedAvailable
-        .filter((entry) => !stableKeys.has(entry.key))
+        .filter((entry) => !stableEntryIndexes.has(entry.originalIndex))
         .slice(0, blockCapacity - regionStableSlotCount);
 
       dynamic.forEach((entry, dynamicIndex) => {

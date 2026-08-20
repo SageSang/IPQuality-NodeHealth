@@ -456,6 +456,40 @@ async function testStablePortGaps() {
   assert.strictEqual(converter.STABLE_SLOT_COUNT, 3);
 }
 
+function testDuplicateNodeAliasesAreAllPreserved() {
+  const aliases = [1, 2, 3, 4].map((number) =>
+    proxy(`US shared endpoint ${number}`, 'shared.example'),
+  );
+  const sharedKey = converter.nodeKey(aliases[0]);
+  for (const alias of aliases) {
+    assert.strictEqual(converter.nodeKey(alias), sharedKey);
+  }
+  const state = {
+    schema_version: 1,
+    version: 'duplicate-aliases',
+    regions: {
+      'united-states': {
+        stable_slots: { 1: sharedKey },
+        ranked: [sharedKey],
+        rejected: {},
+      },
+    },
+    nodes: { [sharedKey]: { region: 'united-states' } },
+  };
+
+  const output = converter.convertConfig({ proxies: aliases }, state, 62000);
+  assert.strictEqual(output.listeners.length, aliases.length);
+  assert.strictEqual(output.proxies.length, aliases.length);
+  assert.deepStrictEqual(
+    output.listeners.map((listener) => listener.proxy),
+    aliases.map((alias) => alias.name),
+  );
+  assert.deepStrictEqual(
+    output.listeners.map((listener) => listener.port),
+    [62800, 62801, 62802, 62803],
+  );
+}
+
 function testStableConverterRejectsIncompleteRankingState() {
   const input = { proxies: [proxy('Keep existing', 'keep-existing.example')] };
   const invalidStates = [
@@ -575,6 +609,7 @@ function testRollbackRestoresRuntimePermissions() {
   await testOperatorPreservesInputForIncompleteRankingState();
   await testIdentityDriftKeepsUnknownNodes();
   await testStablePortGaps();
+  testDuplicateNodeAliasesAreAllPreserved();
   testStableConverterRejectsIncompleteRankingState();
   testPollerCacheIsolationContract();
   testRollbackRestoresRuntimePermissions();
