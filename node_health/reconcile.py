@@ -191,4 +191,19 @@ def reconcile_previous_state(
             for region, slots in stable_slots.items()
             if isinstance(slots, dict)
         }
+    frozen_order = migrated.get("frozen_order")
+    if isinstance(frozen_order, dict):
+        migrated_ranked: dict[str, list[str]] = {}
+        for region, keys in frozen_order.items():
+            if not isinstance(keys, list):
+                continue
+            seen: set[str] = set()
+            migrated_keys: list[str] = []
+            for key in keys:
+                mapped = remap.get(str(key), str(key))
+                if mapped not in seen:
+                    migrated_keys.append(mapped)
+                    seen.add(mapped)
+            migrated_ranked[str(region)] = migrated_keys
+        migrated["frozen_order"] = migrated_ranked
     return list(resolved_nodes.values()), migrated, events

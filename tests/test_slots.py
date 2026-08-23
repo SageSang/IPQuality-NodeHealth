@@ -21,6 +21,7 @@ def assessment(
     fresh_full_completed: bool = True,
     fresh_full_usable: bool = True,
     unavailable_runs: int = 0,
+    region: str = "united-states",
 ):
     full = FullResult(
         completed=completed,
@@ -28,7 +29,7 @@ def assessment(
         details={"Media": {"ChatGPT": {"Status": chatgpt}}},
     )
     return NodeAssessment(
-        node=Node(key, key, "united-states", {"name": key}),
+        node=Node(key, key, region, {"name": key}),
         quick=QuickResult(available, exit_ip="8.8.8.8", latency_ms=score),
         full=full,
         evaluation=Evaluation(
@@ -190,6 +191,86 @@ def test_unchanged_rebuild_does_not_emit_slot_change_alerts():
         "rebuild", items, previous, 3, ["united-states"]
     )
     assert changes == []
+
+
+def test_other_rebuild_ranks_quality_then_maintenance_freezes_and_appends():
+    initial = [
+        assessment("low", 10, region="other"),
+        assessment("best", 90, region="other"),
+        assessment("middle", 50, region="other"),
+    ]
+    rebuilt, changes = assign_all_regions(
+        "rebuild", initial, {}, 3, ["other"]
+    )
+    frozen = rebuilt["other"]["ranked"]
+    assert frozen == ["best", "middle", "low"]
+    assert rebuilt["other"]["stable_slots"] == {}
+    assert changes == []
+
+    changed = [
+        assessment("low", 100, region="other"),
+        assessment(
+            "best",
+            0,
+            decision="rejected",
+            confidence="rejected",
+            region="other",
+        ),
+        assessment("middle", 1, region="other"),
+        assessment("new", 999, region="other"),
+    ]
+    maintained, changes = assign_all_regions(
+        "maintenance",
+        changed,
+        {},
+        3,
+        ["other"],
+        previous_frozen_order={"other": frozen},
+    )
+    assert maintained["other"]["ranked"] == [
+        "best",
+        "middle",
+        "low",
+        "new",
+    ]
+    assert maintained["other"]["rejected"] == {"best": "rejected"}
+    assert changes == []
+
+
+def test_other_maintenance_removes_deleted_nodes_without_reordering_survivors():
+    current = [
+        assessment("third", 100, region="other"),
+        assessment("first", 1, region="other"),
+        assessment("new", 999, region="other"),
+    ]
+    regions, changes = assign_all_regions(
+        "maintenance",
+        current,
+        {},
+        3,
+        ["other"],
+        previous_frozen_order={
+            "other": ["first", "deleted", "third"]
+        },
+    )
+    assert regions["other"]["ranked"] == ["first", "third", "new"]
+    assert changes == []
+
+
+def test_other_next_rebuild_replaces_the_frozen_order():
+    current = [
+        assessment("old-first", 1, region="other"),
+        assessment("old-last", 100, region="other"),
+    ]
+    regions, _ = assign_all_regions(
+        "rebuild",
+        current,
+        {},
+        3,
+        ["other"],
+        previous_frozen_order={"other": ["old-first", "old-last"]},
+    )
+    assert regions["other"]["ranked"] == ["old-last", "old-first"]
 
 
 def test_missing_entire_region_releases_absent_slots_in_maintenance():

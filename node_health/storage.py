@@ -23,6 +23,42 @@ _MAX_PORT = 65535
 LOGGER = logging.getLogger("node_health.storage")
 
 
+def _seed_frozen_order(
+    state: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    """Seed the new `other` baseline from the already-published ranking.
+
+    This keeps an image-only upgrade maintenance-safe: the first run after
+    deployment preserves the currently active `other` order instead of forcing
+    an unsolicited rebuild. The next explicit rebuild will replace it through
+    the normal ranking path.
+    """
+
+    if isinstance(state.get("frozen_order"), dict):
+        return state
+    seeded = dict(state)
+    other = current.get("regions", {}).get("other", {})
+    ranked = other.get("ranked", []) if isinstance(other, dict) else []
+    keys: list[str] = []
+    if isinstance(ranked, list):
+        for entry in ranked:
+            if isinstance(entry, str):
+                key = entry
+            elif isinstance(entry, dict):
+                key = str(
+                    entry.get("node_key")
+                    or entry.get("nodeKey")
+                    or entry.get("key")
+                    or ""
+                )
+            else:
+                key = ""
+            if key and key not in keys:
+                keys.append(key)
+    seeded["frozen_order"] = {"other": keys} if keys else {}
+    return seeded
+
+
 def read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
     # A reader can briefly race an atomic replace on Windows or a NAS mount.
     # Retry only transient access failures; malformed JSON remains an error.
@@ -175,7 +211,12 @@ class StateStore:
         return self.snapshots_dir / f"{version}.json"
 
     def load_state(self) -> dict[str, Any]:
-        empty = {"schema_version": SCHEMA_VERSION, "stable_slots": {}, "nodes": {}}
+        empty = {
+            "schema_version": SCHEMA_VERSION,
+            "stable_slots": {},
+            "frozen_order": {},
+            "nodes": {},
+        }
         state = read_json(self.state_path, empty)
         current = read_json(self.current_path, {})
         if state.get("schema_version") != SCHEMA_VERSION:
@@ -193,10 +234,12 @@ class StateStore:
                 snapshot.get("schema_version") == SCHEMA_VERSION
                 and snapshot.get("version") == current_version
             ):
-                return snapshot
+                return _seed_frozen_order(snapshot, current)
         if not current_version:
-            return state if not state.get("version") else empty
-        return state if state.get("version") == current_version else empty
+            selected = state if not state.get("version") else empty
+        else:
+            selected = state if state.get("version") == current_version else empty
+        return _seed_frozen_order(selected, current)
 
     def load_current(self) -> dict[str, Any]:
         return read_json(self.current_path, {})

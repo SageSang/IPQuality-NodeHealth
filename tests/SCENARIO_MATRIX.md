@@ -21,6 +21,7 @@ health processing may reorder nodes but may not remove them.
 | ID-09 | A stable connection rotates | Keep the same slot, emit no slot-change alert, and force a full audit in that run | `test_rotated_stable_connection_keeps_slot_and_is_forced_into_full_audit` |
 | ID-10 | A dynamic connection rotates outside the normal daily sample | Force a full audit in that run | `test_rotated_connection_is_forced_into_same_round_full_audit` |
 | ID-11 | A schema-v1 state is present | Do not attempt compatibility migration; rebuild schema-v2 state | `test_schema_v1_state_is_intentionally_not_reconciled` plus storage schema checks |
+| ID-12 | An `other` connection rotates and its regional original name remains unique | Move the frozen-order key to the replacement connection without changing its position and force a full audit | `test_unique_name_rotation_migrates_frozen_other_order`, `test_other_connection_rotation_keeps_frozen_position_and_forces_full_audit` |
 
 ## Fixed slots, risk, and availability
 
@@ -51,6 +52,16 @@ health processing may reorder nodes but may not remove them.
 | PR-05 | Quality-promotion cooldown is just under or exactly two days | Block just under two days; allow at the exact boundary | `test_quality_promotion_cooldown_has_exact_two_day_boundary` |
 | PR-06 | Redline, failure replacement, disappearance, degraded fill, or rebuild changes a slot | Do not start or reset quality-promotion cooldown | `test_only_quality_promotion_starts_or_resets_promotion_cooldown` |
 | PR-07 | A normal superior-candidate promotion occurs | Start/reset that region's two-day quality-promotion cooldown | `test_only_quality_promotion_starts_or_resets_promotion_cooldown` |
+
+## Frozen `other` ordering
+
+| ID | Scenario | Required result | Automated coverage |
+|---|---|---|---|
+| OT-01 | `rebuild` contains `other` nodes | Full-quality ordering replaces the previous frozen baseline; no stable 1-3 slots are created | `test_other_rebuild_ranks_quality_then_maintenance_freezes_and_appends`, `test_other_next_rebuild_replaces_the_frozen_order` |
+| OT-02 | Scores, risk, latency, or reachability change during `maintenance` | Update health metadata but preserve the frozen `other` order | `test_other_rebuild_ranks_quality_then_maintenance_freezes_and_appends`, `test_other_order_is_frozen_during_maintenance_and_rebuilt_on_demand` |
+| OT-03 | A new `other` node appears during `maintenance` | Append it after every surviving frozen identity in inventory order | `test_other_rebuild_ranks_quality_then_maintenance_freezes_and_appends` |
+| OT-04 | An `other` node disappears during `maintenance` | Remove it and preserve the relative order of every survivor | `test_other_maintenance_removes_deleted_nodes_without_reordering_survivors` |
+| OT-05 | The deployed state predates frozen `other` ordering | Seed the baseline from the active `current.json` and continue maintenance without an automatic rebuild | `test_state_without_frozen_order_inherits_current_other_without_rebuild` |
 
 ## Publication and consumer completeness
 

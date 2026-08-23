@@ -154,6 +154,7 @@ def assign_all_regions(
     policy: PolicyConfig | None = None,
     previous_promotion_cooldown_at: dict[str, str] | None = None,
     now: datetime | None = None,
+    previous_frozen_order: dict[str, list[str]] | None = None,
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, str]]]:
     grouped: dict[str, list[NodeAssessment]] = {}
     for assessment in assessments:
@@ -161,6 +162,7 @@ def assign_all_regions(
     by_key = {assessment.node.key: assessment for assessment in assessments}
     previous_nodes = previous_nodes or {}
     previous_promotion_cooldown_at = previous_promotion_cooldown_at or {}
+    previous_frozen_order = previous_frozen_order or {}
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -190,6 +192,30 @@ def assign_all_regions(
                 else 3
             ),
         )
+        if mode == "maintenance" and region == "other":
+            # `other` has no fixed 1-3 slots. Its rebuild ranking is instead
+            # frozen for the whole maintenance cycle so that daily score,
+            # risk, latency, and reachability changes cannot reshuffle the
+            # corresponding local SOCKS ports. Existing identities keep their
+            # relative order, deleted identities disappear, and genuinely new
+            # inventory entries are appended in source order. A subsequent
+            # rebuild performs a fresh full-quality sort and replaces this
+            # baseline.
+            current_keys = {
+                item.node.key for item in grouped.get(region, [])
+            }
+            frozen = []
+            seen: set[str] = set()
+            for key in previous_frozen_order.get(region, []):
+                key = str(key)
+                if key in current_keys and key not in seen:
+                    frozen.append(key)
+                    seen.add(key)
+            for item in grouped.get(region, []):
+                if item.node.key not in seen:
+                    frozen.append(item.node.key)
+                    seen.add(item.node.key)
+            ranked = frozen
         old = previous.get(region, {})
         qualified_count = sum(
             1 for item in grouped.get(region, []) if _qualified_stable_candidate(item)

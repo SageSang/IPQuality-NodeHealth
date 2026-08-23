@@ -93,6 +93,25 @@ def test_source_and_name_rotation_inherits_slot_but_not_connection_reputation():
     ]
 
 
+def test_unique_name_rotation_migrates_frozen_other_order():
+    old = nodes(proxy("Brazil 01", "old.example"))[0]
+    new = nodes(proxy("Brazil 01", "new.example"))[0]
+    previous = prior_state(old)
+    previous["frozen_order"] = {
+        "other": ["before", old.key, "after", old.key]
+    }
+
+    resolved, migrated, events = reconcile_previous_state([new], previous)
+
+    assert resolved == [new]
+    assert migrated["frozen_order"]["other"] == [
+        "before",
+        new.key,
+        "after",
+    ]
+    assert events[0]["method"] == "region-original-name"
+
+
 def test_region_unique_name_rotation_works_without_source_metadata():
     old = nodes(proxy("Japan 01", "old.example"))[0]
     new = nodes(proxy("Japan 01", "new.example"))[0]

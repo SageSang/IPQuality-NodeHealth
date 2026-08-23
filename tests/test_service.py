@@ -338,6 +338,85 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
     assert "geo" not in current["nodes"][next(iter(current["nodes"]))]
 
 
+def test_other_order_is_frozen_during_maintenance_and_rebuilt_on_demand(tmp_path):
+    service, _, full, source = make_service(tmp_path, count=4)
+    for index, proxy in enumerate(source.proxies):
+        proxy["name"] = f"Rare node {index}"
+
+    first = service.run_once("rebuild")
+    frozen = first["regions"]["other"]["ranked"]
+    assert len(frozen) == 4
+    assert first["regions"]["other"]["stable_slots"] == {}
+
+    redline_key = frozen[0]
+    full.statuses[redline_key] = "Block"
+    service.config.policy.full_audit_daily_fraction = 1.0
+    maintained = service.run_once("maintenance")
+    assert maintained["regions"]["other"]["ranked"] == frozen
+    assert redline_key in maintained["regions"]["other"]["rejected"]
+    state = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+    assert state["frozen_order"]["other"] == frozen
+
+    rebuilt = service.run_once("rebuild")
+    assert rebuilt["regions"]["other"]["ranked"] != frozen
+    assert rebuilt["regions"]["other"]["ranked"][-1] == redline_key
+
+
+def test_state_without_frozen_order_inherits_current_other_without_rebuild(tmp_path):
+    service, _, _, source = make_service(tmp_path, count=4)
+    for index, proxy in enumerate(source.proxies):
+        proxy["name"] = f"Rare node {index}"
+    first = service.run_once("rebuild")
+    frozen = first["regions"]["other"]["ranked"]
+    version = first["version"]
+    for path in (
+        tmp_path / "data" / "state.json",
+        tmp_path / "data" / "state-snapshots" / f"{version}.json",
+    ):
+        legacy = json.loads(path.read_text(encoding="utf-8"))
+        legacy.pop("frozen_order")
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    current = service.run_once("maintenance")
+
+    assert current["requested_mode"] == "maintenance"
+    assert current["mode"] == "maintenance"
+    assert current["regions"]["other"]["ranked"] == frozen
+    state = json.loads(
+        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
+    )
+    assert state["frozen_order"]["other"] == frozen
+
+
+def test_other_connection_rotation_keeps_frozen_position_and_forces_full_audit(
+    tmp_path,
+):
+    service, _, full, source = make_service(tmp_path, count=4)
+    for index, proxy in enumerate(source.proxies):
+        proxy["name"] = f"Rare node {index}"
+
+    first = service.run_once("rebuild")
+    frozen = first["regions"]["other"]["ranked"]
+    old_key = frozen[1]
+    name = first["identity_index"][old_key]["original_name"]
+    source.rotate_connection(name)
+    rotated_proxy = next(proxy for proxy in source.proxies if proxy["name"] == name)
+    new_key = node_key(rotated_proxy)
+    assert new_key != old_key
+
+    full.calls.clear()
+    maintained = service.run_once("maintenance")
+
+    expected = list(frozen)
+    expected[1] = new_key
+    assert maintained["regions"]["other"]["ranked"] == expected
+    assert new_key in full.calls
+    assert maintained["identity_events"][0]["before"] == old_key
+    assert maintained["identity_events"][0]["after"] == new_key
+
+
 def test_unsampled_dynamic_nodes_keep_their_previous_score(tmp_path):
     service, quick, full, _ = make_service(tmp_path, count=12)
     first = service.run_once("rebuild")

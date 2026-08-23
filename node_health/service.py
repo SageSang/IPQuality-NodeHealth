@@ -103,7 +103,15 @@ def _stable_region_by_key(state: dict[str, Any]) -> dict[str, str]:
 
 
 def _has_usable_slots(state: dict[str, Any]) -> bool:
-    return bool(_all_stable_keys(state))
+    frozen_order = state.get("frozen_order", {})
+    has_frozen_ranking = bool(
+        isinstance(frozen_order, dict)
+        and any(
+            isinstance(keys, list) and any(str(key) for key in keys)
+            for keys in frozen_order.values()
+        )
+    )
+    return bool(_all_stable_keys(state) or has_frozen_ranking)
 
 
 def _updated_promotion_cooldown(
@@ -629,7 +637,16 @@ class NodeHealthService:
         previous = self.store.load_state()
         nodes, source_digest = fetch_inventory(self.config, self.downloader)
         nodes, previous, identity_events = reconcile_previous_state(nodes, previous)
-        effective_mode = requested_mode if _has_usable_slots(previous) else "rebuild"
+        # States published before frozen `other` ordering existed have no
+        # durable baseline to preserve. Bootstrap them with one full rebuild
+        # instead of letting the first maintenance run silently adopt an
+        # arbitrary inventory order.
+        has_frozen_order_state = isinstance(previous.get("frozen_order"), dict)
+        effective_mode = (
+            requested_mode
+            if _has_usable_slots(previous) and has_frozen_order_state
+            else "rebuild"
+        )
 
         with self.environment.open(nodes) as ports:
             self._set_progress("quick-scan", 0, len(nodes), len(nodes))
@@ -711,6 +728,7 @@ class NodeHealthService:
             self.config.policy,
             previous.get("promotion_cooldown_at", {}),
             started_at,
+            previous.get("frozen_order", {}),
         )
         generated_at = self.clock()
         if generated_at.tzinfo is None:
@@ -1121,6 +1139,11 @@ class NodeHealthService:
             "stable_slots": {
                 region: payload["stable_slots"] for region, payload in regions.items()
             },
+            "frozen_order": {
+                "other": list(regions.get("other", {}).get("ranked", []))
+            }
+            if "other" in regions
+            else {},
             "slot_changed_at": slot_changed_at,
             "promotion_cooldown_at": promotion_cooldown_at,
             "nodes": node_state,
