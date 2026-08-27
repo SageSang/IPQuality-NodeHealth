@@ -665,8 +665,15 @@ async function testStablePortGaps() {
     listen: '127.0.0.1:11553',
     'enhanced-mode': 'fake-ip',
     'fake-ip-range': '198.18.0.1/16',
-    'default-nameserver': ['114.114.114.114'],
-    nameserver: ['https://doh.pub/dns-query'],
+    'default-nameserver': ['223.5.5.5', '1.12.12.12'],
+    nameserver: [
+      'https://223.5.5.5/dns-query',
+      'https://1.12.12.12/dns-query',
+    ],
+    'proxy-server-nameserver': [
+      'https://223.5.5.5/dns-query',
+      'https://1.12.12.12/dns-query',
+    ],
   });
   assert.strictEqual(operatorModule.STABLE_SLOT_COUNT, 3);
   assert.strictEqual(converter.STABLE_SLOT_COUNT, 3);
@@ -862,7 +869,9 @@ function testRollbackRestoresRuntimePermissions() {
   assert.ok(runner.includes("path.join(exportDirectory, 'all-plain.txt')"));
   assert.ok(runner.includes("dns.listen !== '127.0.0.1:11553'"));
   assert.ok(runner.includes("dns['enhanced-mode'] !== 'fake-ip'"));
-  assert.ok(runner.includes('converter output must preserve the independent fake-IP DNS configuration'));
+  assert.ok(runner.includes("const bootstrapResolvers = ['223.5.5.5', '1.12.12.12']"));
+  assert.ok(runner.includes("dns['proxy-server-nameserver']"));
+  assert.ok(runner.includes('converter output must preserve the bootstrap-safe independent fake-IP DNS configuration'));
 
   const service = fs.readFileSync(path.join(
     __dirname,

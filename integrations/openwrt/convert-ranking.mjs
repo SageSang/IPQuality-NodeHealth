@@ -84,18 +84,26 @@ function stableSlotEntries(state) {
 
 const outputConfig = converter.convertConfig(sourceConfig, current, startPort);
 const dns = outputConfig && outputConfig.dns;
+const sameStringArray = (actual, expected) =>
+  Array.isArray(actual) &&
+  actual.length === expected.length &&
+  actual.every((value, index) => value === expected[index]);
+const bootstrapResolvers = ['223.5.5.5', '1.12.12.12'];
+const encryptedResolvers = [
+  'https://223.5.5.5/dns-query',
+  'https://1.12.12.12/dns-query',
+];
 if (
   !dns ||
   dns.enable !== true ||
   dns.listen !== '127.0.0.1:11553' ||
   dns['enhanced-mode'] !== 'fake-ip' ||
   dns['fake-ip-range'] !== '198.18.0.1/16' ||
-  !Array.isArray(dns['default-nameserver']) ||
-  dns['default-nameserver'].length === 0 ||
-  !Array.isArray(dns.nameserver) ||
-  dns.nameserver.length === 0
+  !sameStringArray(dns['default-nameserver'], bootstrapResolvers) ||
+  !sameStringArray(dns.nameserver, encryptedResolvers) ||
+  !sameStringArray(dns['proxy-server-nameserver'], encryptedResolvers)
 ) {
-  throw new Error('converter output must preserve the independent fake-IP DNS configuration');
+  throw new Error('converter output must preserve the bootstrap-safe independent fake-IP DNS configuration');
 }
 const allowedKeys = new Set();
 for (const region of Object.values(current.regions || {})) {

@@ -636,17 +636,22 @@
       'allow-lan': true,
       'bind-address': '*',
       mode: 'global',
-      // OpenClash commonly exposes fake-IP answers to the router itself.
-      // This independent Mihomo instance must resolve proxy server hostnames
-      // through its own DNS stack or it may try to dial an unrelated 198.18/16
-      // address without OpenClash's fake-IP mapping.
+      // Use literal-IP DoH endpoints so this independent Mihomo instance does
+      // not need the router/OpenClash DNS path to bootstrap its own resolvers.
       dns: {
         enable: true,
         listen: '127.0.0.1:11553',
         'enhanced-mode': 'fake-ip',
         'fake-ip-range': '198.18.0.1/16',
-        'default-nameserver': ['114.114.114.114'],
-        nameserver: ['https://doh.pub/dns-query'],
+        'default-nameserver': ['223.5.5.5', '1.12.12.12'],
+        nameserver: [
+          'https://223.5.5.5/dns-query',
+          'https://1.12.12.12/dns-query',
+        ],
+        'proxy-server-nameserver': [
+          'https://223.5.5.5/dns-query',
+          'https://1.12.12.12/dns-query',
+        ],
       },
       listeners: output.listeners,
       proxies: output.proxies,
