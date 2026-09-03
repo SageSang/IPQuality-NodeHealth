@@ -4,7 +4,13 @@ import pytest
 
 from node_health import storage
 from node_health.config import AppConfig, InventoryConfig, ReportConfig
-from node_health.storage import StateStore, _listener_port
+from node_health.storage import (
+    StateStore,
+    _listener_port,
+    _redact_exit_ips,
+    _seed_frozen_order,
+    _zh_reason,
+)
 
 
 def test_report_ports_match_converter_block_capacity():
@@ -13,6 +19,90 @@ def test_report_ports_match_converter_block_capacity():
     assert _listener_port("united-states", 62800, 200) is None
     assert _listener_port("other", 64200, 1335) == 65535
     assert _listener_port("other", 64200, 1336) is None
+
+
+def test_exit_ip_redaction_removes_literals_embedded_in_error_strings():
+    redacted = _redact_exit_ips(
+        {
+            "error": "audit exit changed: 8.8.8.8 != 9.9.9.9; v6=2001:4860:4860::8888",
+            "nested": ["retry via 1.1.1.1 failed"],
+        }
+    )
+
+    encoded = str(redacted)
+    assert "8.8.8.8" not in encoded
+    assert "9.9.9.9" not in encoded
+    assert "2001:4860:4860::8888" not in encoded
+    assert "1.1.1.1" not in encoded
+    assert encoded.count("[redacted-ip]") == 4
+
+
+def test_exit_ip_redaction_removes_ip_literals_from_mapping_keys():
+    redacted = _redact_exit_ips(
+        {
+            "provider_by_ip": {
+                "8.8.8.8": {"error": "via 1.1.1.1"},
+                "[redacted-ip]": {"status": "literal-placeholder"},
+                "9.9.9.9": {"status": "ok"},
+            }
+        }
+    )
+
+    encoded = str(redacted)
+    assert "8.8.8.8" not in encoded
+    assert "9.9.9.9" not in encoded
+    assert "1.1.1.1" not in encoded
+    assert set(redacted["provider_by_ip"]) == {
+        "[redacted-ip]",
+        "[redacted-ip]#2",
+        "[redacted-ip]#3",
+    }
+    assert sorted(
+        item.get("status", "")
+        for item in redacted["provider_by_ip"].values()
+    ) == ["", "literal-placeholder", "ok"]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("claude-tor-exit", "Claude 专用出口检测到 Tor"),
+        (
+            "claude-risk-consensus-severe",
+            "Claude 专用出口多个来源共同确认严重风险",
+        ),
+        (
+            "claude-multiple-high-risk-sources:a,b",
+            "Claude 专用出口多个风险源判定为高风险（a,b）",
+        ),
+        (
+            "claude-insufficient-risk-coverage:1/2",
+            "Claude 专用出口有效风险数据源不足（1/2）",
+        ),
+        (
+            "claude-intelligence-country-conflict:US!=CN",
+            "Claude 服务出口国家与风险情报国家不一致（US!=CN）",
+        ),
+    ],
+)
+def test_claude_risk_reasons_have_chinese_report_labels(reason, expected):
+    assert _zh_reason(reason) == expected
+
+
+def test_upgrade_seeds_ranked_order_for_outage_freeze_from_current_document():
+    seeded = _seed_frozen_order(
+        {"schema_version": 2, "frozen_order": {}},
+        {
+            "regions": {
+                "united-states": {"ranked": ["fourth", "fifth"]},
+                "other": {"ranked": ["other-a"]},
+            }
+        },
+    )
+    assert seeded["ranked_order"] == {
+        "united-states": ["fourth", "fifth"],
+        "other": ["other-a"],
+    }
 
 
 def make_store(tmp_path, *, retention_days=180):
@@ -84,6 +174,179 @@ def test_interrupted_current_commit_recovers_snapshot_selected_by_old_current(
     recovered = restarted.load_state()
     assert recovered["version"] == "v1"
     assert recovered["stable_slots"] == {"united-states": {"1": "stable-v1"}}
+
+
+def test_same_runtime_version_failed_commit_cannot_advance_state(
+    tmp_path, monkeypatch
+):
+    store = make_store(tmp_path)
+    first_time = datetime(2026, 7, 24, 8, 30, tzinfo=timezone.utc)
+    second_time = datetime(2026, 7, 24, 9, 30, tzinfo=timezone.utc)
+    publish(store, "stable-runtime", "healthy-day-1", first_time)
+    committed = store.load_current()
+    committed_revision = committed["state_revision"]
+    alerts_dir = store.config.reports_dir / "alerts"
+    committed_latest = (alerts_dir / "latest-run.md").read_text(encoding="utf-8")
+    committed_slot_latest = (alerts_dir / "slot-changes-latest.md").read_text(
+        encoding="utf-8"
+    )
+    change = {
+        "region": "united-states",
+        "slot": "1",
+        "before": "healthy-day-1",
+        "after": "healthy-day-2",
+        "before_name": "Healthy day 1",
+        "after_name": "Healthy day 2",
+        "reason": "quality-severe",
+    }
+
+    real_atomic_write_json = storage.atomic_write_json
+
+    def interrupt_current(path, value):
+        if path == store.current_path:
+            raise OSError("simulated current commit failure")
+        return real_atomic_write_json(path, value)
+
+    monkeypatch.setattr(storage, "atomic_write_json", interrupt_current)
+    with pytest.raises(OSError, match="current commit failure"):
+        publish(
+            store,
+            "stable-runtime",
+            "healthy-day-2",
+            second_time,
+            [change],
+        )
+
+    assert (alerts_dir / "latest-run.md").read_text(
+        encoding="utf-8"
+    ) == committed_latest
+    assert (alerts_dir / "slot-changes-latest.md").read_text(
+        encoding="utf-8"
+    ) == committed_slot_latest
+    assert list(alerts_dir.glob("2026-07-24-s-*.md")) == []
+
+    restarted = StateStore(store.config)
+    assert restarted.load_current()["state_revision"] == committed_revision
+    recovered = restarted.load_state()
+    assert recovered["state_revision"] == committed_revision
+    assert recovered["stable_slots"] == {
+        "united-states": {"1": "healthy-day-1"}
+    }
+    assert list(alerts_dir.glob("2026-07-24-s-*.md")) == []
+
+
+def test_restart_finalizes_alert_for_already_committed_revision(
+    tmp_path, monkeypatch
+):
+    store = make_store(tmp_path)
+    first_time = datetime(2026, 7, 24, 8, tzinfo=timezone.utc)
+    second_time = datetime(2026, 7, 24, 9, tzinfo=timezone.utc)
+    publish(store, "runtime-a", "stable-a", first_time)
+    alerts_dir = store.config.reports_dir / "alerts"
+    prior_latest = (alerts_dir / "latest-run.md").read_text(encoding="utf-8")
+    change = {
+        "region": "united-states",
+        "slot": "1",
+        "before": "stable-a",
+        "after": "stable-b",
+        "before_name": "Stable A",
+        "after_name": "Stable B",
+        "reason": "quality-severe",
+    }
+
+    def fail_alert_finalization(current):
+        if current.get("version") == "runtime-b":
+            raise OSError("simulated crash after current commit")
+        return real_finalize(current)
+
+    real_finalize = store._finalize_committed_alerts
+    monkeypatch.setattr(store, "_finalize_committed_alerts", fail_alert_finalization)
+    publish(store, "runtime-b", "stable-b", second_time, [change])
+    committed = store.load_current()
+
+    assert committed["version"] == "runtime-b"
+    assert (alerts_dir / "latest-run.md").read_text(encoding="utf-8") == prior_latest
+    assert list(alerts_dir.glob("2026-07-24-s-*.md")) == []
+
+    StateStore(store.config)
+
+    latest = (alerts_dir / "latest-run.md").read_text(encoding="utf-8")
+    assert "Stable A" in latest
+    assert "Stable B" in latest
+    history = alerts_dir / f"2026-07-24-{committed['state_revision']}.md"
+    assert history.read_text(encoding="utf-8") == latest
+
+
+def test_pending_committed_alert_blocks_new_revision_until_recovered(
+    tmp_path, monkeypatch
+):
+    store = make_store(tmp_path)
+    publish(
+        store,
+        "runtime-a",
+        "stable-a",
+        datetime(2026, 7, 24, 8, tzinfo=timezone.utc),
+    )
+    change_b = {
+        "region": "united-states",
+        "slot": "1",
+        "before": "stable-a",
+        "after": "stable-b",
+        "before_name": "Stable A",
+        "after_name": "Stable B",
+        "reason": "quality-severe",
+    }
+    change_c = {
+        **change_b,
+        "before": "stable-b",
+        "after": "stable-c",
+        "before_name": "Stable B",
+        "after_name": "Stable C",
+    }
+    real_finalize = store._finalize_committed_alerts
+
+    def fail_runtime_b(current):
+        if current.get("version") == "runtime-b":
+            raise OSError("runtime-b alert storage unavailable")
+        return real_finalize(current)
+
+    monkeypatch.setattr(store, "_finalize_committed_alerts", fail_runtime_b)
+    publish(
+        store,
+        "runtime-b",
+        "stable-b",
+        datetime(2026, 7, 24, 9, tzinfo=timezone.utc),
+        [change_b],
+    )
+    committed_b = store.load_current()
+
+    with pytest.raises(OSError, match="runtime-b alert storage unavailable"):
+        publish(
+            store,
+            "runtime-c",
+            "stable-c",
+            datetime(2026, 7, 24, 10, tzinfo=timezone.utc),
+            [change_c],
+        )
+    assert store.load_current()["state_revision"] == committed_b["state_revision"]
+
+    monkeypatch.setattr(store, "_finalize_committed_alerts", real_finalize)
+    publish(
+        store,
+        "runtime-c",
+        "stable-c",
+        datetime(2026, 7, 24, 11, tzinfo=timezone.utc),
+        [change_c],
+    )
+
+    histories = list(
+        (store.config.reports_dir / "alerts").glob("2026-07-24-s-*.md")
+    )
+    assert len(histories) == 2
+    assert any("Stable A" in path.read_text(encoding="utf-8") for path in histories)
+    assert "Stable C" in (
+        store.config.reports_dir / "alerts" / "slot-changes-latest.md"
+    ).read_text(encoding="utf-8")
 
 
 def test_atomic_write_syncs_parent_directory(tmp_path, monkeypatch):
@@ -160,6 +423,47 @@ def test_no_change_run_does_not_overwrite_latest_slot_change(tmp_path):
     assert "本轮稳定槽位没有变化。" in latest_run
 
 
+def test_same_day_runtime_version_loop_keeps_unique_slot_change_history(tmp_path):
+    store = make_store(tmp_path)
+    change = {
+        "region": "united-states",
+        "slot": "1",
+        "before": "old-key",
+        "after": "new-key",
+        "before_name": "Old node",
+        "after_name": "New node",
+        "reason": "quality-severe",
+    }
+
+    publish(
+        store,
+        "runtime-a",
+        "stable-a1",
+        datetime(2026, 7, 25, 8, tzinfo=timezone.utc),
+        [change],
+    )
+    publish(
+        store,
+        "runtime-b",
+        "stable-b",
+        datetime(2026, 7, 25, 9, tzinfo=timezone.utc),
+        [change],
+    )
+    publish(
+        store,
+        "runtime-a",
+        "stable-a2",
+        datetime(2026, 7, 25, 10, tzinfo=timezone.utc),
+        [change],
+    )
+
+    assert store.load_current()["version"] == "runtime-a"
+    histories = list(
+        (store.config.reports_dir / "alerts").glob("2026-07-25-s-*.md")
+    )
+    assert len(histories) == 3
+
+
 def test_report_retention_deletes_only_exact_old_daily_report_names(tmp_path):
     store = make_store(tmp_path, retention_days=2)
     reports = store.config.reports_dir
@@ -194,15 +498,25 @@ def test_report_retention_deletes_only_exact_old_daily_report_names(tmp_path):
 
 def test_each_scheduled_run_has_an_immutable_versioned_archive(tmp_path):
     store = make_store(tmp_path)
-    generated_at = datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc)
+    first_time = datetime(2026, 7, 25, 8, 30, tzinfo=timezone.utc)
+    second_time = datetime(2026, 7, 25, 9, 30, tzinfo=timezone.utc)
 
-    publish(store, "v1", "stable-v1", generated_at)
+    publish(store, "v1", "stable-v1", first_time)
+    first_revision = store.load_current()["state_revision"]
+    publish(store, "v1", "stable-v1", second_time)
+    second_revision = store.load_current()["state_revision"]
 
-    archive = store.config.reports_dir / "scheduled" / "2026" / "07" / "25" / "v1"
-    assert (archive / "report.json").exists()
-    assert (archive / "report.md").exists()
+    archive_root = store.config.reports_dir / "scheduled" / "2026" / "07" / "25"
+    assert first_revision != second_revision
+    assert (archive_root / first_revision / "report.json").exists()
+    assert (archive_root / first_revision / "report.md").exists()
+    assert (archive_root / second_revision / "report.json").exists()
+    assert (archive_root / second_revision / "report.md").exists()
     assert (store.config.reports_dir / "scheduled" / "latest.json").exists()
-    assert (store.config.reports_dir / "scheduled" / "latest.md").exists()
+    latest_markdown = (
+        store.config.reports_dir / "scheduled" / "latest.md"
+    ).read_text(encoding="utf-8")
+    assert f"状态修订：`{second_revision}`" in latest_markdown
 
 
 def test_store_marks_running_audit_interrupted_after_restart(tmp_path):

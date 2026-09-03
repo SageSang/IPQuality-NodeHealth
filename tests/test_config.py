@@ -61,16 +61,69 @@ def test_minimal_loopback_config_is_valid(tmp_path):
     assert config.policy.stable_slots == 3
     assert config.policy.stable_unavailable_replace_after_runs == 3
     assert config.policy.dnsbl_redline_threshold == 3
+    assert config.policy.claude_min_valid_risk_sources == 2
+    assert config.policy.ai_service_outage_min_egresses == 5
     assert config.report.retention_days == 30
 
 
-def test_config_rejects_non_positive_unavailable_replacement_threshold(tmp_path):
+def test_ignored_legacy_unavailable_threshold_accepts_old_values(tmp_path, caplog):
     path = write_config(
         tmp_path / "config.yaml",
         "policy:\n  stable_unavailable_replace_after_runs: 0\n",
     )
-    with pytest.raises(ValueError, match="stable_unavailable_replace_after_runs"):
+    config = load_config(path)
+    assert config.policy.stable_unavailable_replace_after_runs == 0
+    assert "deprecated and ignored" in caplog.text
+
+
+def test_legacy_unavailable_run_setting_loads_with_deprecation_warning(tmp_path, caplog):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "policy:\n  stable_unavailable_replace_after_runs: 9\n",
+    )
+    config = load_config(path)
+    assert config.policy.stable_unavailable_replace_after_runs == 9
+    assert "deprecated and ignored" in caplog.text
+
+
+def test_legacy_ai_outage_node_count_maps_to_unique_egresses(tmp_path, caplog):
+    config = load_config(
+        write_config(
+            tmp_path / "config.yaml",
+            "policy:\n  ai_service_outage_min_nodes: 7\n",
+        )
+    )
+
+    assert config.policy.ai_service_outage_min_egresses == 7
+    assert "ai_service_outage_min_nodes is deprecated" in caplog.text
+
+
+def test_ai_service_failure_ratio_must_be_positive(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        "policy:\n  claude_service_failure_ratio: 0\n",
+    )
+
+    with pytest.raises(ValueError, match=r"must be in \(0, 1\]"):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "full_audit_top_candidates",
+        "full_audit_max_age_hours",
+        "min_full_passes_high_confidence",
+        "promotion_min_full_passes",
+    ],
+)
+def test_unused_legacy_policy_settings_load_with_warning(tmp_path, caplog, key):
+    config = load_config(
+        write_config(tmp_path / "config.yaml", f"policy:\n  {key}: 0\n")
+    )
+
+    assert getattr(config.policy, key) == 0
+    assert f"policy.{key} is deprecated and ignored" in caplog.text
 
 
 def test_config_rejects_single_dnsbl_listing_as_redline_threshold(tmp_path):
@@ -79,6 +132,27 @@ def test_config_rejects_single_dnsbl_listing_as_redline_threshold(tmp_path):
         "policy:\n  dnsbl_redline_threshold: 1\n",
     )
     with pytest.raises(ValueError, match="dnsbl_redline_threshold must be at least 2"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        (
+            "claude_min_valid_risk_sources",
+            "claude_min_valid_risk_sources must be positive",
+        ),
+        (
+            "ai_service_outage_min_egresses",
+            "ai_service_outage_min_egresses must be positive",
+        ),
+    ],
+)
+def test_config_rejects_nonpositive_new_evidence_thresholds(
+    tmp_path, field, message
+):
+    path = write_config(tmp_path / "config.yaml", f"policy:\n  {field}: 0\n")
+    with pytest.raises(ValueError, match=message):
         load_config(path)
 
 
@@ -117,11 +191,24 @@ def test_deployment_config_classifies_chinese_taipei_names(monkeypatch):
     assert classify_region("臺北 01", config.region_patterns) == "taiwan"
     assert config.probe.full_concurrency == 3
     assert config.schedule.time == "03:30"
-    assert config.policy.full_audit_daily_fraction == 0.25
-    assert config.policy.promotion_challengers_per_region == 1
+    assert config.policy.full_audit_daily_fraction == 0.5
+    assert config.policy.promotion_challengers_per_region == 3
     assert config.policy.promotion_min_full_passes == 2
-    assert config.policy.promotion_score_margin == 10
-    assert config.policy.promotion_cooldown_days == 2
+    assert config.policy.promotion_min_healthy_days == 6
+    assert config.policy.promotion_evidence_days == 3
+    assert config.policy.promotion_score_margin == 15
+    assert config.policy.promotion_cooldown_days == 7
+    assert config.policy.stable_protection_min_healthy_days == 6
+    assert config.policy.mass_outage_drop_ratio == 0.6
+    assert config.policy.claude_min_valid_risk_sources == 2
+    assert config.policy.ai_service_outage_min_egresses == 5
+    assert config.probe.unavailable_retry_delays_seconds == [120, 300]
+    assert config.probe.claude_ipinfo_url_template == "https://api.ipinfo.io/lookup/{ip}"
+    assert config.probe.claude_ipinfo_token == ""
+    assert config.probe.claude_ipapi_key == ""
+    assert "US" in config.probe.chatgpt_supported_countries
+    assert "TW" in config.probe.chatgpt_supported_countries
+    assert "CN" not in config.probe.chatgpt_supported_countries
     assert config.report.retention_days == 30
 
 

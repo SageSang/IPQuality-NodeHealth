@@ -100,12 +100,27 @@ def test_unique_name_rotation_migrates_frozen_other_order():
     previous["frozen_order"] = {
         "other": ["before", old.key, "after", old.key]
     }
+    previous["ranked_order"] = {
+        "other": ["before", old.key, "after", old.key]
+    }
+    previous["availability_baselines"] = {
+        "other": {"available_ratio": 1.0, "node_keys": [old.key, "after"]}
+    }
 
     resolved, migrated, events = reconcile_previous_state([new], previous)
 
     assert resolved == [new]
     assert migrated["frozen_order"]["other"] == [
         "before",
+        new.key,
+        "after",
+    ]
+    assert migrated["ranked_order"]["other"] == [
+        "before",
+        new.key,
+        "after",
+    ]
+    assert migrated["availability_baselines"]["other"]["node_keys"] == [
         new.key,
         "after",
     ]

@@ -197,7 +197,9 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
                 f"EXPORT_DIR='{_shell_path(export)}'",
                 "ADVERTISE_HOST='192.0.2.4'",
                 "READINESS_ATTEMPTS='3'",
-                "READINESS_DELAY_SECONDS='0'",
+                # The mock listener is spawned in the background. Give it a
+                # deterministic scheduling window before readiness polling.
+                "READINESS_DELAY_SECONDS='0.05'",
                 "LISTENER_CONNECT_TIMEOUT_MS='250'",
                 "LISTENER_CHECK_CONCURRENCY='4'",
                 "",

@@ -66,6 +66,8 @@ NODE_HEALTH_STORAGE_ROOT=/volume1/docker/YOUR_PROJECT_DIR
 NODE_HEALTH_BIND_IP=192.0.2.2
 NODE_HEALTH_PORT=18887
 NODE_HEALTH_API_TOKEN=替换为一段足够长的随机字符串
+IPINFO_TOKEN=
+IPAPI_KEY=
 PYTHON_IMAGE=python:3.12.11-slim-bookworm
 MIHOMO_IMAGE=metacubex/mihomo:v1.19.29
 SUB_STORE_INVENTORY_URL=http://192.0.2.2:3001/download/collection/inventory?target=ClashMeta&noCache=true
@@ -77,6 +79,7 @@ SUB_STORE_INVENTORY_URL=http://192.0.2.2:3001/download/collection/inventory?targ
 - `NODE_HEALTH_STORAGE_ROOT`：必填。状态和报告的群晖绝对路径；先创建并授予 `PUID/PGID` 读写权限。
 - `NODE_HEALTH_BIND_IP`：群晖的局域网 IP。也可填 `0.0.0.0`，但必须用 DSM 防火墙限制为局域网访问。
 - `NODE_HEALTH_API_TOKEN`：保护手动维护/全量重建接口；不要提交到 Git，也不要写进报告。
+- `IPINFO_TOKEN`、`IPAPI_KEY`：可选但建议配置，用于 Claude 专用出口的完整风险证据；未配置时只采纳接口实际返回的字段，不把缺失字段当成低风险。
 - `SUB_STORE_INVENTORY_URL`：Sub-Store 完整节点集合的 Clash YAML 下载地址。保留 `target=ClashMeta&noCache=true`，避免 Python 客户端拿到默认 JSON，也避免上游机场资源继续使用 Sub-Store 默认的一小时缓存。
 - 容器内的 `127.0.0.1` 指向容器自身，不能用它访问运行在群晖上的 Sub-Store；URL 必须使用群晖局域网 IP 或同一个 Docker 网络中的服务名。
 
@@ -140,9 +143,9 @@ curl -fsS -X POST \
 4. 按地区重新排序，并自动选出每区最优的三个节点作为固定身份槽位 1-3；
 5. 生成报告和版本状态快照，最后以原子替换 `current.json` 作为新版本生效点。
 
-深检允许少量第三方接口失败：默认要求全局以及每个有可用节点的地区至少 `80%` 的深检拿到与快速检测一致的出口 IP。除此以外，每个地区还必须有同等比例的有效决策证据，例如至少两个可用风险源、明确的 ChatGPT 状态和地区证据，或明确的质量红线。仅仅拿到一份 `Score` 全为 `null` 的 JSON 不算可发布证据。门槛不满足时整轮失败，旧 `current.json`、稳定槽位和 OpenWrt 配置继续生效。
+深检允许单个第三方接口失败：证据不足的节点会降为低置信度、暂停健康/晋级累计，并保留上一份与同一出口匹配的可信深检结果；明确红线仍会生效。`rebuild` 不再使用旧的全局或地区 `80%` 深检完成率作为整轮发布门槛，`minimum_publish_available_ratio` 与 `minimum_rebuild_full_completion_ratio` 仅为旧配置兼容保留。全量不可用或命中大面积异常阈值时，才冻结排序并保留上一有效决策状态。
 
-这里的“原子”是单个可变文件的原子替换，不是把状态和所有报告合成一个跨文件事务。发布顺序是报告 -> `data/state-snapshots/<version>.json` -> `data/state.json` -> `data/current.json`；最后一个 `current.json` 是权威提交点。若在最后一步前中断，重启后仍按旧 `current.json` 选择同版本快照，不会把新槽位状态误配给旧排序。极少数中断可能让磁盘上的报告版本暂时领先于权威 `current.json`，这是因为报告只用于观察、不参与恢复；核对某次报告时应比较其中的 `version` 与当前版本。
+这里的“原子”是单个可变文件的原子替换，不是把状态和所有报告合成一个跨文件事务。OpenWrt 使用稳定的 runtime `version` 判断是否需要重应用；每次扫描另生成唯一 `state_revision`。发布顺序是报告及归档内暂存告警 -> `data/state-snapshots/<state_revision>.json` -> `data/state.json` -> `data/current.json` -> 对外可见的 `reports/alerts/`；`current.json` 是权威提交点。若在提交前中断，重启后仍按旧 `current.json.state_revision` 选择上一份快照，也不会发布未生效的换槽告警；若提交后、告警发布前中断，重启会按已提交修订号幂等补发告警。若补发仍失败，下一修订的发布会被阻止并等待调度重试，不能越过旧换槽历史。旧版只含 `version` 的状态仍可读取。极少数中断可能让磁盘完整报告暂时领先于权威 `current.json`，完整报告只用于观察、不参与恢复。
 
 运行接口返回 `202 Accepted` 只表示任务已经进入后台。用下面的接口查看 `running`、`running_mode`、`last_success`、`last_error`、`started_at` 和 `progress`：
 
@@ -167,17 +170,17 @@ curl -fsS http://192.0.2.2:18887/current.json
 ```text
 /volume1/docker/YOUR_PROJECT_DIR/data/current.json
 /volume1/docker/YOUR_PROJECT_DIR/data/state.json
-/volume1/docker/YOUR_PROJECT_DIR/data/state-snapshots/版本号.json
+/volume1/docker/YOUR_PROJECT_DIR/data/state-snapshots/状态修订号.json
 /volume1/docker/YOUR_PROJECT_DIR/reports/YYYY-MM-DD.md
 /volume1/docker/YOUR_PROJECT_DIR/reports/YYYY-MM-DD.json
 /volume1/docker/YOUR_PROJECT_DIR/reports/alerts/latest-run.md
 /volume1/docker/YOUR_PROJECT_DIR/reports/alerts/slot-changes-latest.md
-/volume1/docker/YOUR_PROJECT_DIR/reports/alerts/YYYY-MM-DD-版本号.md
+/volume1/docker/YOUR_PROJECT_DIR/reports/alerts/YYYY-MM-DD-状态修订号.md
 ```
 
-`data/current.json` 是服务内部的完整当期结果；HTTP `/current.json` 只公开 Sub-Store/OpenWrt 所需的版本、地区稳定槽、完整动态顺序、风险标记，以及不含连接秘密的来源/原始名称身份索引，不公开出口 IP、代理密码、UUID 或原始检测详情。`state.json` 保存下一轮决策需要的连续通过次数、可信深检、槽位变更时间和独立的质量晋升冷却时间；`state-snapshots` 默认只保留最近三个，并通过版本与 `current.json` 配对。
+`data/current.json` 是服务内部的完整当期结果；HTTP `/current.json` 只公开 Sub-Store/OpenWrt 所需的版本、地区稳定槽、完整动态顺序、风险标记，以及不含连接秘密的来源/原始名称身份索引，不公开出口 IP、代理密码、UUID 或原始检测详情。`state.json` 保存下一轮决策需要的连续通过次数、可信深检、槽位变更时间和独立的质量晋级冷却时间；`state-snapshots` 默认只保留最近三个，并通过唯一 `state_revision` 与 `current.json` 配对，运行时 `version` 只用于判断消费者是否需要重应用排序。
 
-每日 `YYYY-MM-DD.md/.json` 是该日期最后一次写入的完整报告，同一天重复运行会覆盖同名日报。`latest-run.md` 每次发布都会更新，展示当前 degraded/unavailable/absent 槽位；`slot-changes-latest.md` 首次创建后只在真实身份变化时更新，因此不会被下一轮“无变化”覆盖。每日完整报告默认保留 30 天，带日期和版本号的槽位变更历史不随它清理。
+每日 `YYYY-MM-DD.md/.json` 是该日期最后一次写入的完整报告，同一天重复运行会覆盖同名日报。`latest-run.md` 每次发布都会更新，展示当前 degraded/unavailable/absent 槽位；`slot-changes-latest.md` 首次创建后只在真实身份变化时更新，因此不会被下一轮“无变化”覆盖。每日完整报告默认保留 30 天，带日期和唯一状态修订号的槽位变更历史不随它清理。
 
 如果状态文件不存在或其中没有任何已记录的稳定槽位身份，服务会自动把计划任务或手动 `maintenance` 升级为 `rebuild`。仍在 inventory 中但暂时 unavailable 的槽位在阈值前仍算有效历史；已从 inventory 消失的身份会在当轮释放。损坏且无法解析的状态文件不会被静默忽略，服务会停止发布并要求从备份恢复或由你明确清理后重建。
 
@@ -191,51 +194,63 @@ curl -fsS http://192.0.2.2:18887/current.json
 POST /api/run?mode=maintenance
 ```
 
-它会对全部节点快速检测；完整检测所有稳定槽位、全部新节点、出口 IP 变化节点，以及连接参数改变后通过逻辑身份安全继承的节点，并按每个地区的当前动态排名分段抽检约四分之一。连接参数变化节点在发现当轮强制深检，不等待抽检周期。每个四节点排名段优先选择最久未深检的成员，因此正常情况下约四天覆盖一轮，不会再在 48 小时时集中触发整批深检。每区当前最高分的动态候补每天额外深检，用于积累连续晋级证据。
+它会对全部节点快速检测，并对首次失败节点依次等待 120 秒和 300 秒复检。完整检测所有稳定槽位、每区当前最强的 3 个动态挑战者、全部新节点、出口 IP 或 Claude 专用出口变化节点、刚恢复节点和风险数据冲突节点；其余动态池每天轮换 50%，正常情况下两天覆盖一轮。连接参数变化节点在发现当轮强制深检，不等待抽检周期。
 
-稳定槽位 `001-003` 正常情况下是三个固定身份；合格可用节点不足三个时则放弃历史身份顺序，按整体质量重排以保证固定入口优先可用：
+稳定槽位 `001-003` 正常情况下是三个固定身份：
 
 | 检测情况 | 稳定槽位处理 | 固定端口结果 |
 |---|---|---|
 | 新候补仅略高于当前节点 | 不替换 | 继续指向原身份 |
 | 高置信候补满足全部自动晋级门槛 | 每区本轮最多替换一个可比较的最弱稳定节点 | 仅被选中的固定端口改变身份 |
-| 连续 1-2 轮连接不可用但仍在 `inventory` | 保留原 `node_key`，任一轮恢复后计数归零 | listener 和原指向暂时保留 |
-| 连续第 3 轮连接不可用 | 节点移到地区队尾；固定节点由最佳候补接替 | 若候补不足则按完整降级质量顺序补槽 |
+| 健康连续不足 6 天，当日三次检测均不可用 | 当日释放，仅替换对应槽位 | 最佳可用候补接替 |
+| 健康连续至少 6 天后第一次确认不可用 | 清零健康天数并使用一次宽限 | listener 和原指向保留到下一个有效检测日 |
+| 宽限后的下一有效日仍不可用 | 释放槽位，被替换节点回到普通动态池 | 最佳可用候补接替，无恢复特权 |
+| 宽限后的下一有效日恢复 | 保留原槽，健康天数从 1 重新累计 | 固定端口不变 |
 | 节点从 `inventory` 消失 | 当轮释放并用最高质量候补补齐 | 地区至少还有三个节点时不留空 |
-| 明确触发质量红线且合格候补充足 | 只用最高分合格候补替换这个槽位 | 仅该端口变更身份，其他两个槽位不动 |
-| 合格可用节点不足三个 | 全地区所有节点按可用性、风险和质量重排 | 风险或不可达节点也可补槽，最优节点从 `001` 开始 |
+| 明确触发严重风险 C 且有等级更好的可信候补 | 只替换这个槽位 | 其他两个槽位不动 |
+| A/B 候补不足 | 使用风险最低的可用 C 级节点 | 只要仍有可用节点就不主动留空 |
+| 全部不可用或命中 20%/60% 大面积异常阈值 | 冻结槽位、顺序、计数、宽限和晋级历史 | 保持上一有效输出并报告原因 |
 
-质量红线必须是明确结论，例如地区不匹配、出口采样不稳定、Tor/DNSBL、多个风险源同时高风险，或 AI 服务明确返回 `Block/WebOnly/APPOnly` 等不可用或受限状态。单次稳定节点出口 IP 变化只会重置置信度并强制绑定新 IP 深检，不会单凭变化换槽。普通超时、第三方风险接口失败以及 AI 检测返回 `Failed/Unknown` 都不是新的红线；此前健康的槽位会保留但标记为 `degraded`，也不能作为新槽位候选。如果同一出口 IP 已有可信红线，模糊结果不能解除它，节点继续被拒绝，直到新的可信 clean 深检通过。
+综合等级由 AI 等级和风险等级中较差者决定，明显国家错配、出口不稳定或无法取得出口 IP 可进一步降为 C。风险 C 需要 Tor、同一出口至少两个不低于 75 的风险源、DNSBL 至少 3 个命中，或同一出口至少三个独立来源共同确认 proxy/VPN/server/abuser；通用出口和 Claude 专用出口分别计算，不能跨出口拼成风险共识。普通 B 风险和单来源误报不会立即换槽。AI 只有在 ChatGPT 与 Claude 都确认不可用、受限或封锁时才进入 C。若至少 5 个不同服务出口中有 80% 的基础正常且官方支持地区节点同时无法访问同一 AI 服务，本轮将该服务视为系统异常，沿用上一轮可信 AI 结果并禁止由此触发替换或晋级；共享出口的节点别名只算一个样本，不支持地区不会进入 ChatGPT 异常比例的分母。
+
+100 分模型为 AI 可用性 25、IP 风险 25、运行可靠性 25、住宅/家宽 10、地理与身份一致性 10、延迟 5。排序依次比较实际可用性、综合 A/B/C、总分、延迟和稳定标识；总分只在同一等级内生效。Claude 通过 `claude.ai/cdn-cgi/trace` 与 `anthropic.com` 独立检查，专用出口不同时再查询该出口的 ASN、住宅与风险信息。Claude 是否属于支持地区只采用 trace 的服务出口国家；第三方情报国家仅用于诊断，不覆盖服务结论。
 
 日常允许一个严格受控的自动晋级例外。候补必须同时满足：
 
-- 至少连续 `2` 个不同自然日完整检测通过，达到高置信度；
-- 至少 `2` 个风险评分源返回有效数据，AI 可用性为明确通过；
+- 连续健康至少 `6` 个有效自然日；
+- 最近连续 `3` 个有效日都有新鲜深检，且每天都领先目标稳定节点至少 `15` 分；
+- 至少 `3` 个风险评分源返回有效数据；
 - 默认 3 次出口采样至少成功 2 次，出口 IP 一致，实际地区与节点地区一致；
-- 综合分至少比当前“可比较的最弱稳定节点”高 `10` 分；
+- AI、风险和住宅等级均不差于目标节点；
 - 同一地区本轮最多晋级 `1` 个节点；
-- 该地区距离上一次“第 4 名因质量领先而主动晋升”，至少已经冷却 `2` 天。
+- 该地区没有宽限节点、没有先执行必要换槽，且距上次普通晋级至少 `7` 天。
 
-“可比较”只包含当前存在、可用且检测数据足以比较的稳定节点。连续 1-2 轮 unavailable 的稳定节点不参与“最弱节点”比较，因此性能晋级不能借短暂连接失败清退它；连续第 3 轮失败则按独立的连接失败规则替换。从 inventory 消失的身份按缺失规则立即释放。如果该地区尚在冷却期，或没有可比较的稳定节点，本轮不执行性能晋级。
+“可比较”只包含当前存在、可用且本轮深检证据完整的稳定节点。宽限中的稳定节点不参与“最弱节点”比较，因此普通晋级不能借短暂连接失败清退它。从 inventory 消失的身份按缺失规则立即释放。如果该地区尚在冷却期、发生大面积异常或缺少可比较证据，本轮不执行普通晋级。
 
-除了当前分差，服务还会核对前一个自然日的可比得分是否同样至少领先 `10` 分，以过滤单日偶然峰值；同一天重复运行不会累计天数。冷却期只限制“第 4 名为了更高质量而主动晋升”，不阻止明确质量红线的强制替换。只有正常质量晋升会启动或重置该地区的 2 天冷却；风险淘汰、连续失败换槽、节点消失、降级补槽和 `rebuild` 都不会新建或重置它。风险换槽前已经存在的质量晋升冷却会继续按原时间倒计时，但不能阻止任何新的风险换槽。同一地区仍然遵守每轮最多质量晋升一个节点。
+同一天重复运行只覆盖当天记录，不重复累计天数。冷却期只限制普通质量晋级，不阻止确认不可用、节点消失或严重风险换槽；也只有普通晋级会启动或重置 7 天冷却。
 
 稳定槽位之后的动态节点，也就是逻辑上的第 4 名及以后，只有本轮可信深检成功的节点才更新质量分；未轮到的节点保留上一轮可信分数和相对质量依据。风险、不可达、证据不足和未匹配节点全部继续输出，只根据状态移动到更靠后的位置。
 
-这项策略允许两轮短暂网络波动自行恢复；连续第 3 轮仍失败时才会改变固定身份。除此之外，只有明确质量红线、合格节点不足触发整体重排、满足全部门槛的受控晋级、节点从 inventory 消失或手动 `rebuild` 才能改变槽位身份。
+这项策略只给已经连续健康至少 6 天的节点一次确认不可用宽限；其他节点确认不可用后当日换槽。系统不再因为“合格候补不足”重排整个前三。
 
 这些门槛都可以在 `deploy/config/config.example.yaml` 的 `policy` 中调整：
 
 ```yaml
 promotion_enabled: true
-full_audit_daily_fraction: 0.25
-promotion_challengers_per_region: 1
-promotion_min_full_passes: 2
-promotion_score_margin: 10
+full_audit_daily_fraction: 0.5
+promotion_challengers_per_region: 3
+promotion_min_healthy_days: 6
+promotion_evidence_days: 3
+promotion_score_margin: 15
 promotion_max_per_region_per_run: 1
-promotion_cooldown_days: 2
-min_valid_risk_sources: 2
+promotion_cooldown_days: 7
+stable_protection_min_healthy_days: 6
+stable_unavailable_grace_days: 1
+min_valid_risk_sources: 3
+claude_min_valid_risk_sources: 2
 minimum_candidate_success_rate: 0.6666
+claude_service_failure_ratio: 0.80
+ai_service_outage_min_egresses: 5
 ```
 
 建议先保持默认值运行。将 `promotion_enabled` 设为 `false` 可完全关闭日常性能晋级，但红线替换和手动 `rebuild` 仍然有效。
@@ -263,7 +278,7 @@ curl -fsS -X POST \
   "http://192.0.2.2:18887/api/run?mode=rebuild"
 ```
 
-`rebuild` 会全量深检所有可用节点，并允许每区所有合格节点重新竞争三个稳定槽位；原来健康的 1-3 也不保留特权。它不使用日常晋级的 `10` 分差、每轮一个和冷却期限制；合格节点不足三个时改为按全部节点的可用性、风险和质量选择前三。
+`rebuild` 会全量深检所有可用节点，并允许每区所有节点重新竞争三个稳定槽位；原来健康的 1-3 也不保留特权。它不使用日常晋级的 6 天培养、连续 3 天 15 分差、每轮一个和冷却期限制；A/B 节点不足时继续使用风险最低的可用 C 级节点。
 
 `rebuild` 不会边测边改变线上结果。旧 `current.json` 一直有效，只有全量扫描、评分和文件写入全部成功后才切换到新版本。
 
@@ -273,11 +288,11 @@ curl -fsS -X POST \
 
 - 稳定槽位按 `001-003` 展示固定身份、端口、当前健康状态、最后成功时间和详细检测结果，不把槽位号解释成质量名次。
 - 动态节点从第 4 名开始按当日质量顺序展示。
-- 临时不可用的稳定槽位在前两轮标记为“保留等待恢复”，并显示连续不可用次数；连续第 3 轮失败会记录连接失败换槽原因。
+- 获得 6 天稳定资格的节点第一次确认不可用时标记为“宽限保护中”；下一有效日仍失败会记录连接失败换槽原因，恢复则从健康第 1 天重新累计。
 - 真正发生替换时，记录地区、槽位、旧节点、新节点、触发原因以及运行模式是 `maintenance` 还是 `rebuild`。
-- 自动晋级还会记录候补连续完整通过次数、晋级前后分数和实际分差；一般槽位变化时间保存在 `data/state.json` 的 `slot_changed_at`，仅质量晋升使用的地区冷却起点单独保存在 `promotion_cooldown_at`。
+- 自动晋级还会记录候补健康连续天数、晋级前后分数和实际分差；一般槽位变化时间保存在 `data/state.json` 的 `slot_changed_at`，仅质量晋升使用的地区冷却起点单独保存在 `promotion_cooldown_at`。
 
-`reports/alerts/latest-run.md` 显示本轮保留但 degraded/unavailable/absent 的稳定槽位。`reports/alerts/slot-changes-latest.md` 在首次发布时创建；发生过身份变化后，它保存最近一次真实变化。任何红线替换、自动晋级或 `rebuild` 造成的实际身份替换，都会额外写入 `reports/alerts/YYYY-MM-DD-版本号.md`，不会被下一次检测覆盖。长期监控应关注 `alerts` 目录中新出现的日期版本文件，而不是只轮询一个会变化的文件内容。
+`reports/alerts/latest-run.md` 显示本轮保留但 degraded/unavailable/absent 的稳定槽位。`reports/alerts/slot-changes-latest.md` 在首次发布时创建；发生过身份变化后，它保存最近一次真实变化。任何红线替换、自动晋级或 `rebuild` 造成的实际身份替换，都会额外写入 `reports/alerts/YYYY-MM-DD-状态修订号.md`，不会被下一次检测覆盖。长期监控应关注 `alerts` 目录中新出现的日期状态修订文件，而不是只轮询一个会变化的文件内容。
 
 每次定时或手动正式扫描还会写入不可变的版本目录：
 
@@ -285,7 +300,7 @@ curl -fsS -X POST \
 reports/
 ├── YYYY-MM-DD.md/json                 # 当天最新一次，兼容现有查看方式
 ├── scheduled/latest.md/json           # 最近一次正式扫描
-├── scheduled/YYYY/MM/DD/<version>/
+├── scheduled/YYYY/MM/DD/<state_revision>/
 │   └── report.md/json                 # 每次扫描独立归档
 └── alerts/                             # 稳定槽位状态与变化
 ```
@@ -358,7 +373,7 @@ reports/audits/YYYY/MM/DD/<id>/report.json
 - OpenClash、subconverter、手机、电脑等所有实际订阅都改为从 `healthy` 派生。
 - 下载 URL 使用 `http://群晖局域网IP:3001/download/collection/healthy?target=ClashMeta&noCache=true`。
 
-健康脚本只改变顺序：成功读取有效 `current.json` 时，先输出稳定槽位，再按 `ranked` 输出其余节点；风险、不可达、证据不足和未检测节点全部保留。排名中暂未出现的输入节点放在末尾并保持原顺序。固定节点连接失败前两轮保持身份，连续第 3 轮由最佳动态候补接替并把失败节点移到地区队尾；命中红线则立即替换。候补不足时全地区重排并尽量补满前三槽。
+健康脚本只改变顺序：成功读取有效 `current.json` 时，先输出稳定槽位，再按 `ranked` 输出其余节点；风险、不可达、证据不足和未检测节点全部保留。排名中暂未出现的输入节点放在末尾并保持原顺序。只有已连续健康至少 6 天的固定节点在第一次确认不可用时保留身份；其他节点当日确认不可用即由最佳可用候补接替。严重风险 C 仅在存在等级更好候补时替换对应槽位，候补不足时允许风险最低的可用 C 补槽，不做整个地区重排。
 
 如果 Script Operator 使用远程脚本链接而界面没有单独的 arguments 输入框，把 URL 编码后的 JSON 放到脚本链接 fragment，例如：
 
@@ -519,7 +534,7 @@ apply-command INVENTORY_YAML CURRENT_JSON VERSION
 62803 起 = 美国动态候选
 ```
 
-如果 `002` 连接不可用，前两轮 `62801` 保持原节点和 listener，任一轮恢复后计数归零；连续第 3 轮仍失败时由当前最佳候补接替，失败节点移到地区队尾。节点从订阅消失或明确触发质量红线时也会替换；满足全部门槛的候补可受控晋级，`rebuild` 则重新选优。红线替换且合格候补充足时只更新对应端口；合格可用节点不足三个时，所有节点按整体质量重排并重新占据 `001-003`。只要该地区仍有至少三个不同节点，固定端口就不得留空；风险节点仍保留在固定或动态端口中。
+如果 `002` 已连续健康至少 6 天，它第一次确认不可用时 `62801` 保持原节点和 listener，下一有效日恢复则从健康第 1 天重新累计；下一有效日仍失败则由当前最佳可用候补接替。未达到 6 天的节点确认不可用后当日换槽。节点从订阅消失或存在等级更好的候补且当前确认严重风险 C 时也会替换；满足全部门槛的候补可受控晋级，`rebuild` 则重新选优。只要还有可用节点，就按 A、B、风险最低的 C 顺序补槽；风险节点始终保留在固定或动态端口中。
 
 ### 启用 cron 前的真实验收
 
@@ -573,9 +588,9 @@ uci commit firewall
 ## 10. 失败保护和回滚
 
 - inventory 下载失败：本轮任务失败，不发布新状态。
-- 稳定节点连接不可用：前两轮保留槽位身份和 listener；连续第 3 轮失败时用最佳候补补位并把失败节点移到地区队尾；从 inventory 缺失时立即用剩余节点补位。
+- 稳定节点连接不可用：先完成 120/300 秒延迟复检；连续健康至少 6 天的节点第一次确认失败使用一次宽限，其他情况立即用最佳可用候补补位；从 inventory 缺失时立即释放槽位。
 - Mihomo 配置加载失败：本轮任务失败，保留上一版 `current.json`。
-- 深检出口 IP 与快速检测出口 IP 不一致、地区证据覆盖不足或风险源大量返回空值：整轮 `rebuild` 不发布。
+- 深检出口 IP 与快速检测出口 IP 不一致、地区证据覆盖不足或风险源大量返回空值：该节点证据无效并暂停健康累计，不用模糊结果覆盖历史可信证据。
 - IPQuality 第三方接口超时：标记不确定，不把节点误判为危险。
 - 报告或状态无法原子写入：不推进当前版本。
 - Sub-Store 状态读取、校验或身份匹配失败：记录错误并原样输出完整 inventory，不删除节点。
@@ -612,4 +627,4 @@ uci commit firewall
 - AdsPower 继续使用固定地区端口 001-003；
 - 稳定槽位的保留/恢复/变更状态和详细检测结果写入群晖 `reports` 目录。
 
-日常查看 `alerts/latest-run.md` 了解当前降级槽位，并监控 `alerts/YYYY-MM-DD-版本号.md` 新文件获知真实换槽；`slot-changes-latest.md` 首次发布时创建，发生过换槽后保留最近一次换槽，不会每天重写。只有机场大规模更新或你主动希望重新选优时，才手动调用一次 `rebuild`。
+日常查看 `alerts/latest-run.md` 了解当前降级槽位，并监控 `alerts/YYYY-MM-DD-状态修订号.md` 新文件获知真实换槽；`slot-changes-latest.md` 首次发布时创建，发生过换槽后保留最近一次换槽，不会每天重写。只有机场大规模更新或你主动希望重新选优时，才手动调用一次 `rebuild`。

@@ -20,21 +20,28 @@ OpenWrt 不直接读取 `current.json`，也不需要部署
 每个固定地区有三个稳定槽位。`001`、`002`、`003` 是固定身份，三者之间
 没有实时名次关系。
 
-- 首次运行、状态丢失或手动 `rebuild`：全量深检；合格可用节点不少于三个
-  时选出最好的三个，否则把该地区全部节点按可用性、风险和质量重排后取前三。
-- 节点仍在完整订阅中但本轮无法连接：前两轮保留原槽位和固定监听等待恢复；
-  连续第 3 轮失败时移到地区队尾，固定槽由当前最佳候补接替。
-- 不可用节点恢复连接：连续不可用计数立即归零。
+- 首次运行、状态丢失或手动 `rebuild`：全量深检；按可用状态、A/B/C 等级、
+  100 分质量分、延迟和稳定标识选出最好的三个。候补不足时允许 B、C 级可用
+  节点补槽，只有没有任何可用节点才留空。
+- 首次连接失败会在 120 秒、300 秒后复检；三次都失败才算当日确认不可用。
+  连续健康不足 6 天的前三节点当日替换；已连续健康至少 6 天的节点第一次失败
+  享受一次宽限并清零健康天数，下一有效日仍失败才替换。
+- 宽限节点下一有效日恢复后保留原槽位，健康天数从 1 重新累计；已被替换的节点
+  没有恢复原槽位的特权，只作为普通动态候补参与后续排序。
 - 节点服务器、端口或认证等连接参数变化但逻辑身份安全匹配：继承原排序位置，
   并在本轮强制完整深检，不等待动态池轮转抽检。
 - 节点已从完整订阅消失：本轮立即释放并用当前最高质量候补补齐；只有该地区
   实际少于三个不同节点时，才无法填满三个不同槽位。
-- 明确触发质量红线：合格候补足够时立即只替换对应槽位；候补不足时进入全量
-  重排，风险节点也可用于补满前三槽，但最安全、最可用的节点排在前面。
-- 明显更优的高置信候补：满足连续两个不同自然日完整检测、当前及前一日均领先 10 分、2 天冷却等条件后，
+- 明确触发严重质量 C 且存在等级更好的可信候补时，仅替换对应槽位；没有更好
+  候补时保留当前可用节点，不再因候补不足重排整个前三。
+- 明显更优的高置信候补：满足连续 6 个健康日、最近 3 个有效日每天领先至少
+  15 分、等级不退步及 7 天冷却等条件后，
   每个地区每轮最多替换一个最弱槽位。
-- 第 4 名以后没有固定身份，每轮按可用性、风险、置信度、质量分、延迟排序；
+- 第 4 名以后没有固定身份，每轮按可用性、A/B/C 等级、质量分和延迟排序；
   风险、不可达、未检测和暂未匹配节点全部保留，健康逻辑只排序、不删除。
+- 全局或地区全部不可达，或可用率低于 20% 且比上一有效基线下降至少 60 个
+  百分点时，冻结对应范围的槽位、顺序和连续天数。首次运行全量不可达不会发布
+  错误排名。
 - `other` 不使用前三槽和日常质量重排：`rebuild` 全量检测后建立一次完整质量
   顺序，后续 `maintenance` 保留现有节点的相对顺序、删除已从订阅消失的节点，
   并将全新节点按订阅顺序追加队尾；风险、失败和分数变化只更新报告。下一次
@@ -52,11 +59,28 @@ OpenWrt 不直接读取 `current.json`，也不需要部署
 ```yaml
 policy:
   stable_slots: 3
-  stable_unavailable_replace_after_runs: 3
-  promotion_min_full_passes: 2
-  promotion_score_margin: 10
-  promotion_cooldown_days: 2
+  stable_protection_min_healthy_days: 6
+  stable_unavailable_grace_days: 1
+  full_audit_daily_fraction: 0.5
+  promotion_challengers_per_region: 3
+  promotion_min_healthy_days: 6
+  promotion_evidence_days: 3
+  promotion_score_margin: 15
+  promotion_cooldown_days: 7
+  min_valid_risk_sources: 3
+  claude_min_valid_risk_sources: 2
+  claude_service_failure_ratio: 0.80
+  ai_service_outage_min_egresses: 5
 ```
+
+质量分由 AI 可用性 25、IP 风险 25、运行可靠性 25、住宅/家宽 10、地理与
+身份一致性 10、延迟 5 组成。ChatGPT 与 Claude 分开判断；Claude 使用
+`claude.ai/cdn-cgi/trace`、`anthropic.com` 和可覆盖的 Anthropic 支持国家快照，
+专用出口与通用出口不同时会额外查询该出口的 ASN 与风险。Claude trace 国家
+只决定服务地区，第三方风险源国家单独记录；两条出口的风险来源和共识不会
+合并。ChatGPT 服务级异常比例只统计官方支持地区中的节点，且两项 AI 服务
+异常都至少需要 5 个不同服务出口；共享出口的节点别名只计一个样本。总分只在同一综合
+等级内比较，不能用低延迟跨越 AI 双失败或严重风险等级。
 
 ## 2. 群晖目录
 
@@ -133,13 +157,18 @@ NODE_HEALTH_BIND_IP=NAS_LAN_IP
 NODE_HEALTH_PORT=18887
 LOCAL_SOCKS_ADVERTISE_HOST=OPENWRT_LAN_IP
 NODE_HEALTH_API_TOKEN=一段足够长的随机字符串
+# 可选；建议填写以获得完整、稳定的 Claude 专用出口风险证据
+IPINFO_TOKEN=
+IPAPI_KEY=
 
 MIHOMO_IMAGE=metacubex/mihomo:v1.19.29
 NODE_HEALTH_IMAGE=ghcr.io/sagesang/ipquality-node-health:latest
 SUB_STORE_INVENTORY_URL=http://NAS_LAN_IP:3001/download/collection/inventory?target=ClashMeta&noCache=true
 ```
 
-`NODE_HEALTH_API_TOKEN`、真实订阅链接、`data`、`reports` 不要提交到 Git。
+`NODE_HEALTH_API_TOKEN`、`IPINFO_TOKEN`、`IPAPI_KEY`、真实订阅链接、
+`data`、`reports` 不要提交到 Git。未配置风险接口密钥时，系统只使用服务商
+实际返回的字段，不会把缺失风险字段虚构成“低风险”。
 
 ## 5. Container Manager 部署
 
@@ -236,9 +265,10 @@ START_PORT='62000'
 默认每天 `03:30` 自动执行一次 `maintenance`。无需群晖 cron，也无需
 OpenWrt 每 10 分钟读取 `current.json`。
 
-`maintenance` 每天快速检查全部节点，深检所有稳定槽位、新节点、出口 IP
-变化节点，以及按排名均匀轮转的约四分之一动态节点；完整检测并发默认为
-`3`。未轮到的动态节点保留上次可信分数，正常约四天完成一轮动态池深检。
+`maintenance` 每天快速检查全部节点，深检所有稳定槽位、每区最强的 3 个
+挑战者、新节点、出口 IP/Claude 出口变化节点、刚恢复和风险冲突节点；其余
+动态节点轮转 50%，完整检测并发默认为 `3`。未轮到的动态节点保留上次可信
+分数，正常两天完成一轮动态池深检。
 
 手动日常检测：
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -7,8 +8,9 @@ import re
 import shutil
 import tempfile
 import time
+import uuid
 from collections.abc import Iterable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from .config import AppConfig
 from .models import NodeAssessment
 from .audit import audit_day_parts, validate_audit_id
 from .reconcile import SCHEMA_VERSION
+from .slots import ranking_key
 
 
 _FIXED_REGION_PORT_BLOCK_SIZE = 200
@@ -26,36 +29,52 @@ LOGGER = logging.getLogger("node_health.storage")
 def _seed_frozen_order(
     state: dict[str, Any], current: dict[str, Any]
 ) -> dict[str, Any]:
-    """Seed the new `other` baseline from the already-published ranking.
+    """Seed ordering baselines from the already-published ranking.
 
     This keeps an image-only upgrade maintenance-safe: the first run after
-    deployment preserves the currently active `other` order instead of forcing
-    an unsolicited rebuild. The next explicit rebuild will replace it through
-    the normal ranking path.
+    deployment preserves the active regional order during an outage and keeps
+    the existing `other` freeze instead of forcing an unsolicited rebuild. The
+    next explicit rebuild will replace them through the normal ranking path.
     """
 
-    if isinstance(state.get("frozen_order"), dict):
-        return state
     seeded = dict(state)
-    other = current.get("regions", {}).get("other", {})
-    ranked = other.get("ranked", []) if isinstance(other, dict) else []
-    keys: list[str] = []
-    if isinstance(ranked, list):
-        for entry in ranked:
-            if isinstance(entry, str):
-                key = entry
-            elif isinstance(entry, dict):
-                key = str(
-                    entry.get("node_key")
-                    or entry.get("nodeKey")
-                    or entry.get("key")
-                    or ""
-                )
-            else:
-                key = ""
-            if key and key not in keys:
-                keys.append(key)
-    seeded["frozen_order"] = {"other": keys} if keys else {}
+    regions = current.get("regions", {}) if isinstance(current.get("regions"), dict) else {}
+    if not isinstance(state.get("frozen_order"), dict):
+        other = regions.get("other", {})
+        ranked = other.get("ranked", []) if isinstance(other, dict) else []
+        keys: list[str] = []
+        if isinstance(ranked, list):
+            for entry in ranked:
+                if isinstance(entry, str):
+                    key = entry
+                elif isinstance(entry, dict):
+                    key = str(
+                        entry.get("node_key")
+                        or entry.get("nodeKey")
+                        or entry.get("key")
+                        or ""
+                    )
+                else:
+                    key = ""
+                if key and key not in keys:
+                    keys.append(key)
+        seeded["frozen_order"] = {"other": keys} if keys else {}
+    if not isinstance(state.get("ranked_order"), dict):
+        seeded["ranked_order"] = {
+            str(region): [str(key) for key in payload.get("ranked", [])]
+            for region, payload in regions.items()
+            if isinstance(payload, dict) and isinstance(payload.get("ranked"), list)
+        }
+    if not isinstance(state.get("rejected_by_region"), dict):
+        seeded["rejected_by_region"] = {
+            str(region): {
+                str(key): str(reason)
+                for key, reason in payload.get("rejected", {}).items()
+            }
+            for region, payload in regions.items()
+            if isinstance(payload, dict)
+            and isinstance(payload.get("rejected"), dict)
+        }
     return seeded
 
 
@@ -153,6 +172,7 @@ class StateStore:
         self.audit_reports_dir = config.reports_dir / "audits"
         self.local_socks_reports_dir = config.reports_dir / "local-socks"
         self._recover_interrupted_audits()
+        self._recover_committed_alerts()
 
     def _recover_interrupted_audits(self) -> None:
         if not self.audit_jobs_dir.exists():
@@ -172,6 +192,82 @@ class StateStore:
                 }
             )
             atomic_write_json(path, status)
+
+    def _committed_alert_archive_dir(
+        self, current: dict[str, Any]
+    ) -> Path | None:
+        revision = str(current.get("state_revision") or "")
+        if self._snapshot_path(revision) is None:
+            return None
+        try:
+            generated_at = datetime.fromisoformat(
+                str(current.get("generated_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+        return (
+            self.scheduled_reports_dir
+            / generated_at.strftime("%Y")
+            / generated_at.strftime("%m")
+            / generated_at.strftime("%d")
+            / revision
+        )
+
+    def _finalize_committed_alerts(self, current: dict[str, Any]) -> None:
+        """Publish alert views only for the revision selected by current.json."""
+        archive_dir = self._committed_alert_archive_dir(current)
+        if archive_dir is None:
+            return
+        latest_source = archive_dir / "alert-latest-run.md"
+        if not latest_source.exists():
+            return
+        latest_content = latest_source.read_text(encoding="utf-8")
+        alerts_dir = self.config.reports_dir / "alerts"
+        atomic_write_text(alerts_dir / "latest-run.md", latest_content)
+
+        change_source = archive_dir / "alert-slot-change.md"
+        if not change_source.exists():
+            slot_latest = alerts_dir / "slot-changes-latest.md"
+            if not slot_latest.exists():
+                atomic_write_text(slot_latest, latest_content)
+            return
+
+        change_content = change_source.read_text(encoding="utf-8")
+        atomic_write_text(alerts_dir / "slot-changes-latest.md", change_content)
+        day = str(current.get("generated_at") or "")[:10]
+        revision = str(current["state_revision"])
+        history_path = alerts_dir / f"{day}-{revision}.md"
+        if history_path.exists():
+            if history_path.read_text(encoding="utf-8") != change_content:
+                raise FileExistsError(
+                    f"alert history content mismatch: {history_path}"
+                )
+            return
+        write_text_exclusive(history_path, change_content)
+
+    def _recover_committed_alerts(
+        self,
+        current: dict[str, Any] | None = None,
+        *,
+        required: bool = False,
+    ) -> None:
+        selected = current if current is not None else read_json(self.current_path, {})
+        if not selected:
+            return
+        try:
+            self._finalize_committed_alerts(selected)
+        except (OSError, ValueError) as error:
+            # Startup and post-commit recovery stay best-effort because
+            # current.json is already authoritative. Before a newer publish,
+            # however, the caller requires success so an older committed slot
+            # change cannot be permanently skipped by the next revision.
+            LOGGER.warning(
+                "committed %s but alert finalization is pending: %s",
+                selected.get("state_revision") or selected.get("version"),
+                error,
+            )
+            if required:
+                raise
 
     def audit_status_path(self, audit_id: str) -> Path:
         return self.audit_jobs_dir / f"{validate_audit_id(audit_id)}.json"
@@ -202,13 +298,13 @@ class StateStore:
         atomic_write_json(path, status)
         return status
 
-    def _snapshot_path(self, version: str) -> Path | None:
-        if not version or len(version) > 128 or any(
+    def _snapshot_path(self, identifier: str) -> Path | None:
+        if not identifier or len(identifier) > 128 or any(
             character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-            for character in version
+            for character in identifier
         ):
             return None
-        return self.snapshots_dir / f"{version}.json"
+        return self.snapshots_dir / f"{identifier}.json"
 
     def load_state(self) -> dict[str, Any]:
         empty = {
@@ -224,7 +320,8 @@ class StateStore:
         if current and current.get("schema_version") != SCHEMA_VERSION:
             current = {}
         current_version = str(current.get("version") or "")
-        snapshot_path = self._snapshot_path(current_version)
+        current_revision = str(current.get("state_revision") or "")
+        snapshot_path = self._snapshot_path(current_revision or current_version)
         if snapshot_path is not None:
             try:
                 snapshot = read_json(snapshot_path, {})
@@ -233,9 +330,19 @@ class StateStore:
             if (
                 snapshot.get("schema_version") == SCHEMA_VERSION
                 and snapshot.get("version") == current_version
+                and (
+                    not current_revision
+                    or snapshot.get("state_revision") == current_revision
+                )
             ):
                 return _seed_frozen_order(snapshot, current)
-        if not current_version:
+        if current_revision:
+            selected = (
+                state
+                if state.get("state_revision") == current_revision
+                else empty
+            )
+        elif not current_version:
             selected = state if not state.get("version") else empty
         else:
             selected = state if state.get("version") == current_version else empty
@@ -252,6 +359,17 @@ class StateStore:
         slot_changes: list[dict[str, str]],
         generated_at: datetime,
     ) -> None:
+        # Finish any alert left between the previous current.json commit and
+        # its best-effort alert publication before preparing a newer scan.
+        self._recover_committed_alerts(required=True)
+        revision = str(current.get("state_revision") or "")
+        if self._snapshot_path(revision) is None:
+            stamp = generated_at.astimezone(timezone.utc).strftime(
+                "%Y%m%dT%H%M%S%fZ"
+            )
+            revision = f"s-{stamp}-{uuid.uuid4().hex[:12]}"
+        current["state_revision"] = revision
+        state["state_revision"] = revision
         day = generated_at.date().isoformat()
         report_json = build_report_json(
             current,
@@ -294,7 +412,7 @@ class StateStore:
             / generated_at.strftime("%Y")
             / generated_at.strftime("%m")
             / generated_at.strftime("%d")
-            / str(current["version"])
+            / revision
         )
         if self.config.report.json:
             atomic_write_json(archive_dir / "report.json", report_json)
@@ -310,35 +428,40 @@ class StateStore:
             local_socks_exports,
             str(current["version"]),
         )
-        alerts_dir = self.config.reports_dir / "alerts"
-        atomic_write_text(alerts_dir / "latest-run.md", alert_markdown)
-        slot_latest = alerts_dir / "slot-changes-latest.md"
-        if slot_changes or not slot_latest.exists():
-            atomic_write_text(slot_latest, alert_markdown)
+        # Alert consumers watch reports/alerts directly. Stage the content in
+        # this revision's archive so a failed current.json commit cannot emit
+        # a false slot-change notification. Finalization below is idempotent
+        # and restart-recoverable.
+        atomic_write_text(archive_dir / "alert-latest-run.md", alert_markdown)
         if slot_changes:
-            history_name = f"{day}-{current['version']}.md"
-            write_text_exclusive(alerts_dir / history_name, alert_markdown)
+            atomic_write_text(archive_dir / "alert-slot-change.md", alert_markdown)
 
         previous_current = read_json(self.current_path, {})
         previous_state = read_json(self.state_path, {})
         previous_version = str(previous_current.get("version") or "")
-        previous_snapshot = self._snapshot_path(previous_version)
+        previous_revision = str(previous_current.get("state_revision") or "")
+        previous_snapshot = self._snapshot_path(previous_revision or previous_version)
         if (
             previous_snapshot is not None
             and previous_state.get("version") == previous_version
+            and (
+                not previous_revision
+                or previous_state.get("state_revision") == previous_revision
+            )
             and not previous_snapshot.exists()
         ):
             atomic_write_json(previous_snapshot, previous_state)
 
-        snapshot_path = self._snapshot_path(str(current.get("version") or ""))
+        snapshot_path = self._snapshot_path(revision)
         if snapshot_path is None:
-            raise ValueError("current version is unsafe for a state snapshot path")
+            raise ValueError("state revision is unsafe for a snapshot path")
         # The immutable snapshot is the durable side of the commit. If writing
-        # current.json fails, the previous current still selects its matching
-        # snapshot after restart.
+        # current.json fails, the previous current still points to its unique
+        # state revision and cannot select this scan's newer state.
         atomic_write_json(snapshot_path, state)
         atomic_write_json(self.state_path, state)
         atomic_write_json(self.current_path, current)
+        self._recover_committed_alerts(current)
         try:
             self._prune_state_snapshots(keep=3)
             self._prune_daily_reports(generated_at)
@@ -485,8 +608,6 @@ def _assessment_detail(
     include_raw_details: bool,
 ) -> dict[str, Any]:
     quick = assessment.quick.to_dict()
-    if not include_exit_ip:
-        quick.pop("exit_ip", None)
     full = assessment.full.to_dict() if assessment.full else None
     fresh_full_attempt = (
         assessment.fresh_full_attempt.to_dict()
@@ -497,6 +618,12 @@ def _assessment_detail(
         full.pop("details", None)
     if fresh_full_attempt is not None and not include_raw_details:
         fresh_full_attempt.pop("details", None)
+    evaluation = assessment.evaluation.to_dict()
+    if not include_exit_ip:
+        quick = _redact_exit_ips(quick)
+        full = _redact_exit_ips(full)
+        fresh_full_attempt = _redact_exit_ips(fresh_full_attempt)
+        evaluation = _redact_exit_ips(evaluation)
     return {
         "node_key": assessment.node.key,
         "name": assessment.node.name,
@@ -516,12 +643,68 @@ def _assessment_detail(
             )
         ),
         "fresh_full_attempt": fresh_full_attempt,
-        "evaluation": assessment.evaluation.to_dict(),
+        "evaluation": evaluation,
         "consecutive_full_passes": assessment.consecutive_full_passes,
         "consecutive_unavailable_runs": assessment.consecutive_unavailable_runs,
+        "healthy_streak_days": assessment.healthy_streak_days,
+        "last_healthy_day": assessment.last_healthy_day,
+        "consecutive_unavailable_valid_days": assessment.consecutive_unavailable_valid_days,
+        "unavailable_grace_active": assessment.unavailable_grace_active,
+        "daily_quality_history": assessment.daily_quality_history,
+        "evidence_valid": assessment.evidence_valid,
         "fresh_full_completed": assessment.fresh_full_completed,
         "fresh_full_usable": assessment.fresh_full_usable,
     }
+
+
+_IPV4_LITERAL = re.compile(
+    r"(?<![0-9A-Za-z_])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9A-Za-z_])"
+)
+_IPV6_LITERAL = re.compile(
+    r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"
+)
+
+
+def _redact_ip_literals(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            return candidate
+        return "[redacted-ip]"
+
+    return _IPV6_LITERAL.sub(replace, _IPV4_LITERAL.sub(replace, value))
+
+
+def _redact_exit_ips(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact_exit_ips(item) for item in value]
+    if isinstance(value, str):
+        return _redact_ip_literals(value)
+    if not isinstance(value, dict):
+        return value
+    sensitive = {
+        "ip",
+        "exit_ip",
+        "audited_exit_ip",
+        "last_exit_ip",
+        "claude_exit_ip",
+    }
+    redacted: dict[Any, Any] = {}
+    for key, item in value.items():
+        if str(key).lower() in sensitive:
+            continue
+        safe_key: Any = _redact_ip_literals(key) if isinstance(key, str) else key
+        if safe_key in redacted:
+            suffix = 2
+            candidate = f"{safe_key}#{suffix}"
+            while candidate in redacted:
+                suffix += 1
+                candidate = f"{safe_key}#{suffix}"
+            safe_key = candidate
+        redacted[safe_key] = _redact_exit_ips(item)
+    return redacted
 
 
 def _clean_geo_text(value: Any) -> str | None:
@@ -707,6 +890,11 @@ def _report_summary(assessments: list[NodeAssessment]) -> dict[str, Any]:
     by_region: dict[str, int] = {}
     for item in assessments:
         by_region[item.node.region] = by_region.get(item.node.region, 0) + 1
+    grades = {grade: sum(1 for item in assessments if item.evaluation.overall_grade == grade) for grade in ("A", "B", "C")}
+    residential = {
+        grade: sum(1 for item in assessments if item.evaluation.residential_grade == grade)
+        for grade in ("confirmed", "probable", "unknown")
+    }
     return {
         "nodes": len(assessments),
         "available": sum(1 for item in assessments if item.quick.available),
@@ -723,6 +911,9 @@ def _report_summary(assessments: list[NodeAssessment]) -> dict[str, Any]:
         ),
         "eligible": sum(1 for item in assessments if item.evaluation.eligible),
         "rejected": sum(1 for item in assessments if item.evaluation.redline),
+        "transient_recoveries": sum(1 for item in assessments if item.quick.transient_recovery),
+        "quality_grades": grades,
+        "residential": residential,
         "regions": dict(sorted(by_region.items())),
     }
 
@@ -742,6 +933,7 @@ def build_report_json(
         "schema_version": 1,
         "report_kind": current.get("report_kind", "scheduled"),
         "version": current["version"],
+        "state_revision": current.get("state_revision"),
         "generated_at": current["generated_at"],
         "started_at": current.get("started_at"),
         "completed_at": current.get("completed_at", current["generated_at"]),
@@ -749,8 +941,19 @@ def build_report_json(
         "mode": current["mode"],
         "source": current.get("source", {}),
         "summary": _report_summary(assessments),
-        "slot_changes": slot_changes,
-        "regions": current.get("regions", {}),
+        "slot_changes": (
+            slot_changes if include_exit_ip else _redact_exit_ips(slot_changes)
+        ),
+        "regions": (
+            current.get("regions", {})
+            if include_exit_ip
+            else _redact_exit_ips(current.get("regions", {}))
+        ),
+        "outage_protection": (
+            current.get("outage_protection", {})
+            if include_exit_ip
+            else _redact_exit_ips(current.get("outage_protection", {}))
+        ),
         "nodes": [
             {
                 **_assessment_detail(item, include_exit_ip, include_raw_details),
@@ -768,12 +971,7 @@ def build_report_json(
 
 
 def _report_sort_key(assessment: NodeAssessment) -> tuple[object, ...]:
-    return (
-        assessment.node.region,
-        0 if assessment.evaluation.eligible else 1,
-        -assessment.evaluation.score,
-        assessment.node.name,
-    )
+    return (assessment.node.region, *ranking_key(assessment))
 
 
 def _markdown_escape(value: Any) -> str:
@@ -810,6 +1008,7 @@ def _listener_port(region: str, base: int | None, offset: int) -> int | None:
 
 
 _REGION_ZH = {
+    "__global__": "全局",
     "hong-kong": "香港",
     "taiwan": "台湾",
     "japan": "日本",
@@ -824,10 +1023,18 @@ _REGION_ZH = {
     "other": "其他",
 }
 
+_OUTAGE_REASON_ZH = {
+    "all-nodes-unavailable": "最终复检后全部节点不可达",
+    "availability-collapse": "可用率低于阈值且较上一有效基线大幅下降",
+    "global-all-nodes-unavailable": "全局最终复检后全部节点不可达",
+    "global-availability-collapse": "全局可用率异常大幅下降",
+}
+
 _STATUS_ZH = {
     "healthy": "健康",
     "degraded": "降级",
     "unavailable": "不可达",
+    "protected-unavailable": "宽限保护中",
     "absent": "订阅中已消失",
     "eligible": "可用",
     "rejected": "已拒绝",
@@ -878,6 +1085,8 @@ _CHANGE_REASON_ZH = {
     "quality-redline": "触发质量红线",
     "degraded-quality-rerank": "合格可用节点不足，按整体质量重排",
     "vacant-slot-fill": "填补空槽位",
+    "confirmed-unavailable": "当日复检后确认不可达",
+    "quality-severe": "确认严重质量风险且有更好候补",
 }
 
 _REASON_ZH = {
@@ -887,7 +1096,22 @@ _REASON_ZH = {
     "stable-egress-ip-changed": "稳定槽出口 IP 已变化",
     "country-unconfirmed": "无法确认出口国家",
     "tor-exit": "检测到 Tor 出口",
+    "claude-tor-exit": "Claude 专用出口检测到 Tor",
     "full-audit-incomplete": "本轮深度检测未完成",
+    "transient-recovery": "延迟复检后恢复",
+    "ai-services-unavailable": "ChatGPT 与 Claude 均确认不可用",
+    "risk-consensus-severe": "多个来源共同确认严重风险",
+    "claude-risk-consensus-severe": "Claude 专用出口多个来源共同确认严重风险",
+    "chatgpt-available": "ChatGPT 可用",
+    "chatgpt-unavailable": "ChatGPT 不可用",
+    "chatgpt-unknown": "ChatGPT 状态未知",
+    "claude-degraded": "Claude 部分可达",
+    "claude-restricted": "Claude 出口地区不受支持",
+    "claude-unreachable": "Claude 与 Anthropic 均不可达",
+    "claude-unknown": "Claude 状态未知",
+    "chatgpt-service-outage": "ChatGPT 本轮触发服务级异常保护，沿用历史 AI 结果",
+    "claude-service-outage": "Claude 本轮触发服务级异常保护，沿用历史 AI 结果",
+    "claude-risk-incomplete": "Claude 专用出口风险数据不完整，沿用可信缓存并暂停累计",
 }
 
 _REASON_PREFIX_ZH = {
@@ -901,6 +1125,10 @@ _REASON_PREFIX_ZH = {
     "chatgpt-redline:": "ChatGPT 可用性触发红线",
     "chatgpt-unconfirmed:": "无法确认 ChatGPT 可用性",
     "insufficient-risk-coverage:": "有效风险数据源不足",
+    "claude-insufficient-risk-coverage:": "Claude 专用出口有效风险数据源不足",
+    "claude-multiple-high-risk-sources:": "Claude 专用出口多个风险源判定为高风险",
+    "claude-intelligence-country-conflict:": "Claude 服务出口国家与风险情报国家不一致",
+    "fresh-ai-unconfirmed:": "本轮 AI 深检结果不确定，沿用历史可信结果",
 }
 
 
@@ -958,6 +1186,8 @@ def build_report_markdown(
     include_raw_details: bool,
     advertise_host: str,
 ) -> str:
+    if not include_exit_ip:
+        slot_changes = _redact_exit_ips(slot_changes)
     lookup = _slot_lookup(current)
     order = _report_order(current, port_bases, slot_count)
     report_kind = str(current.get("report_kind") or "scheduled")
@@ -973,9 +1203,17 @@ def build_report_markdown(
         f"- 报告类型：`{'临时订阅审计' if report_kind == 'subscription-audit' else '正式定时检测'}`",
         f"- 运行模式：`{_MODE_ZH.get(current['mode'], current['mode'])}`",
         f"- 版本：`{current['version']}`",
+        *(
+            [f"- 状态修订：`{current['state_revision']}`"]
+            if current.get("state_revision")
+            else []
+        ),
         f"- 订阅节点总数：{current['source']['node_count']}",
         f"- 快速检测可达：{summary['available']}；不可达：{summary['unavailable']}",
         f"- 深度检测完成：{summary['full_completed']}；未完成：{summary['full_incomplete']}",
+        f"- 综合等级：A={summary['quality_grades']['A']}；B={summary['quality_grades']['B']}；C={summary['quality_grades']['C']}",
+        f"- 家宽识别：确认={summary['residential']['confirmed']}；高概率={summary['residential']['probable']}；未知/冲突={summary['residential']['unknown']}",
+        f"- 延迟复检恢复：{summary['transient_recoveries']}",
         "",
         "## 稳定槽位变更" if report_kind != "subscription-audit" else "## 本次审计建议",
         "",
@@ -1004,7 +1242,7 @@ def build_report_markdown(
             details = (
                 f"分数 {change.get('before_score', '-')} -> {change.get('after_score', '-')} "
                 f"（差值 {change.get('score_margin', '-')}）；"
-                f"候补连续深检通过 {change.get('candidate_full_passes', '-')} 次"
+                f"候补健康连续 {change.get('candidate_healthy_days', '-')} 天"
             )
             if change.get("redline_reasons"):
                 details += f"；红线原因 {_zh_reason(change['redline_reasons'])}"
@@ -1015,13 +1253,40 @@ def build_report_markdown(
     else:
         lines.append("本轮稳定槽位没有变化。")
 
+    outage = current.get("outage_protection", {})
+    if not include_exit_ip:
+        outage = _redact_exit_ips(outage)
+    frozen_scopes = [
+        f"{_zh_region(scope)}={_OUTAGE_REASON_ZH.get(str(value.get('reason')), value.get('reason'))}"
+        for scope, value in (outage.get("regions", {}) if isinstance(outage, dict) else {}).items()
+        if isinstance(value, dict) and value.get("frozen")
+    ]
+    ai_outages = list((outage.get("ai_services", {}) if isinstance(outage, dict) else {}))
+    lines.extend([
+        "",
+        "## 异常保护",
+        "",
+        f"- 排名冻结：{_markdown_escape('；'.join(frozen_scopes) if frozen_scopes else '无')}",
+        f"- AI 服务级异常：{_markdown_escape('、'.join(ai_outages) if ai_outages else '无')}",
+    ])
+    if isinstance(outage, dict):
+        for service, payload in (outage.get("ai_services", {}) or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            diagnostic = payload.get("diagnostics", {})
+            lines.append(
+                f"- {service} 失败比例：`{float(payload.get('failure_ratio') or 0):.0%}`；"
+                f"直连/官方状态诊断（仅供排障，不参与排序）："
+                f"`{json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)}`"
+            )
+
     lines.extend(
         [
             "",
             "## 建议优先槽位" if report_kind == "subscription-audit" else "## 稳定槽位状态",
             "",
-            "| 地区 | 槽位 | 端口 | SOCKS5 | 节点 | 状态 | 连续不可达次数 | 最近出口 IP | 最近深检时间 | 分数 | 原因 |",
-            "|---|---:|---:|---|---|---|---:|---|---|---:|---|",
+            "| 地区 | 槽位 | 端口 | SOCKS5 | 节点 | 状态 | 健康天数 | 确认不可达天数 | 宽限 | 等级 | 最近出口 IP | 最近深检时间 | 分数 | 原因 |",
+            "|---|---:|---:|---|---|---|---:|---:|---|---|---|---|---:|---|",
         ]
     )
     for region in current.get("region_order", []):
@@ -1045,7 +1310,10 @@ def build_report_markdown(
             lines.append(
                 f"| {_zh_region(region)} | {slot} | {port} | `{socks5}` | {escaped_name} | "
                 f"{_zh_status(status.get('status', 'unknown'))} | "
-                f"{int(status.get('consecutive_unavailable_runs', 0) or 0)} | "
+                f"{int(status.get('healthy_streak_days', 0) or 0)} | "
+                f"{int(status.get('consecutive_unavailable_valid_days', 0) or 0)} | "
+                f"{_zh_bool(status.get('unavailable_grace_active'))} | "
+                f"{status.get('overall_grade', 'B')} | "
                 f"{last_exit_ip} | {last_full} | "
                 f"{score:.2f} | {escaped_reasons} |"
             )
@@ -1057,8 +1325,8 @@ def build_report_markdown(
             "",
             "| 地区 | 当前位置 | 端口 | SOCKS5 | 节点 | 出口 IP | 国家 | "
             "州/省 | 城市 | ASN | 运营商 | 延迟 | 成功率 | "
-            "分数 | 置信度 | 判定 |",
-            "|---|---|---:|---|---|---|---|---|---|---|---|---:|---:|---:|---|---|",
+            "等级 | AI/风险/可靠/家宽/地理/延迟 | 分数 | 置信度 | 判定 |",
+            "|---|---|---:|---|---|---|---|---|---|---|---|---:|---:|---|---|---:|---|---|",
         ]
     )
     region_indexes = {
@@ -1103,6 +1371,11 @@ def build_report_markdown(
             decision += f"（{reason}）"
         name = item.node.name.replace("|", "\\|")
         geo = _geo_detail(item, include_exit_ip)
+        components = item.evaluation.components
+        component_text = "/".join(
+            f"{float(components.get(name, 0)):.0f}"
+            for name in ("ai", "risk", "reliability", "residential", "geo", "latency")
+        )
         country_code = str(geo.get("country_code") or "").upper()
         country = str(
             _COUNTRY_CODE_ZH.get(country_code)
@@ -1118,7 +1391,7 @@ def build_report_markdown(
             f"| {_zh_region(item.node.region)} | {position} | {port} | `{socks5}` | {name} | "
             f"{(item.quick.exit_ip or '-') if include_exit_ip else '[omitted]'} | "
             f"{country} | {subdivision} | {city} | {asn} | {organization} | "
-            f"{latency} | {item.quick.success_rate:.0%} | {item.evaluation.score:.2f} | "
+            f"{latency} | {item.quick.success_rate:.0%} | {item.evaluation.overall_grade} | {component_text} | {item.evaluation.score:.2f} | "
             f"{_zh_confidence(item.evaluation.confidence)} | {decision} |"
         )
 
@@ -1134,6 +1407,7 @@ def build_report_markdown(
         fresh = detail["fresh_full_attempt"]
         connection = detail["connection"]
         geo = detail["geo"]
+        evaluation = detail["evaluation"]
         reasons = _zh_reasons(item.evaluation.reasons)
         connection_text = ", ".join(
             f"{key}={value}" for key, value in connection.items()
@@ -1155,9 +1429,15 @@ def build_report_markdown(
                 f"- 连接参数：{_markdown_escape(connection_text)}",
                 f"- 本地 SOCKS5：`{socks5}`",
                 f"- 判定：`{_zh_status(item.evaluation.decision)}`；置信度："
-                f"`{_zh_confidence(item.evaluation.confidence)}`；分数：`{item.evaluation.score:.2f}`",
+                f"`{_zh_confidence(item.evaluation.confidence)}`；综合等级：`{item.evaluation.overall_grade}`；"
+                f"AI=`{item.evaluation.ai_grade}`；风险=`{item.evaluation.risk_grade}`；家宽=`{item.evaluation.residential_grade}`；"
+                f"分数：`{item.evaluation.score:.2f}`",
+                f"- 分项得分：`{json.dumps(item.evaluation.components, ensure_ascii=False, sort_keys=True)}`",
+                f"- 评分证据：`{json.dumps(evaluation.get('evidence', {}), ensure_ascii=False, sort_keys=True)}`",
                 f"- 原因：{_markdown_escape(reasons)}",
-                f"- 连续不可达次数：`{item.consecutive_unavailable_runs}`",
+                f"- 健康连续天数：`{item.healthy_streak_days}`；确认不可达天数："
+                f"`{item.consecutive_unavailable_valid_days}`；宽限保护："
+                f"`{_zh_bool(item.unavailable_grace_active)}`",
                 f"- 快速检测时间：`{quick.get('checked_at') or '-'}`",
                 f"- 连通性：`{availability}`；成功率："
                 f"`{float(quick.get('success_rate') or 0):.0%}`；延迟：`{latency_text} ms`",
@@ -1175,6 +1455,12 @@ def build_report_markdown(
                 f"观测时间=`{geo.get('observed_at') or '-'}`",
                 f"- 服务检查：Google=`{_zh_bool(quick.get('google_ok'))}`；"
                 f"ChatGPT=`{_zh_bool(quick.get('chatgpt_ok'))}`",
+                f"- Claude：状态=`{quick.get('claude', {}).get('status', 'unknown')}`；"
+                f"出口=`{quick.get('claude', {}).get('exit_ip') or '-'}`；国家="
+                f"`{quick.get('claude', {}).get('country') or '-'}`；情报国家="
+                f"`{quick.get('claude', {}).get('intelligence_country') or '-'}`；支持地区="
+                f"`{_zh_bool(quick.get('claude', {}).get('supported'))}`；路由稳定="
+                f"`{_zh_bool(quick.get('claude', {}).get('route_stable'))}`",
                 f"- 快速检测错误：{_markdown_escape(quick.get('error') or '无')}",
                 f"- 可信深检结果：`{'有' if full else '无'}` "
                 f"（`{_zh_result_source(detail['full_result_source'])}`）；本轮深检："
@@ -1274,7 +1560,12 @@ def _alert_markdown(
     attention: list[str] = []
     for region, payload in current.get("regions", {}).items():
         for slot, status in payload.get("stable_status", {}).items():
-            if status.get("status") not in {"unavailable", "absent", "degraded"}:
+            if status.get("status") not in {
+                "unavailable",
+                "protected-unavailable",
+                "absent",
+                "degraded",
+            }:
                 continue
             reasons = _zh_reasons(status.get("reasons", []))
             attention.append(

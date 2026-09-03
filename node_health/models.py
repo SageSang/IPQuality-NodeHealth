@@ -17,6 +17,31 @@ class Node:
 
 
 @dataclass
+class ClaudeResult:
+    status: str = "unknown"
+    trace_ok: bool = False
+    anthropic_ok: bool = False
+    exit_ip: str = ""
+    country: str = ""
+    intelligence_country: str = ""
+    supported: bool | None = None
+    asn: str = ""
+    organization: str = ""
+    risk_sources: dict[str, str] = field(default_factory=dict)
+    factors: dict[str, dict[str, bool]] = field(default_factory=dict)
+    residential: str = "unknown"
+    route_stable: bool = True
+    intelligence_complete: bool = False
+    intelligence_cached: bool = False
+    service_outage: bool = False
+    checked_at: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class QuickResult:
     available: bool
     exit_ip: str = ""
@@ -27,6 +52,10 @@ class QuickResult:
     exit_ip_stable: bool = True
     google_ok: bool | None = None
     chatgpt_ok: bool | None = None
+    claude: ClaudeResult = field(default_factory=ClaudeResult)
+    transient_recovery: bool = False
+    retry_count: int = 0
+    chatgpt_service_outage: bool = False
     checked_at: str = ""
     error: str = ""
 
@@ -57,6 +86,12 @@ class Evaluation:
     score: float
     confidence: str
     reasons: list[str] = field(default_factory=list)
+    components: dict[str, float] = field(default_factory=dict)
+    ai_grade: str = "B"
+    risk_grade: str = "B"
+    overall_grade: str = "B"
+    residential_grade: str = "unknown"
+    evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
     def eligible(self) -> bool:
@@ -81,3 +116,10 @@ class NodeAssessment:
     fresh_full_completed: bool = False
     fresh_full_usable: bool = False
     fresh_full_attempt: FullResult | None = None
+    healthy_streak_days: int = 0
+    last_healthy_day: str = ""
+    consecutive_unavailable_valid_days: int = 0
+    last_unavailable_day: str = ""
+    unavailable_grace_active: bool = False
+    daily_quality_history: list[dict[str, Any]] = field(default_factory=list)
+    evidence_valid: bool = False

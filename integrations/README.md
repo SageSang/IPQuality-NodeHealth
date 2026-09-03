@@ -81,11 +81,12 @@ without filtering. The OpenWrt poller retains its independent validation layer
 and keeps the last applied configuration when a new pair cannot be validated.
 
 Stable-slot membership is authoritative over connectivity failure for as long
-as the identity remains in the successful inventory snapshot. Confirmed danger
-immediately replaces only that slot when three safe usable candidates exist.
-When fewer than three such candidates exist, the complete regional inventory
-is reranked and its best available three fill the fixed slots, including risky
-or unavailable nodes when necessary. No health result removes a node.
+as the identity remains in the successful inventory snapshot, except for the
+documented per-node unavailability and severe-risk replacement rules. A
+required replacement changes only the affected slot: use the best available A
+candidate, then B, then the lowest-risk usable C candidate. The other fixed
+slots are not reranked, and a slot is left empty only when no usable node
+exists. No health result removes a node from the complete output.
 
 `version` is an opaque, non-empty string. The OpenWrt poller compares it for
 equality and writes it only after a successful atomic apply.
@@ -94,20 +95,34 @@ equality and writes it only after a successful atomic apply.
 
 `data/current.json` is the durable commit selector for a published ranking.
 `data/state.json` is the latest working state, while
-`data/state-snapshots/<version>.json` is the immutable state paired with a
-specific ranking version. The service keeps the newest three snapshots. On
-restart it loads only the snapshot whose version matches `current.json`, so an
-interruption before the final current-file replacement cannot advance stable
-slots without advancing the public ranking.
+`data/state-snapshots/<state_revision>.json` is the immutable state paired with
+one specific scan. The service keeps the newest three snapshots. On restart it
+loads only the snapshot whose unique `state_revision` matches `current.json`,
+so an interruption before the final current-file replacement cannot advance
+stable slots without advancing the public ranking. Legacy documents without a
+revision continue to fall back to their runtime `version` during migration.
 
 Mutable JSON and Markdown files are written through atomic file replacement;
 immutable alert history is created exclusively. The files are not one
 cross-file transaction. Publication prepares reports, then writes the
-versioned state snapshot and `state.json`, and replaces `current.json` last.
-Consumers therefore treat `current.json` as authoritative and use the embedded
-`version` when correlating a report. A rare interruption before the final
-replacement can leave a newer report on disk while the authoritative ranking
-remains old; reports are observability artifacts, not recovery state.
+revisioned state snapshot and `state.json`, and replaces `current.json` last.
+The service and local operators therefore treat the private
+`data/current.json` as authoritative and use its embedded `state_revision` when
+correlating a particular scan report. The public HTTP `/current.json` keeps the
+schema-v2 consumer contract and intentionally omits this private revision;
+external ranking consumers continue to compare only the stable runtime
+`version`. A rare interruption before the final replacement can leave a newer
+report on disk while the authoritative ranking remains old; reports are
+observability artifacts, not recovery state.
+
+Alert content is first staged inside that scan's revisioned scheduled archive.
+The watched `reports/alerts/` views and immutable slot-change history are
+published only after `data/current.json` commits. If the process stops between
+those two steps, startup replays the staged alert only when its
+`state_revision` is selected by the committed private current document.
+If that replay still fails, publication of a newer revision is blocked until
+the committed alert can be finalized, preventing an older slot-change history
+entry from being permanently skipped.
 
 The dated `reports/YYYY-MM-DD.md` and `.json` files describe the latest run
 written for that date and are retained for the configured number of days.
@@ -117,7 +132,7 @@ observation time, and fresh/cached status. These report-only fields are not
 part of `current.json` and are never consumed for ranking recovery.
 Every successful scheduled publication also writes the current regional SOCKS5
 lists to `reports/local-socks/latest/<region>.txt` and archives the same files
-under `reports/scheduled/YYYY/MM/DD/<version>/local-socks/`. Subscription audits
+under `reports/scheduled/YYYY/MM/DD/<state_revision>/local-socks/`. Subscription audits
 write their lists beside the audit report in its `local-socks/` directory.
 Each of those directories also contains `all.txt`, which concatenates every
 regional list in the configured region order for one-shot full import, and
@@ -127,7 +142,7 @@ internal position labels such as `dynamic-001` are never used as proxy names.
 `reports/alerts/latest-run.md` is refreshed for every publication.
 `slot-changes-latest.md` is created initially and thereafter changes only when
 a stable identity changes. Each such change also creates an immutable
-`alerts/YYYY-MM-DD-<version>.md` history file; daily-report retention does not
+`alerts/YYYY-MM-DD-<state_revision>.md` history file; daily-report retention does not
 delete those alert-history files.
 
 ## Stable node identity

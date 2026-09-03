@@ -157,6 +157,7 @@ def reconcile_previous_state(
             "logical_id": node.logical_id,
             "last_score": float(old.get("last_score") or 0),
             "last_exit_ip": "",
+            "last_country": "",
             "last_full_exit_ip": "",
             "last_full": None,
             "last_full_checked_at": "",
@@ -164,6 +165,13 @@ def reconcile_previous_state(
             "last_full_attempt_error": "",
             "consecutive_full_passes": 0,
             "consecutive_unavailable_runs": 0,
+            "healthy_streak_days": 0,
+            "last_healthy_day": "",
+            "consecutive_unavailable_valid_days": 0,
+            "last_unavailable_day": "",
+            "unavailable_grace_active": False,
+            "daily_quality_history": [],
+            "last_claude": None,
             "last_decision": "identity-rotated-pending",
             "current_status": "identity-rotated-pending",
             "identity_rotated_from": old_key,
@@ -206,4 +214,35 @@ def reconcile_previous_state(
                     seen.add(mapped)
             migrated_ranked[str(region)] = migrated_keys
         migrated["frozen_order"] = migrated_ranked
+    ranked_order = migrated.get("ranked_order")
+    if isinstance(ranked_order, dict):
+        migrated_ranked = {}
+        for region, keys in ranked_order.items():
+            if not isinstance(keys, list):
+                continue
+            seen = set()
+            migrated_keys = []
+            for key in keys:
+                mapped = remap.get(str(key), str(key))
+                if mapped not in seen:
+                    migrated_keys.append(mapped)
+                    seen.add(mapped)
+            migrated_ranked[str(region)] = migrated_keys
+        migrated["ranked_order"] = migrated_ranked
+    baselines = migrated.get("availability_baselines")
+    if isinstance(baselines, dict):
+        migrated_baselines: dict[str, Any] = {}
+        for scope, payload in baselines.items():
+            if not isinstance(payload, dict):
+                continue
+            keys = payload.get("node_keys")
+            migrated_baselines[str(scope)] = {
+                **payload,
+                **(
+                    {"node_keys": [remap.get(str(key), str(key)) for key in keys]}
+                    if isinstance(keys, list)
+                    else {}
+                ),
+            }
+        migrated["availability_baselines"] = migrated_baselines
     return list(resolved_nodes.values()), migrated, events

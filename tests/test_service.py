@@ -11,9 +11,10 @@ import pytest
 from node_health.app import DailyScheduler, create_server
 from node_health.config import AppConfig, HttpConfig, InventoryConfig, PolicyConfig, ProbeConfig, ScheduleConfig
 from node_health.identity import node_key
-from node_health.models import FullResult, QuickResult
+from node_health.models import ClaudeResult, FullResult, Node, QuickResult
 from node_health.service import (
     NodeHealthService,
+    NoPublishSafetyAbort,
     ScanStartError,
     _updated_promotion_cooldown,
 )
@@ -67,6 +68,19 @@ class FakeQuick:
         self.unstable = set()
         self.exit_ips = {}
         self.latencies = {}
+        self.chatgpt_fail = set()
+        self.claude_unreachable = set()
+        self.claude_results = {}
+        self.diagnosed_services = []
+
+    def diagnose_ai_service(self, service):
+        self.diagnosed_services.append(service)
+        return {
+            "direct": {service: True},
+            "official_status": {"indicator": "none", "description": "All Systems Operational"},
+            "diagnostic_only": True,
+            "errors": [],
+        }
 
     def check(self, node, port):
         available = node.key not in self.unavailable and node.name not in self.unavailable_names
@@ -80,7 +94,27 @@ class FakeQuick:
             success_rate=1.0 if available else 0,
             exit_ip_stable=node.key not in self.unstable,
             google_ok=True,
-            chatgpt_ok=True,
+            chatgpt_ok=node.key not in self.chatgpt_fail,
+            claude=self.claude_results.get(node.key) or (
+                ClaudeResult(
+                    status="unreachable",
+                    trace_ok=False,
+                    anthropic_ok=False,
+                    supported=None,
+                    route_stable=True,
+                    error="connection refused",
+                )
+                if node.key in self.claude_unreachable
+                else ClaudeResult(
+                    status="available",
+                    trace_ok=True,
+                    anthropic_ok=True,
+                    exit_ip=self.exit_ips.get(node.key, f"8.8.8.{index}"),
+                    country="US",
+                    supported=True,
+                    route_stable=True,
+                )
+            ),
             checked_at="2026-07-24T00:00:00+00:00",
             error="" if available else "timeout",
         )
@@ -111,7 +145,7 @@ class FakeFull:
             audited_exit_ip=self.exit_ips.get(node.key, f"8.8.8.{index}"),
             risk_sources=self.risk_sources.get(
                 node.key,
-                {"source-a": "low", "source-b": "low"} if completed else {},
+                {"source-a": "low", "source-b": "low", "source-c": "low"} if completed else {},
             ),
             details={
                 "Info": {
@@ -134,7 +168,7 @@ class FakeFull:
                     },
                     "Type": "Geo-consistent",
                 },
-                "Media": {"ChatGPT": {"Status": status}},
+                "Media": {"ChatGPT": {"Status": status, "Region": "US", "Type": "Native"}},
             }
             if completed
             else {},
@@ -172,8 +206,38 @@ def make_service(tmp_path, count=7):
         quick_probe=quick,
         full_auditor=full,
         clock=lambda: datetime(2026, 7, 24, 0, 2, tzinfo=timezone.utc),
+        sleeper=lambda _seconds: None,
     )
     return service, quick, full, source
+
+
+def test_initial_unavailable_node_retries_and_transient_recovery_pauses_streak(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=1)
+    recovering = FakeQuick()
+    calls = 0
+
+    def check(node, port):
+        nonlocal calls
+        calls += 1
+        result = FakeQuick.check(recovering, node, port)
+        if calls == 1:
+            return QuickResult(available=False, checked_at=result.checked_at, error="timeout")
+        return result
+
+    recovering.check = check
+    delays = []
+    service.quick_probe = recovering
+    service.sleeper = delays.append
+
+    current = service.run_once("rebuild")
+    key = current["regions"]["united-states"]["stable_slots"]["1"]
+    state = service.store.load_state()["nodes"][key]
+
+    assert calls == 2
+    assert delays == [120.0]
+    assert state["transient_recovery"] is True
+    assert state["healthy_streak_days"] == 0
+    assert state["score_components"]["reliability"] == 12
 
 
 def test_only_quality_promotion_starts_or_resets_promotion_cooldown():
@@ -279,7 +343,7 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
         / "2026"
         / "07"
         / "24"
-        / current["version"]
+        / current["state_revision"]
         / "local-socks"
         / "united-states.txt"
     ).read_text(encoding="utf-8")
@@ -304,7 +368,7 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
         / "2026"
         / "07"
         / "24"
-        / current["version"]
+        / current["state_revision"]
         / "local-socks"
         / "all.txt"
     ).read_text(encoding="utf-8")
@@ -326,7 +390,7 @@ def test_no_history_maintenance_becomes_full_rebuild_and_publishes_reports(tmp_p
         / "2026"
         / "07"
         / "24"
-        / current["version"]
+        / current["state_revision"]
         / "local-socks"
         / "all-plain.txt"
     ).read_text(encoding="utf-8")
@@ -353,7 +417,8 @@ def test_other_order_is_frozen_during_maintenance_and_rebuilt_on_demand(tmp_path
     service.config.policy.full_audit_daily_fraction = 1.0
     maintained = service.run_once("maintenance")
     assert maintained["regions"]["other"]["ranked"] == frozen
-    assert redline_key in maintained["regions"]["other"]["rejected"]
+    assert maintained["nodes"][redline_key]["ai_grade"] == "B"
+    assert redline_key not in maintained["regions"]["other"]["rejected"]
     state = json.loads(
         (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
     )
@@ -370,10 +435,10 @@ def test_state_without_frozen_order_inherits_current_other_without_rebuild(tmp_p
         proxy["name"] = f"Rare node {index}"
     first = service.run_once("rebuild")
     frozen = first["regions"]["other"]["ranked"]
-    version = first["version"]
+    state_revision = first["state_revision"]
     for path in (
         tmp_path / "data" / "state.json",
-        tmp_path / "data" / "state-snapshots" / f"{version}.json",
+        tmp_path / "data" / "state-snapshots" / f"{state_revision}.json",
     ):
         legacy = json.loads(path.read_text(encoding="utf-8"))
         legacy.pop("frozen_order")
@@ -533,6 +598,7 @@ def test_full_passes_count_distinct_calendar_days_not_same_day_reruns(tmp_path):
     )
     assert same_day["nodes"][key]["consecutive_full_passes"] == 1
     assert same_day["nodes"][key]["last_full_pass_day"] == "2026-07-24"
+    assert same_day["nodes"][key]["healthy_streak_days"] == 1
 
     service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
     full.checked_at = "2026-07-25T00:01:00+00:00"
@@ -542,6 +608,7 @@ def test_full_passes_count_distinct_calendar_days_not_same_day_reruns(tmp_path):
     )
     assert next_day["nodes"][key]["consecutive_full_passes"] == 2
     assert next_day["nodes"][key]["last_full_pass_day"] == "2026-07-25"
+    assert next_day["nodes"][key]["healthy_streak_days"] == 2
 
 
 def test_dynamic_unavailable_counter_is_consecutive_and_resets_on_recovery(tmp_path):
@@ -575,22 +642,55 @@ def test_unchanged_runtime_projection_keeps_version_stable(tmp_path):
     assert second["generated_at"] != first["generated_at"]
 
 
+def test_runtime_version_ignores_rejected_reason_text_but_tracks_membership():
+    first = {
+        "united-states": {
+            "stable_slots": {"1": "stable"},
+            "ranked": ["candidate"],
+            "rejected": {"risky": "reason-one"},
+        }
+    }
+    reason_changed = {
+        "united-states": {
+            "stable_slots": {"1": "stable"},
+            "ranked": ["candidate"],
+            "rejected": {"risky": "reason-two"},
+        }
+    }
+    membership_changed = {
+        "united-states": {
+            "stable_slots": {"1": "stable"},
+            "ranked": ["candidate"],
+            "rejected": {"different": "reason-one"},
+        }
+    }
+
+    baseline = NodeHealthService._runtime_version("source", first)
+    assert NodeHealthService._runtime_version("source", reason_changed) == baseline
+    assert NodeHealthService._runtime_version("source", membership_changed) != baseline
+
+
 def test_maintenance_keeps_temporarily_unavailable_stable_slot(tmp_path):
     service, quick, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     before = first["regions"]["united-states"]["stable_slots"]
     failed_slot = "2"
-    prior_score = json.loads(
-        (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
-    )["nodes"][before[failed_slot]]["last_score"]
+    original_load_state = service.store.load_state
+    previous = original_load_state()
+    previous["nodes"][before[failed_slot]]["healthy_streak_days"] = 6
+    previous["nodes"][before[failed_slot]]["last_healthy_day"] = "2026-07-24"
+    prior_score = previous["nodes"][before[failed_slot]]["last_score"]
+    service.store.load_state = lambda: previous
     quick.unavailable.add(before[failed_slot])
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
 
     second = service.run_once("maintenance")
+    service.store.load_state = original_load_state
     after = second["regions"]["united-states"]["stable_slots"]
     assert second["mode"] == "maintenance"
     assert after == before
     region = second["regions"]["united-states"]
-    assert region["stable_status"][failed_slot]["status"] == "unavailable"
+    assert region["stable_status"][failed_slot]["status"] == "protected-unavailable"
     assert region["stable_status"][failed_slot]["last_exit_ip"]
     assert region["stable_status"][failed_slot]["last_full_checked_at"]
     assert region["stable_status"][failed_slot]["score"] == prior_score
@@ -598,6 +698,8 @@ def test_maintenance_keeps_temporarily_unavailable_stable_slot(tmp_path):
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
     assert state["nodes"][before[failed_slot]]["last_score"] == prior_score
     assert state["nodes"][before[failed_slot]]["consecutive_unavailable_runs"] == 1
+    assert state["nodes"][before[failed_slot]]["consecutive_unavailable_valid_days"] == 1
+    assert state["nodes"][before[failed_slot]]["unavailable_grace_active"] is True
     latest = (tmp_path / "data" / "reports" / "alerts" / "latest-run.md").read_text(
         encoding="utf-8"
     )
@@ -619,13 +721,13 @@ def test_maintenance_quality_redline_replaces_only_one_slot(tmp_path):
     changes = [change for change in json.loads(
         (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(encoding="utf-8")
     )["slot_changes"] if change["slot"] == failed_slot]
-    assert changes[0]["reason"] == "quality-redline"
+    assert changes[0]["reason"] == "quality-severe"
     assert changes[0]["before_name"].startswith("US node")
     assert changes[0]["after_name"].startswith("US node")
     assert changes[0]["redline_reasons"] == "egress-ip-unstable"
     history = list((tmp_path / "data" / "reports" / "alerts").glob("2026-07-24-*.md"))
     assert len(history) >= 2
-    assert any("触发质量红线" in path.read_text(encoding="utf-8") for path in history)
+    assert any("确认严重质量风险" in path.read_text(encoding="utf-8") for path in history)
 
 
 def test_missing_inventory_node_is_immediately_replaced(tmp_path):
@@ -649,38 +751,457 @@ def test_missing_inventory_node_is_immediately_replaced(tmp_path):
     assert "节点已从订阅中消失" in changes
 
 
-def test_three_consecutive_unavailable_runs_replace_stable_and_move_it_to_tail(tmp_path):
+def test_protected_stable_is_replaced_on_second_valid_unavailable_day(tmp_path):
     service, quick, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     before = first["regions"]["united-states"]["stable_slots"]
     failed_slot = "2"
     failed_key = before[failed_slot]
+    original_load_state = service.store.load_state
+    previous = original_load_state()
+    previous["nodes"][failed_key]["healthy_streak_days"] = 6
+    previous["nodes"][failed_key]["last_healthy_day"] = "2026-07-24"
+    service.store.load_state = lambda: previous
     quick.unavailable.add(failed_key)
 
-    for expected_runs in (1, 2):
-        current = service.run_once("maintenance")
-        assert current["regions"]["united-states"]["stable_slots"] == before
-        state = json.loads(
-            (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
-        )
-        assert state["nodes"][failed_key]["consecutive_unavailable_runs"] == expected_runs
-
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
     current = service.run_once("maintenance")
+    service.store.load_state = original_load_state
+    assert current["regions"]["united-states"]["stable_slots"] == before
+    first_failure_state = service.store.load_state()
+    assert first_failure_state["nodes"][failed_key]["unavailable_grace_active"] is True
+
+    service.store.load_state = lambda: first_failure_state
+    service.clock = lambda: datetime(2026, 7, 26, 0, 2, tzinfo=timezone.utc)
+    current = service.run_once("maintenance")
+    service.store.load_state = original_load_state
     after = current["regions"]["united-states"]["stable_slots"]
     assert after[failed_slot] != failed_key
     assert current["regions"]["united-states"]["ranked"][-1] == failed_key
     report = json.loads(
-        (tmp_path / "data" / "reports" / "2026-07-24.json").read_text(
+        (tmp_path / "data" / "reports" / "2026-07-26.json").read_text(
             encoding="utf-8"
         )
     )
     changes = [
         change for change in report["slot_changes"] if change["slot"] == failed_slot
     ]
-    assert [change["reason"] for change in changes] == ["consecutive-unavailable"]
+    assert [change["reason"] for change in changes] == ["confirmed-unavailable"]
 
 
-def test_reachable_stable_node_resets_unavailable_counter(tmp_path):
+def test_protected_stable_recovery_keeps_slot_and_restarts_at_day_one(tmp_path):
+    service, quick, full, _ = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    before = first["regions"]["united-states"]["stable_slots"]
+    failed_key = before["2"]
+    previous = service.store.load_state()
+    previous["nodes"][failed_key]["healthy_streak_days"] = 6
+    previous["nodes"][failed_key]["last_healthy_day"] = "2026-07-24"
+    original_load_state = service.store.load_state
+    service.store.load_state = lambda: previous
+    quick.unavailable.add(failed_key)
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+    service.run_once("maintenance")
+    service.store.load_state = original_load_state
+
+    quick.unavailable.remove(failed_key)
+    full.checked_at = "2026-07-26T00:01:00+00:00"
+    service.clock = lambda: datetime(2026, 7, 26, 0, 2, tzinfo=timezone.utc)
+    recovered = service.run_once("maintenance")
+    state = service.store.load_state()["nodes"][failed_key]
+
+    assert recovered["regions"]["united-states"]["stable_slots"] == before
+    assert state["healthy_streak_days"] == 1
+    assert state["consecutive_unavailable_valid_days"] == 0
+    assert state["unavailable_grace_active"] is False
+
+
+def test_global_all_unavailable_freezes_slots_order_and_counters(tmp_path):
+    service, quick, full, _ = make_service(tmp_path, count=5)
+    first = service.run_once("rebuild")
+    before_state = service.store.load_state()
+    quick.unavailable.update(first["nodes"])
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    frozen = service.run_once("maintenance")
+    after_state = service.store.load_state()
+
+    assert frozen["regions"]["united-states"]["stable_slots"] == first["regions"]["united-states"]["stable_slots"]
+    assert frozen["regions"]["united-states"]["ranked"] == first["regions"]["united-states"]["ranked"]
+    assert frozen["outage_protection"]["regions"]["__global__"]["reason"] == "all-nodes-unavailable"
+    for key in first["nodes"]:
+        for field in (
+            "consecutive_full_passes",
+            "last_full_pass_day",
+            "healthy_streak_days",
+            "consecutive_unavailable_valid_days",
+            "unavailable_grace_active",
+            "daily_quality_history",
+        ):
+            assert after_state["nodes"][key][field] == before_state["nodes"][key][field]
+
+
+def test_availability_collapse_threshold_freezes_without_all_nodes_failing(tmp_path):
+    service, quick, full, _ = make_service(tmp_path, count=10)
+    first = service.run_once("rebuild")
+    before_state = service.store.load_state()
+    keys = list(first["nodes"])
+    quick.unavailable.update(keys[:9])
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    frozen = service.run_once("maintenance")
+    diagnostic = frozen["outage_protection"]["regions"]["__global__"]
+    after_state = service.store.load_state()
+
+    assert diagnostic["reason"] == "availability-collapse"
+    assert diagnostic["available_ratio"] == 0.1
+    assert frozen["regions"]["united-states"]["stable_slots"] == first["regions"]["united-states"]["stable_slots"]
+    assert frozen["regions"]["united-states"]["ranked"] == first["regions"]["united-states"]["ranked"]
+    assert after_state["availability_baselines"] == before_state["availability_baselines"]
+    for key in keys:
+        assert after_state["nodes"][key]["consecutive_full_passes"] == before_state["nodes"][key]["consecutive_full_passes"]
+        assert after_state["nodes"][key]["last_full_pass_day"] == before_state["nodes"][key]["last_full_pass_day"]
+
+
+def test_ai_service_outage_preserves_previous_ai_grade_and_blocks_history_growth(tmp_path):
+    service, quick, full, _ = make_service(tmp_path, count=5)
+    first = service.run_once("rebuild")
+    before_state = service.store.load_state()
+    keys = set(first["nodes"])
+    quick.chatgpt_fail.update(keys)
+    quick.claude_unreachable.update(keys)
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    protected = service.run_once("maintenance")
+    after_state = service.store.load_state()
+
+    assert set(protected["outage_protection"]["ai_services"]) == {"chatgpt", "claude"}
+    assert set(quick.diagnosed_services) == {"chatgpt", "claude"}
+    assert protected["regions"]["united-states"]["stable_slots"] == first["regions"]["united-states"]["stable_slots"]
+    for key in keys:
+        assert protected["nodes"][key]["ai_grade"] == first["nodes"][key]["ai_grade"]
+        assert protected["nodes"][key]["components"]["ai"] == first["nodes"][key]["components"]["ai"]
+        assert after_state["nodes"][key]["healthy_streak_days"] == before_state["nodes"][key]["healthy_streak_days"]
+        assert after_state["nodes"][key]["daily_quality_history"][-1]["evidence_valid"] is False
+        assert (
+            after_state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
+            == "Yes"
+        )
+
+
+def test_chatgpt_outage_denominator_excludes_unsupported_exit_countries(tmp_path):
+    service, _, _, _ = make_service(tmp_path)
+    nodes = [
+        Node(str(index), str(index), "other", {"name": str(index)})
+        for index in range(5)
+    ]
+    results = {
+        node.key: QuickResult(
+            available=True,
+            country="CN" if index < 4 else "US",
+            chatgpt_ok=False if index < 4 else True,
+            claude=ClaudeResult(status="available", supported=True),
+        )
+        for index, node in enumerate(nodes)
+    }
+
+    status = service._apply_ai_service_outage_guard(nodes, results)
+
+    assert "chatgpt" not in status
+    assert not any(result.chatgpt_service_outage for result in results.values())
+
+
+def test_ai_service_outage_guard_requires_minimum_sample(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=1)
+    node = Node("one", "one", "united-states", {"name": "one"})
+    result = QuickResult(
+        available=True,
+        exit_ip="8.8.8.8",
+        country="US",
+        chatgpt_ok=False,
+        claude=ClaudeResult(status="unreachable", supported=True),
+    )
+
+    status = service._apply_ai_service_outage_guard([node], {node.key: result})
+
+    assert status == {}
+    assert result.chatgpt_service_outage is False
+    assert result.claude.service_outage is False
+
+
+def test_ai_service_outage_guard_deduplicates_shared_service_egresses(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=5)
+    nodes = [
+        Node(str(index), str(index), "united-states", {"name": str(index)})
+        for index in range(5)
+    ]
+    results = {
+        node.key: QuickResult(
+            available=True,
+            exit_ip="8.8.8.8",
+            country="US",
+            chatgpt_ok=False,
+            claude=ClaudeResult(
+                status="unreachable",
+                exit_ip="1.1.1.1",
+                country="US",
+                supported=True,
+            ),
+        )
+        for node in nodes
+    }
+
+    status = service._apply_ai_service_outage_guard(nodes, results)
+
+    assert status == {}
+    assert not any(result.chatgpt_service_outage for result in results.values())
+    assert not any(result.claude.service_outage for result in results.values())
+
+
+def test_ai_outage_country_fallback_requires_same_exit_ip(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=5)
+    nodes = [
+        Node(str(index), str(index), "united-states", {"name": str(index)})
+        for index in range(5)
+    ]
+    results = {
+        node.key: QuickResult(
+            available=True,
+            exit_ip=f"8.8.8.{index + 1}",
+            country="",
+            chatgpt_ok=False,
+            claude=ClaudeResult(status="available", supported=True),
+        )
+        for index, node in enumerate(nodes)
+    }
+    previous = {
+        "nodes": {
+            node.key: {
+                "last_exit_ip": f"8.8.8.{index + 1}",
+                "last_country": "US",
+            }
+            for index, node in enumerate(nodes)
+        }
+    }
+
+    status = service._apply_ai_service_outage_guard(nodes, results, previous)
+
+    assert status["chatgpt"]["sample_size"] == 5
+    previous["nodes"][nodes[0].key]["last_exit_ip"] = "9.9.9.9"
+    for result in results.values():
+        result.chatgpt_service_outage = False
+    status = service._apply_ai_service_outage_guard(nodes, results, previous)
+    assert "chatgpt" not in status
+
+
+def test_observed_country_is_persisted_with_the_exit_ip(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=1)
+
+    current = service.run_once("rebuild")
+    key = next(iter(current["nodes"]))
+    state = service.store.load_state()["nodes"][key]
+
+    assert state["last_country"] == "US"
+    assert state["last_exit_ip"]
+
+
+def test_claude_degraded_fleet_triggers_service_outage_guard(tmp_path):
+    service, _, _, _ = make_service(tmp_path)
+    nodes = [
+        Node(str(index), str(index), "united-states", {"name": str(index)})
+        for index in range(5)
+    ]
+    results = {
+        node.key: QuickResult(
+            available=True,
+            exit_ip=f"8.8.8.{int(node.key) + 1}",
+            country="US",
+            chatgpt_ok=True,
+            claude=ClaudeResult(
+                status="degraded",
+                trace_ok=True,
+                anthropic_ok=False,
+                exit_ip=f"1.1.1.{int(node.key) + 1}",
+                country="US",
+                supported=True,
+            ),
+        )
+        for node in nodes
+    }
+
+    status = service._apply_ai_service_outage_guard(nodes, results)
+
+    assert status["claude"]["failure_ratio"] == 1
+    assert all(result.claude.service_outage for result in results.values())
+    assert all(result.claude.status == "unknown" for result in results.values())
+
+
+def test_claude_outage_country_fallback_is_scoped_to_claude_egress(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=5)
+    nodes = [
+        Node(str(index), str(index), "united-states", {"name": str(index)})
+        for index in range(5)
+    ]
+    results = {
+        node.key: QuickResult(
+            available=True,
+            exit_ip=f"8.8.8.{index + 1}",
+            country="US",
+            chatgpt_ok=True,
+            claude=ClaudeResult(
+                status="unreachable",
+                exit_ip=f"1.1.1.{index + 1}",
+                country="",
+                supported=None,
+            ),
+        )
+        for index, node in enumerate(nodes)
+    }
+
+    assert "claude" not in service._apply_ai_service_outage_guard(nodes, results)
+
+    previous = {
+        "nodes": {
+            node.key: {
+                "last_claude": ClaudeResult(
+                    exit_ip=f"1.1.1.{index + 1}", country="US"
+                ).to_dict()
+            }
+            for index, node in enumerate(nodes)
+        }
+    }
+    status = service._apply_ai_service_outage_guard(nodes, results, previous)
+
+    assert status["claude"]["sample_size"] == 5
+
+
+def test_outage_freeze_preserves_trusted_ai_and_score_state(tmp_path):
+    service, quick, _, _ = make_service(tmp_path, count=5)
+    first = service.run_once("rebuild")
+    before = service.store.load_state()
+    keys = set(first["nodes"])
+    quick.unavailable.update(keys)
+    for key in keys:
+        quick.claude_results[key] = ClaudeResult(status="unknown")
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    frozen = service.run_once("maintenance")
+    after = service.store.load_state()
+
+    assert frozen["outage_protection"]["regions"]["__global__"]["frozen"] is True
+    for key in keys:
+        assert after["nodes"][key]["last_claude"] == before["nodes"][key]["last_claude"]
+        assert after["nodes"][key]["ai_grade"] == before["nodes"][key]["ai_grade"]
+        assert after["nodes"][key]["score_components"] == before["nodes"][key]["score_components"]
+        assert after["nodes"][key]["last_score"] == before["nodes"][key]["last_score"]
+        assert after["nodes"][key]["last_decision"] == before["nodes"][key]["last_decision"]
+        assert after["nodes"][key]["last_frozen_observation"]["available"] is False
+
+
+def test_outage_freeze_preserves_rejected_membership_and_runtime_version(tmp_path):
+    service, quick, full, source = make_service(tmp_path, count=5)
+    risky_key = node_key(source.proxies[0])
+    full.risk_sources[risky_key] = {
+        "source-a": "high",
+        "source-b": "high",
+        "source-c": "high",
+    }
+    first = service.run_once("rebuild")
+    before_rejected = first["regions"]["united-states"]["rejected"]
+    quick.unavailable.update(first["nodes"])
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    frozen = service.run_once("maintenance")
+
+    assert risky_key in before_rejected
+    assert frozen["regions"]["united-states"]["rejected"] == before_rejected
+    assert frozen["version"] == first["version"]
+
+
+def test_existing_vacant_slot_full_audits_every_available_candidate(tmp_path):
+    service, _, full, _ = make_service(tmp_path, count=7)
+    first = service.run_once("rebuild")
+    previous = service.store.load_state()
+    del previous["stable_slots"]["united-states"]["3"]
+    original_load_state = service.store.load_state
+    service.store.load_state = lambda: previous
+    full.calls.clear()
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    service.run_once("maintenance")
+    service.store.load_state = original_load_state
+
+    assert set(full.calls) == set(first["nodes"])
+
+
+def test_report_exit_ip_redaction_covers_nested_claude_full_and_region_fields(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=3)
+    service.config.report.include_exit_ip = False
+
+    service.run_once("rebuild")
+    json_report = (
+        tmp_path / "data" / "reports" / "2026-07-24.json"
+    ).read_text(encoding="utf-8")
+    markdown_report = (
+        tmp_path / "data" / "reports" / "2026-07-24.md"
+    ).read_text(encoding="utf-8")
+
+    assert "8.8.8." not in json_report
+    assert "8.8.8." not in markdown_report
+
+
+def test_incomplete_claude_split_route_risk_uses_cache_but_pauses_streak(tmp_path):
+    service, quick, full, _ = make_service(tmp_path, count=1)
+    first = service.run_once("rebuild")
+    key = next(iter(first["nodes"]))
+    previous = service.store.load_state()
+    previous["nodes"][key]["last_claude"] = ClaudeResult(
+        status="available",
+        trace_ok=True,
+        anthropic_ok=True,
+        exit_ip="1.1.1.1",
+        country="US",
+        supported=True,
+        asn="AS13335",
+        organization="Cloudflare",
+        risk_sources={"IPinfo-privacy": "low", "ipapi-flags": "low"},
+        factors={},
+        residential="probable",
+        intelligence_complete=True,
+    ).to_dict()
+    original_load_state = service.store.load_state
+    service.store.load_state = lambda: previous
+    quick.claude_results[key] = ClaudeResult(
+        status="available",
+        trace_ok=True,
+        anthropic_ok=True,
+        exit_ip="1.1.1.1",
+        country="US",
+        supported=True,
+        intelligence_complete=False,
+        error="ipinfo timeout; ipapi timeout",
+    )
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    current = service.run_once("maintenance")
+    service.store.load_state = original_load_state
+    state = service.store.load_state()["nodes"][key]
+
+    assert "claude-risk-incomplete" in current["nodes"][key]["reasons"]
+    assert state["last_claude"]["intelligence_cached"] is True
+    assert state["last_claude"]["risk_sources"] == {
+        "IPinfo-privacy": "low",
+        "ipapi-flags": "low",
+    }
+    assert state["healthy_streak_days"] == previous["nodes"][key]["healthy_streak_days"]
+    assert state["daily_quality_history"][-1]["evidence_valid"] is False
+
+
+def test_replaced_node_recovers_without_original_slot_rights(tmp_path):
     service, quick, _, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["stable_slots"]["1"]
@@ -690,8 +1211,47 @@ def test_reachable_stable_node_resets_unavailable_counter(tmp_path):
     quick.unavailable.remove(key)
     current = service.run_once("maintenance")
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
-    assert current["regions"]["united-states"]["stable_slots"]["1"] == key
+    assert current["regions"]["united-states"]["stable_slots"]["1"] != key
+    assert key in current["regions"]["united-states"]["ranked"]
     assert state["nodes"][key]["consecutive_unavailable_runs"] == 0
+
+
+def test_legacy_v2_state_keeps_slots_and_initializes_new_history_incrementally(tmp_path):
+    service, _, full, _ = make_service(tmp_path)
+    first = service.run_once("rebuild")
+    legacy = service.store.load_state()
+    legacy.pop("ranked_order", None)
+    for payload in legacy["nodes"].values():
+        for field in (
+            "healthy_streak_days",
+            "last_healthy_day",
+            "consecutive_unavailable_valid_days",
+            "last_unavailable_day",
+            "unavailable_grace_active",
+            "daily_quality_history",
+            "last_claude",
+            "ai_grade",
+            "risk_grade",
+            "overall_grade",
+            "residential_grade",
+            "score_components",
+        ):
+            payload.pop(field, None)
+    original_load_state = service.store.load_state
+    service.store.load_state = lambda: legacy
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    service.clock = lambda: datetime(2026, 7, 25, 0, 2, tzinfo=timezone.utc)
+
+    migrated = service.run_once("maintenance")
+    service.store.load_state = original_load_state
+    state = service.store.load_state()
+
+    assert migrated["mode"] == "maintenance"
+    assert migrated["regions"]["united-states"]["stable_slots"] == first["regions"]["united-states"]["stable_slots"]
+    for payload in state["nodes"].values():
+        assert payload["healthy_streak_days"] == 1
+        assert len(payload["daily_quality_history"]) == 1
+        assert payload["last_claude"]["status"] == "available"
 
 
 def test_unchanged_rebuild_refreshes_slot_timestamps_without_slot_change_alert(tmp_path):
@@ -803,7 +1363,7 @@ def test_changed_exit_ip_never_reuses_old_full_after_repeated_failures(tmp_path)
     assert state["nodes"][key]["consecutive_full_passes"] == 0
 
 
-def test_transient_chatgpt_failure_resets_passes_but_preserves_trusted_full(tmp_path):
+def test_transient_chatgpt_failure_pauses_history_and_preserves_trusted_full(tmp_path):
     service, _, full, _ = make_service(tmp_path, count=1)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["stable_slots"]["1"]
@@ -813,8 +1373,8 @@ def test_transient_chatgpt_failure_resets_passes_but_preserves_trusted_full(tmp_
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
 
     assert current["nodes"][key]["decision"] == "eligible"
-    assert current["nodes"][key]["confidence"] == "low"
-    assert "chatgpt-unconfirmed:Failed" in current["nodes"][key]["reasons"]
+    assert current["nodes"][key]["confidence"] == "high"
+    assert "fresh-ai-unconfirmed:Failed" in current["nodes"][key]["reasons"]
     assert state["nodes"][key]["consecutive_full_passes"] == 0
     assert (
         state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
@@ -842,18 +1402,19 @@ def test_incomplete_fresh_full_degrades_stable_slot_without_losing_trusted_full(
     assert "本轮深度检测未完成" in latest
 
 
-def test_chatgpt_redline_remains_latched_until_a_fresh_clean_full(tmp_path):
+def test_risk_redline_remains_latched_until_a_fresh_clean_full(tmp_path):
     service, _, full, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["stable_slots"]["1"]
-    full.statuses[key] = "Block"
+    full.risk_sources[key] = {"source-a": "high", "source-b": "high", "source-c": "high"}
 
     blocked = service.run_once("maintenance")
     assert blocked["nodes"][key]["decision"] == "rejected"
     assert key not in blocked["regions"]["united-states"]["stable_slots"].values()
 
-    service.config.policy.full_audit_top_candidates = 0
-    full.statuses.pop(key)
+    service.config.policy.promotion_challengers_per_region = 0
+    service.config.policy.full_audit_daily_fraction = 0
+    full.risk_sources[key] = {"source-a": "low", "source-b": "low", "source-c": "low"}
     full.calls.clear()
     still_blocked = service.run_once("maintenance")
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
@@ -863,8 +1424,8 @@ def test_chatgpt_redline_remains_latched_until_a_fresh_clean_full(tmp_path):
     assert key in still_blocked["regions"]["united-states"]["ranked"]
     assert key in still_blocked["regions"]["united-states"]["rejected"]
     assert (
-        state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
-        == "Block"
+        state["nodes"][key]["last_full"]["risk_sources"]["source-a"]
+        == "high"
     )
 
 
@@ -872,10 +1433,11 @@ def test_ambiguous_fresh_full_cannot_clear_a_latched_redline(tmp_path):
     service, _, full, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["stable_slots"]["1"]
-    full.statuses[key] = "Block"
+    full.risk_sources[key] = {"source-a": "high", "source-b": "high", "source-c": "high"}
     service.run_once("maintenance")
 
     full.statuses[key] = "Failed"
+    full.risk_sources[key] = {"source-a": "low", "source-b": "low", "source-c": "low"}
     ambiguous = service.run_once("maintenance")
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
 
@@ -883,8 +1445,8 @@ def test_ambiguous_fresh_full_cannot_clear_a_latched_redline(tmp_path):
     assert key in ambiguous["regions"]["united-states"]["ranked"]
     assert key in ambiguous["regions"]["united-states"]["rejected"]
     assert (
-        state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
-        == "Block"
+        state["nodes"][key]["last_full"]["risk_sources"]["source-a"]
+        == "high"
     )
 
 
@@ -893,7 +1455,7 @@ def test_absent_dynamic_redline_is_remembered_when_node_returns(tmp_path):
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["ranked"][0]
     proxy = next(item for item in source.proxies if node_key(item) == key)
-    full.statuses[key] = "Block"
+    full.risk_sources[key] = {"source-a": "high", "source-b": "high", "source-c": "high"}
     blocked = service.run_once("maintenance")
     assert blocked["nodes"][key]["decision"] == "rejected"
 
@@ -906,6 +1468,7 @@ def test_absent_dynamic_redline_is_remembered_when_node_returns(tmp_path):
 
     source.proxies.append(proxy)
     full.statuses[key] = "Failed"
+    full.risk_sources[key] = {"source-a": "low", "source-b": "low", "source-c": "low"}
     returned = service.run_once("maintenance")
 
     assert returned["nodes"][key]["decision"] == "rejected"
@@ -935,14 +1498,12 @@ def test_stable_warning_is_degraded_without_changing_the_slot(tmp_path):
     assert "降级" in latest
 
 
-def test_first_rebuild_publishes_even_when_all_nodes_are_unavailable(tmp_path):
+def test_first_rebuild_all_unavailable_aborts_without_publishing(tmp_path):
     service, quick, _, _ = make_service(tmp_path, count=100)
     quick.unavailable_names.update(f"US node {index}" for index in range(100))
-    current = service.run_once("rebuild")
-    assert (tmp_path / "data" / "current.json").exists()
-    region = current["regions"]["united-states"]
-    assert len(region["stable_slots"]) == 3
-    assert len(region["ranked"]) == 97
+    with pytest.raises(NoPublishSafetyAbort):
+        service.run_once("rebuild")
+    assert not (tmp_path / "data" / "current.json").exists()
 
 
 def test_http_endpoints_and_token(tmp_path):
@@ -1215,6 +1776,96 @@ def test_subscription_audit_checks_all_nodes_without_changing_ranking_state(tmp_
     assert audit_all_plain_txt == "".join(
         f"{line.split('{', 1)[0]}\n" for line in audit_all_txt.splitlines()
     )
+
+
+def test_subscription_audit_retries_transient_quick_failure(tmp_path):
+    service, quick, full, source = make_service(tmp_path, count=1)
+    service.audit_downloader = lambda *_: source.download()
+    target_key = node_key(source.proxies[0])
+    original_check = quick.check
+    calls = 0
+
+    def flaky_check(node, port):
+        nonlocal calls
+        calls += 1
+        if node.key == target_key and calls == 1:
+            return QuickResult(
+                available=False,
+                checked_at="2026-07-24T00:00:00+00:00",
+                error="timeout",
+            )
+        return original_check(node, port)
+
+    quick.check = flaky_check
+    audit_id = service.trigger_subscription_audit(
+        "https://inventory.invalid/audit", "Transient audit"
+    )
+    status = _wait_for_audit(service, audit_id)
+    report = json.loads(
+        service.store.audit_report_path(audit_id, "json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert status["status"] == "completed"
+    assert calls == 2
+    assert target_key in full.calls
+    assert report["nodes"][0]["quick"]["transient_recovery"] is True
+    assert report["nodes"][0]["quick"]["retry_count"] == 1
+
+
+def test_subscription_audit_applies_ai_service_outage_guard(tmp_path):
+    service, quick, _, source = make_service(tmp_path, count=5)
+    service.audit_downloader = lambda *_: source.download()
+    keys = {node_key(proxy) for proxy in source.proxies}
+    quick.chatgpt_fail.update(keys)
+    quick.claude_unreachable.update(keys)
+
+    audit_id = service.trigger_subscription_audit(
+        "https://inventory.invalid/audit", "AI outage audit"
+    )
+    status = _wait_for_audit(service, audit_id)
+    report = json.loads(
+        service.store.audit_report_path(audit_id, "json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert status["status"] == "completed_with_warnings"
+    assert set(report["outage_protection"]["ai_services"]) == {
+        "chatgpt",
+        "claude",
+    }
+    assert set(quick.diagnosed_services) == {"chatgpt", "claude"}
+    assert status["summary"]["ai_service_outages"] == ["chatgpt", "claude"]
+    assert report["summary"]["rejected"] == 0
+
+
+def test_claude_country_conflict_pauses_quality_evidence(tmp_path):
+    service, quick, _, source = make_service(tmp_path, count=1)
+    key = node_key(source.proxies[0])
+    quick.claude_results[key] = ClaudeResult(
+        status="available",
+        trace_ok=True,
+        anthropic_ok=True,
+        exit_ip="1.1.1.1",
+        country="US",
+        intelligence_country="CN",
+        supported=True,
+        intelligence_complete=True,
+        risk_sources={"IPinfo-privacy": "low", "ipapi-flags": "low"},
+    )
+
+    current = service.run_once("rebuild")
+    state = service.store.load_state()["nodes"][key]
+
+    assert current["nodes"][key]["confidence"] == "low"
+    assert any(
+        reason.startswith("claude-intelligence-country-conflict:")
+        for reason in current["nodes"][key]["reasons"]
+    )
+    assert state["healthy_streak_days"] == 0
+    assert state["daily_quality_history"][-1]["evidence_valid"] is False
 
 
 def test_subscription_audit_http_api_and_authenticated_report_download(tmp_path):

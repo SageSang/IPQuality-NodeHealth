@@ -37,22 +37,37 @@ probe:
   geo_url_template: https://ipapi.co/{ip}/json/
   google_url: https://www.gstatic.com/generate_204
   chatgpt_url: https://chatgpt.com/cdn-cgi/trace
+  # An unavailable node is checked again after 2 and then 5 minutes before the
+  # day is counted as unavailable. Set shorter values only for tests.
+  unavailable_retry_delays_seconds: [120, 300]
+  claude_timeout_seconds: 8
+  claude_trace_url: https://claude.ai/cdn-cgi/trace
+  anthropic_trace_url: https://www.anthropic.com/cdn-cgi/trace
+  # IPinfo Core/Plus lookup. A token is needed for reliable privacy/hosting
+  # evidence; without one only whatever the provider returns is used.
+  claude_ipinfo_url_template: https://api.ipinfo.io/lookup/{ip}
+  claude_ipinfo_token: ${IPINFO_TOKEN:-}
+  # The anonymous ipapi.is endpoint is rate-limited. Configure IPAPI_KEY for
+  # larger pools and complete responses.
+  claude_ipapi_url_template: https://api.ipapi.is/?q={ip}
+  claude_ipapi_key: ${IPAPI_KEY:-}
+  # OpenAI ChatGPT web/mobile support snapshot checked 2026-09-02. Override
+  # this ISO alpha-2 list when the official page changes.
+  chatgpt_supported_countries_snapshot: "2026-09-02"
+  # Anthropic consumer availability snapshot published 2026-03-16. Override
+  # this ISO alpha-2 list when the official page changes.
+  claude_supported_countries_snapshot: "2026-03-16"
 
 policy:
   # maintenance keeps these identities unordered and fixed; rebuild lets all
   # fully audited candidates compete for these slots again.
   stable_slots: 3
-  # A node moves to the regional tail only after this many consecutive failed
-  # quick-scan rounds. A stable node is then replaced by the best candidate;
-  # any successful round resets the counter to zero.
-  stable_unavailable_replace_after_runs: 3
-  # Deep-audit one node from each four-node ranking block, preferring the
-  # least-recently audited member. This covers the dynamic pool in about 4 days.
-  full_audit_daily_fraction: 0.25
-  # Recheck the best non-stable node in every region each day so a sustained
-  # promotion is based on fresh evidence from two different calendar days.
-  promotion_challengers_per_region: 1
-  min_full_passes_high_confidence: 2
+  stable_protection_min_healthy_days: 6
+  stable_unavailable_grace_days: 1
+  # Stable slots and the three strongest challengers are audited every day;
+  # half of the remaining pool rotates daily.
+  full_audit_daily_fraction: 0.5
+  promotion_challengers_per_region: 3
   # Kept for backwards-compatible config parsing. Publication no longer uses
   # this ratio: unreachable nodes are retained at the ranking tail.
   minimum_publish_available_ratio: 0.2
@@ -61,20 +76,32 @@ policy:
   minimum_rebuild_full_completion_ratio: 0.8
   # A JSON result is not trusted for ordering until at least this many
   # independent risk-score providers returned usable values.
-  min_valid_risk_sources: 2
+  min_valid_risk_sources: 3
+  # Claude dedicated egress has two independent providers and is evaluated as
+  # a separate route; its evidence never fills the generic egress quota.
+  claude_min_valid_risk_sources: 2
   # One noisy DNSBL listing is only a warning. Three independent listings are
   # required before DNSBL alone can trigger a stable-slot redline.
   dnsbl_redline_threshold: 3
+  dnsbl_severe_threshold: 3
   # A new stable candidate must succeed in at least two of the default three
   # public-egress samples. Existing slots are preserved when this is uncertain.
   minimum_candidate_success_rate: 0.6666
   # Controlled maintenance promotion. A transiently unavailable or missing
   # stable identity is never used as the weakest comparison target.
   promotion_enabled: true
-  promotion_min_full_passes: 2
-  promotion_score_margin: 10
+  promotion_min_healthy_days: 6
+  promotion_evidence_days: 3
+  promotion_score_margin: 15
   promotion_max_per_region_per_run: 1
-  promotion_cooldown_days: 2
+  promotion_cooldown_days: 7
+  mass_outage_current_ratio: 0.20
+  mass_outage_drop_ratio: 0.60
+  mass_outage_min_nodes: 5
+  mass_outage_min_identity_overlap: 0.60
+  claude_service_failure_ratio: 0.80
+  # Count distinct service egresses, not aliases sharing the same route.
+  ai_service_outage_min_egresses: 5
   expected_country:
     hong-kong: HK
     taiwan: TW

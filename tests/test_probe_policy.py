@@ -8,16 +8,18 @@ from unittest.mock import patch
 import pytest
 
 from node_health.config import AppConfig, InventoryConfig, PolicyConfig, ProbeConfig
-from node_health.models import FullResult, Node, QuickResult
+from node_health.models import ClaudeResult, FullResult, Node, QuickResult
 from node_health.policy import (
     chatgpt_explicitly_allowed,
     evaluate_node,
     full_has_confirmed_redline,
+    residential_profile,
     score_node,
     select_full_audit_nodes,
 )
 from node_health.probe import (
     BUNDLED_DNSBL_FILE,
+    CurlQuickProbe,
     IPQualityAuditor,
     MihomoProbeEnvironment,
     generate_mihomo_probe_config,
@@ -48,10 +50,192 @@ def quick(**overrides) -> QuickResult:
         "exit_ip_stable": True,
         "google_ok": True,
         "chatgpt_ok": True,
+        "claude": ClaudeResult(
+            status="available",
+            trace_ok=True,
+            anthropic_ok=True,
+            exit_ip="8.8.8.8",
+            country="US",
+            supported=True,
+            route_stable=True,
+        ),
         "checked_at": "2026-07-24T00:00:00+00:00",
     }
     values.update(overrides)
     return QuickResult(**values)
+
+
+def test_claude_split_route_collects_two_source_risk_intelligence():
+    config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
+    probe = CurlQuickProbe(config)
+    responses = {
+        config.probe.claude_trace_url: "ip=1.1.1.1\nloc=US\n",
+        config.probe.anthropic_trace_url: "ip=1.1.1.1\nloc=US\n",
+        config.probe.claude_ipinfo_url_template.format(ip="1.1.1.1"): json.dumps(
+            {
+                "data": {
+                    "asn": {"asn": "AS13335", "name": "Cloudflare", "type": "isp"},
+                    "company": {"name": "Cloudflare", "type": "isp"},
+                    "privacy": {"proxy": False, "vpn": False, "tor": False, "hosting": False},
+                }
+            }
+        ),
+        config.probe.claude_ipapi_url_template.format(ip="1.1.1.1"): json.dumps(
+            {
+                "asn": {"asn": "AS13335", "type": "isp"},
+                "company": {"name": "Cloudflare", "type": "isp", "abuser_score": "0.1016 (High)"},
+                "location": {"country_code": "US"},
+                "is_proxy": False,
+                "is_vpn": False,
+                "is_tor": False,
+                "is_datacenter": False,
+                "is_abuser": False,
+                "is_crawler": False,
+            }
+        ),
+    }
+
+    probe._get = lambda _port, url, _timeout=None: (responses[url], 1.0)
+    result = probe._check_claude(20000, "8.8.8.8")
+
+    assert result.status == "available"
+    assert result.exit_ip == "1.1.1.1"
+    assert result.country == "US"
+    assert result.supported is True
+    assert result.intelligence_complete is True
+    assert result.asn == "AS13335"
+    assert result.residential == "confirmed"
+    assert set(result.risk_sources) == {"IPinfo-privacy", "ipapi"}
+    assert result.risk_sources["ipapi"] == "high"
+
+
+def test_claude_trace_country_is_not_overwritten_by_risk_provider_country():
+    config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
+    probe = CurlQuickProbe(config)
+    responses = {
+        config.probe.claude_trace_url: "ip=1.1.1.1\nloc=US\n",
+        config.probe.anthropic_trace_url: "ip=1.1.1.1\nloc=US\n",
+        config.probe.claude_ipinfo_url_template.format(ip="1.1.1.1"): json.dumps(
+            {
+                "country_code": "CN",
+                "is_anonymous": False,
+                "is_hosting": False,
+            }
+        ),
+        config.probe.claude_ipapi_url_template.format(ip="1.1.1.1"): json.dumps(
+            {"cc": "CN", "is_proxy": False, "is_vpn": False}
+        ),
+    }
+    probe._get = lambda _port, url, _timeout=None: (responses[url], 1.0)
+
+    result = probe._check_claude(20000, "8.8.8.8")
+
+    assert result.status == "available"
+    assert result.country == "US"
+    assert result.supported is True
+    assert result.intelligence_country == "CN"
+
+
+def test_claude_ipapi_anonymous_response_shape_is_usable_without_an_api_key():
+    config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
+    probe = CurlQuickProbe(config)
+
+    def fake_get(_port, url, _timeout=None):
+        if "ipinfo.io" in url:
+            raise RuntimeError("rate limited")
+        return (
+            json.dumps(
+                {
+                    "ip": "82.66.115.249",
+                    "is_datacenter": False,
+                    "is_tor": False,
+                    "is_proxy": False,
+                    "is_vpn": False,
+                    "is_abuser": False,
+                    "company_name": "Proxad / Free SAS",
+                    "asn_num": 12322,
+                    "asn_org": "Free SAS",
+                    "cc": "FR",
+                }
+            ),
+            1.0,
+        )
+
+    probe._get = fake_get
+    result = probe._claude_risk_intelligence(20000, "82.66.115.249")
+
+    assert result["complete"] is False
+    assert result["asn"] == "AS12322"
+    assert result["organization"] == "Proxad / Free SAS"
+    assert result["country"] == "FR"
+    assert result["risk_sources"] == {"ipapi-flags": "low"}
+
+
+def test_claude_provider_response_without_risk_fields_does_not_invent_low_risk():
+    config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
+    probe = CurlQuickProbe(config)
+
+    def fake_get(_port, url, _timeout=None):
+        if "ipinfo.io" in url:
+            return json.dumps({"asn": "AS12322", "as_name": "Free SAS", "country_code": "FR"}), 1.0
+        return json.dumps({"company": {"name": "Free SAS"}, "asn": {"asn": "AS12322"}, "cc": "FR"}), 1.0
+
+    probe._get = fake_get
+    result = probe._claude_risk_intelligence(20000, "82.66.115.249")
+
+    assert result["complete"] is False
+    assert result["risk_sources"] == {}
+
+
+def test_claude_risk_provider_credentials_are_appended_without_entering_templates():
+    config = AppConfig(
+        inventory=InventoryConfig("http://inventory.invalid"),
+        probe=ProbeConfig(claude_ipinfo_token="info secret", claude_ipapi_key="api secret"),
+    )
+    probe = CurlQuickProbe(config)
+    urls = []
+
+    def fake_get(_port, url, _timeout=None):
+        urls.append(url)
+        if "ipinfo.io" in url:
+            return json.dumps({"is_anonymous": False, "is_hosting": False}), 1.0
+        return json.dumps({"is_proxy": False}), 1.0
+
+    probe._get = fake_get
+    probe._claude_risk_intelligence(20000, "8.8.8.8")
+
+    assert any("token=info+secret" in url for url in urls)
+    assert any("key=api+secret" in url for url in urls)
+
+
+@pytest.mark.parametrize(
+    ("claude_body", "anthropic_error", "expected"),
+    [
+        ("ip=8.8.8.8\nloc=CN\n", None, "restricted"),
+        ("ip=8.8.8.8\nloc=US\n", RuntimeError("connection refused"), "degraded"),
+        (RuntimeError("connection refused"), RuntimeError("connection refused"), "unreachable"),
+        (RuntimeError("curl exited 28"), RuntimeError("curl exited 28"), "unknown"),
+        (RuntimeError("HTTP 503"), RuntimeError("HTTP 503"), "unknown"),
+        (RuntimeError("HTTP 429"), RuntimeError("HTTP 429"), "unknown"),
+    ],
+)
+def test_claude_status_classification(claude_body, anthropic_error, expected):
+    config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
+    probe = CurlQuickProbe(config)
+
+    def fake_get(_port, url, _timeout=None):
+        if url == config.probe.claude_trace_url:
+            if isinstance(claude_body, Exception):
+                raise claude_body
+            return claude_body, 1.0
+        if url == config.probe.anthropic_trace_url:
+            if anthropic_error is not None:
+                raise anthropic_error
+            return "ok=1\n", 1.0
+        raise AssertionError(f"unexpected URL: {url}")
+
+    probe._get = fake_get
+    assert probe._check_claude(20000, "8.8.8.8").status == expected
 
 
 def test_probe_config_preserves_names_and_dialer_references():
@@ -134,6 +318,18 @@ def test_full_auditor_uses_bundled_dnsbl_file():
     assert environment["IPQUALITY_SKIP_MAIL"] == "1"
     assert environment["IPQUALITY_DNSBL_FILE"] == BUNDLED_DNSBL_FILE
     assert BUNDLED_DNSBL_FILE == "/app/ref/dnsbl.list"
+
+
+def test_quick_http_get_rejects_http_error_responses():
+    config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
+    failed = subprocess.CompletedProcess(
+        args=[], returncode=22, stdout="error page", stderr="curl: (22) HTTP 503"
+    )
+    with patch("node_health.probe.subprocess.run", return_value=failed) as run:
+        with pytest.raises(RuntimeError, match="503"):
+            CurlQuickProbe(config)._get(20000, "https://claude.ai/cdn-cgi/trace")
+
+    assert "--fail-with-body" in run.call_args.args[0]
 
 
 def test_full_auditor_accepts_valid_json_on_exit_one_and_binds_audited_ip():
@@ -238,7 +434,7 @@ def test_dnsbl_requires_multiple_listings_for_a_confirmed_redline():
     )
     common = {
         "completed": True,
-        "risk_sources": {"one": "low", "two": "low"},
+        "risk_sources": {"one": "low", "two": "low", "three": "low"},
         "details": {"Media": {"ChatGPT": {"Status": "Yes"}}},
     }
     single = FullResult(
@@ -277,7 +473,7 @@ def test_legacy_dnsbl_boolean_is_treated_as_one_listing():
     full = FullResult(
         completed=True,
         dnsbl_blacklisted=True,
-        risk_sources={"one": "low", "two": "low"},
+        risk_sources={"one": "low", "two": "low", "three": "low"},
         details={"Media": {"ChatGPT": {"Status": "Yes"}}},
     )
 
@@ -296,13 +492,244 @@ def test_numeric_risk_scores_apply_a_continuous_penalty():
             quick(),
             FullResult(
                 completed=True,
-                risk_sources={"one": str(risk), "two": f"{risk}%"},
+                risk_sources={"one": str(risk), "two": f"{risk}%", "three": str(risk)},
             ),
             policy,
         )
 
     assert scored(5) > scored(70) > scored(74)
     assert scored(5) - scored(70) >= 10
+
+
+@pytest.mark.parametrize(
+    ("type_data", "expected_grade", "expected_points"),
+    [
+        (
+            {
+                "Usage": {"one": "Fixed Line ISP", "two": "Broadband"},
+                "Company": {"one": "ISP"},
+            },
+            "confirmed",
+            10,
+        ),
+        ({"Usage": {"one": "ISP", "two": "ISP"}}, "probable", 5),
+        ({"Usage": {"one": "Residential"}}, "probable", 5),
+        ({"Company": {"one": "ISP"}}, "unknown", 0),
+        (
+            {
+                "Usage": {"one": "Residential", "two": "Broadband"},
+                "Company": {"three": "Hosting"},
+            },
+            "unknown",
+            0,
+        ),
+    ],
+)
+def test_residential_evidence_levels(type_data, expected_grade, expected_points):
+    grade, points, _ = residential_profile(
+        FullResult(completed=True, details={"Type": type_data})
+    )
+    assert grade == expected_grade
+    assert points == expected_points
+
+
+def test_geo_multi_source_country_consensus_receives_consistency_point():
+    policy = PolicyConfig(expected_country={"united-states": "US"})
+    evaluation = evaluate_node(
+        node("a"),
+        quick(),
+        FullResult(
+            completed=True,
+            risk_sources={"one": "low", "two": "low", "three": "low"},
+            details={
+                "Factor": {"CountryCode": {"one": "US", "two": "US", "three": "JP"}},
+                "Info": {
+                    "Region": {"Code": "US"},
+                    "RegisteredRegion": {"Code": "US"},
+                    "ASN": "AS15169",
+                    "Organization": "Example ISP",
+                },
+                "Media": {"ChatGPT": {"Status": "Yes", "Region": "US"}},
+            },
+        ),
+        policy,
+        1,
+    )
+    assert evaluation.components["geo"] == 10
+
+
+def test_chatgpt_region_points_compare_with_observed_exit_not_node_group():
+    evaluation = evaluate_node(
+        node("a"),
+        quick(country="US"),
+        FullResult(
+            completed=True,
+            risk_sources={"one": "low", "two": "low", "three": "low"},
+            details={
+                "Media": {
+                    "ChatGPT": {"Status": "Yes", "Region": "JP", "Type": "Native"}
+                }
+            },
+        ),
+        PolicyConfig(),
+        1,
+    )
+
+    assert evaluation.components["ai"] == 22
+
+
+def test_crawler_only_is_a_small_penalty_but_not_a_risk_downgrade():
+    policy = PolicyConfig(expected_country={"united-states": "US"})
+    evaluation = evaluate_node(
+        node("a"),
+        quick(),
+        FullResult(
+            completed=True,
+            risk_sources={"one": "0", "two": "0", "three": "0"},
+            details={
+                "Factor": {"Robot": {"one": True}},
+                "Media": {"ChatGPT": {"Status": "Yes", "Region": "US"}},
+            },
+        ),
+        policy,
+        2,
+    )
+    assert evaluation.risk_grade == "A"
+    assert evaluation.components["risk"] == 24
+
+
+def test_three_source_proxy_consensus_is_risk_c():
+    policy = PolicyConfig(expected_country={"united-states": "US"})
+    full = FullResult(
+        completed=True,
+        risk_sources={"one": "low", "two": "low", "three": "low"},
+        details={
+            "Factor": {"Proxy": {"one": True, "two": True, "three": True}},
+            "Media": {"ChatGPT": {"Status": "Yes"}},
+        },
+    )
+    evaluation = evaluate_node(node("a"), quick(), full, policy, 2)
+    assert evaluation.risk_grade == "C"
+    assert evaluation.redline
+    assert "risk-consensus-severe" in evaluation.reasons
+
+
+def test_claude_route_evidence_does_not_fill_generic_risk_coverage():
+    split = quick(
+        claude=ClaudeResult(
+            status="available",
+            trace_ok=True,
+            anthropic_ok=True,
+            exit_ip="1.1.1.1",
+            country="US",
+            supported=True,
+            intelligence_complete=True,
+            risk_sources={"claude-one": "low", "claude-two": "low"},
+        )
+    )
+    evaluation = evaluate_node(
+        node("a"),
+        split,
+        FullResult(completed=True, risk_sources={"generic-one": "low"}),
+        PolicyConfig(expected_country={"united-states": "US"}),
+        2,
+    )
+
+    assert evaluation.risk_grade == "B"
+    assert evaluation.components["risk_source_count"] == 1
+    assert "insufficient-risk-coverage:1/3" in evaluation.reasons
+    assert "claude-insufficient-risk-coverage:2/2" not in evaluation.reasons
+
+
+def test_clean_generic_and_claude_routes_are_independently_risk_a():
+    split = quick(
+        claude=ClaudeResult(
+            status="available",
+            trace_ok=True,
+            anthropic_ok=True,
+            exit_ip="1.1.1.1",
+            country="US",
+            supported=True,
+            intelligence_complete=True,
+            risk_sources={"claude-one": "low", "claude-two": "low"},
+        )
+    )
+    evaluation = evaluate_node(
+        node("a"),
+        split,
+        FullResult(
+            completed=True,
+            risk_sources={"generic-one": "low", "generic-two": "low", "generic-three": "low"},
+        ),
+        PolicyConfig(expected_country={"united-states": "US"}),
+        2,
+    )
+
+    assert evaluation.risk_grade == "A"
+
+
+def test_high_risk_and_factor_consensus_do_not_cross_egress_routes():
+    split = quick(
+        claude=ClaudeResult(
+            status="available",
+            trace_ok=True,
+            anthropic_ok=True,
+            exit_ip="1.1.1.1",
+            country="US",
+            supported=True,
+            intelligence_complete=True,
+            risk_sources={"claude-high": "high", "claude-low": "low"},
+            factors={"proxy": {"claude": True}},
+        )
+    )
+    evaluation = evaluate_node(
+        node("a"),
+        split,
+        FullResult(
+            completed=True,
+            risk_sources={"generic-high": "high", "generic-low": "low", "generic-low-2": "low"},
+            details={"Factor": {"Proxy": {"generic": True}}},
+        ),
+        PolicyConfig(expected_country={"united-states": "US"}),
+        2,
+    )
+
+    assert evaluation.risk_grade == "B"
+    assert not evaluation.redline
+    assert not any("multiple-high-risk-sources" in reason for reason in evaluation.reasons)
+    assert "risk-consensus-severe" not in evaluation.reasons
+
+
+def test_two_high_risk_sources_on_claude_route_are_risk_c():
+    split = quick(
+        claude=ClaudeResult(
+            status="available",
+            trace_ok=True,
+            anthropic_ok=True,
+            exit_ip="1.1.1.1",
+            country="US",
+            supported=True,
+            intelligence_complete=True,
+            risk_sources={"claude-one": "high", "claude-two": "85"},
+        )
+    )
+    evaluation = evaluate_node(
+        node("a"),
+        split,
+        FullResult(
+            completed=True,
+            risk_sources={"one": "low", "two": "low", "three": "low"},
+        ),
+        PolicyConfig(expected_country={"united-states": "US"}),
+        2,
+    )
+
+    assert evaluation.risk_grade == "C"
+    assert evaluation.redline
+    assert any(
+        reason.startswith("claude-multiple-high-risk-sources:")
+        for reason in evaluation.reasons
+    )
 
 
 def test_danger_policy_and_stable_ip_change():
@@ -346,15 +773,16 @@ def test_real_ipquality_high_risk_labels_are_redlines():
         assert any(reason.startswith("multiple-high-risk-sources") for reason in evaluation.reasons)
 
 
-def test_chatgpt_explicit_block_is_redline_but_unknown_is_not():
+def test_chatgpt_explicit_block_is_ai_b_when_claude_is_available():
     policy = PolicyConfig(expected_country={"united-states": "US"})
     blocked = FullResult(
         completed=True,
         details={"Media": {"ChatGPT": {"Status": "Block"}}},
     )
     evaluation = evaluate_node(node("a"), quick(), blocked, policy, 2)
-    assert evaluation.redline
-    assert "chatgpt-redline:Block" in evaluation.reasons
+    assert evaluation.eligible
+    assert evaluation.ai_grade == "B"
+    assert "chatgpt-unavailable" in evaluation.reasons
 
     unknown = FullResult(
         completed=True,
@@ -377,7 +805,7 @@ def test_chatgpt_explicit_allow_statuses_are_usable(status):
     "status",
     ["Block", "屏蔽", "WebOnly", "APPOnly", "仅网页", "仅APP"],
 )
-def test_chatgpt_explicit_restrictions_are_redlines(status):
+def test_chatgpt_explicit_restrictions_are_ai_b_when_claude_works(status):
     evaluation = evaluate_node(
         node("a"),
         quick(),
@@ -388,8 +816,9 @@ def test_chatgpt_explicit_restrictions_are_redlines(status):
         PolicyConfig(expected_country={"united-states": "US"}),
         2,
     )
-    assert evaluation.redline
-    assert f"chatgpt-redline:{status}" in evaluation.reasons
+    assert evaluation.eligible
+    assert evaluation.ai_grade == "B"
+    assert "chatgpt-unavailable" in evaluation.reasons
 
 
 @pytest.mark.parametrize("status", ["Failed", "失败"])
@@ -399,15 +828,15 @@ def test_chatgpt_transient_probe_failures_are_degraded_not_redlines(status):
         quick(),
         FullResult(
             completed=True,
-            risk_sources={"one": "low", "two": "low"},
+            risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": status}}},
         ),
         PolicyConfig(expected_country={"united-states": "US"}),
         2,
     )
     assert evaluation.eligible
-    assert evaluation.confidence == "low"
-    assert f"chatgpt-unconfirmed:{status}" in evaluation.reasons
+    assert evaluation.confidence == "provisional"
+    assert "chatgpt-unknown" in evaluation.reasons
 
 
 def test_chatgpt_negated_available_words_are_never_allowed():
@@ -424,7 +853,34 @@ def test_chatgpt_negated_available_words_are_never_allowed():
             PolicyConfig(expected_country={"united-states": "US"}),
             2,
         )
-        assert evaluation.redline
+        assert evaluation.eligible
+        assert evaluation.ai_grade == "B"
+
+
+def test_both_ai_services_confirmed_unavailable_are_grade_c():
+    unavailable = quick(
+        chatgpt_ok=False,
+        claude=ClaudeResult(
+            status="unreachable",
+            trace_ok=False,
+            anthropic_ok=False,
+            supported=True,
+        ),
+    )
+    evaluation = evaluate_node(
+        node("a"),
+        unavailable,
+        FullResult(
+            completed=True,
+            risk_sources={"one": "low", "two": "low", "three": "low"},
+            details={"Media": {"ChatGPT": {"Status": "Block"}}},
+        ),
+        PolicyConfig(expected_country={"united-states": "US"}),
+        2,
+    )
+    assert evaluation.redline
+    assert evaluation.ai_grade == "C"
+    assert "ai-services-unavailable" in evaluation.reasons
 
 
 def test_unknown_risk_values_do_not_count_as_coverage_or_full_score():
@@ -436,7 +892,7 @@ def test_unknown_risk_values_do_not_count_as_coverage_or_full_score():
     )
     clean = FullResult(
         completed=True,
-        risk_sources={"one": "low", "two": "low"},
+        risk_sources={"one": "low", "two": "low", "three": "low"},
         details={"Media": {"ChatGPT": {"Status": "Yes"}}},
     )
 
@@ -445,7 +901,7 @@ def test_unknown_risk_values_do_not_count_as_coverage_or_full_score():
 
     assert unknown_evaluation.eligible
     assert unknown_evaluation.confidence == "low"
-    assert "insufficient-risk-coverage:0/2" in unknown_evaluation.reasons
+    assert "insufficient-risk-coverage:0/3" in unknown_evaluation.reasons
     assert unknown_evaluation.score < clean_evaluation.score
 
 
@@ -455,7 +911,7 @@ def test_two_of_three_quick_successes_meet_the_default_candidate_threshold():
         quick(success_rate=0.6667),
         FullResult(
             completed=True,
-            risk_sources={"one": "low", "two": "low"},
+            risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Yes"}}},
         ),
         PolicyConfig(expected_country={"united-states": "US"}),
@@ -475,7 +931,7 @@ def test_missing_country_is_eligible_but_low_confidence():
         quick(country=""),
         FullResult(
             completed=True,
-            risk_sources={"one": "low", "two": "low"},
+            risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Yes"}}},
         ),
         PolicyConfig(expected_country={"united-states": "US"}),
@@ -500,7 +956,7 @@ def test_full_country_majority_overrides_a_lone_quick_geo_result():
 
     quick_disagrees = FullResult(
         completed=True,
-        risk_sources={"one": "low", "two": "low"},
+        risk_sources={"one": "low", "two": "low", "three": "low"},
         details={
             "Factor": {"CountryCode": {"one": "US", "two": "US", "three": "JP"}},
             "Media": {"ChatGPT": {"Status": "Yes"}},
@@ -517,14 +973,14 @@ def test_full_country_majority_overrides_a_lone_quick_geo_result():
         quick(country="JP"),
         FullResult(
             completed=True,
-            risk_sources={"one": "low", "two": "low"},
+            risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Yes"}}},
         ),
         policy,
         2,
     )
-    assert lone_quick.eligible
-    assert lone_quick.confidence == "low"
+    assert lone_quick.redline
+    assert lone_quick.overall_grade == "C"
     assert "quick-country-mismatch:JP!=US" in lone_quick.reasons
 
     conflict = FullResult(
@@ -541,7 +997,8 @@ def test_full_country_majority_overrides_a_lone_quick_geo_result():
         2,
         was_stable=True,
     )
-    assert unavailable.redline
+    assert unavailable.decision == "unavailable"
+    assert unavailable.overall_grade == "C"
     assert "country-mismatch:JP!=US" in unavailable.reasons
 
 
@@ -567,6 +1024,33 @@ def test_full_audit_selection_modes_and_stale_history():
     assert select_full_audit_nodes("maintenance", nodes, results, prior, policy, now) == {"a", "b"}
 
 
+def test_newly_observed_claude_route_forces_a_full_audit():
+    target = node("a")
+    results = {"a": quick()}
+    prior = {
+        "stable_slots": {},
+        "nodes": {
+            "a": {
+                "last_exit_ip": "8.8.8.8",
+                "last_claude": {"exit_ip": ""},
+                "last_risk_source_count": 3,
+                "last_decision": "eligible",
+            }
+        },
+    }
+
+    selected = select_full_audit_nodes(
+        "maintenance",
+        [target],
+        results,
+        prior,
+        PolicyConfig(full_audit_daily_fraction=0, promotion_challengers_per_region=0),
+        datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+
+    assert selected == {"a"}
+
+
 def test_maintenance_samples_oldest_quarter_across_dynamic_ranking():
     nodes = [node(key) for key in "abcdefghi"]
     results = {item.key: quick() for item in nodes}
@@ -575,6 +1059,8 @@ def test_maintenance_samples_oldest_quarter_across_dynamic_ranking():
             "last_exit_ip": "8.8.8.8",
             "last_score": 100 - index,
             "last_full_checked_at": f"2026-07-{20 + (index % 4):02d}T00:00:00+00:00",
+            "last_risk_source_count": 3,
+            "last_claude": {"exit_ip": "8.8.8.8"},
         }
         for index, item in enumerate(nodes)
     }
@@ -596,8 +1082,8 @@ def test_maintenance_samples_oldest_quarter_across_dynamic_ranking():
         datetime(2026, 7, 24, 12, tzinfo=timezone.utc),
     )
 
-    # a is stable, b is the best dynamic challenger, and e/i are the oldest
-    # members of two evenly distributed four-node ranking blocks.
+    # a is stable, b is the configured strongest challenger, and e/i are the
+    # oldest rotation members after that challenger is removed.
     assert selected == {"a", "b", "e", "i"}
 
 
@@ -631,3 +1117,76 @@ def test_maintenance_always_audits_new_and_changed_egress_nodes():
     )
 
     assert {"a", "d", "e"}.issubset(selected)
+
+
+def test_default_audit_plan_checks_three_challengers_daily_and_covers_pool_in_two_days():
+    nodes = [node(key) for key in "abcdefghi"]
+    results = {item.key: quick() for item in nodes}
+    prior_nodes = {
+        item.key: {
+            "last_exit_ip": "8.8.8.8",
+            "last_score": 100 - index,
+            "last_full_checked_at": "2026-07-20T00:00:00+00:00",
+            "last_risk_source_count": 3,
+            "last_decision": "eligible",
+        }
+        for index, item in enumerate(nodes)
+    }
+    prior = {
+        "stable_slots": {"united-states": {"1": "a"}},
+        "nodes": prior_nodes,
+    }
+    policy = PolicyConfig()
+    first = select_full_audit_nodes(
+        "maintenance",
+        nodes,
+        results,
+        prior,
+        policy,
+        datetime(2026, 7, 24, tzinfo=timezone.utc),
+    )
+    assert {"a", "b", "c", "d"}.issubset(first)
+
+    second_prior = json.loads(json.dumps(prior))
+    for key in first:
+        second_prior["nodes"][key]["last_full_checked_at"] = "2026-07-24T00:00:00+00:00"
+    second = select_full_audit_nodes(
+        "maintenance",
+        nodes,
+        results,
+        second_prior,
+        policy,
+        datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+
+    assert {"a", "b", "c", "d"}.issubset(second)
+    assert first | second == {item.key for item in nodes}
+
+
+def test_risk_conflict_forces_full_audit_outside_rotation():
+    nodes = [node(key) for key in "abc"]
+    results = {item.key: quick() for item in nodes}
+    prior = {
+        "stable_slots": {"united-states": {"1": "a"}},
+        "nodes": {
+            key: {
+                "last_exit_ip": "8.8.8.8",
+                "last_score": 100 - index,
+                "last_full_checked_at": "2026-07-24T00:00:00+00:00",
+                "last_risk_source_count": 3,
+                "last_decision": "eligible",
+                "risk_data_conflict": key == "c",
+                "last_claude": {"exit_ip": "8.8.8.8"},
+            }
+            for index, key in enumerate("abc")
+        },
+    }
+    selected = select_full_audit_nodes(
+        "maintenance",
+        nodes,
+        results,
+        prior,
+        PolicyConfig(full_audit_daily_fraction=0, promotion_challengers_per_region=0),
+        datetime(2026, 7, 25, tzinfo=timezone.utc),
+    )
+    assert selected == {"a", "c"}

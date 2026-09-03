@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
 from itertools import product
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from node_health.config import PolicyConfig
 from node_health.models import Evaluation, FullResult, Node, NodeAssessment, QuickResult
+from node_health.policy import evaluate_node
 from node_health.slots import assign_all_regions, assign_region_slots
 
 
@@ -21,7 +23,11 @@ def assessment(
     fresh_full_completed: bool = True,
     fresh_full_usable: bool = True,
     unavailable_runs: int = 0,
+    unavailable_days: int = 0,
+    healthy_days: int = 6,
+    grace_active: bool = False,
     region: str = "united-states",
+    history=None,
 ):
     full = FullResult(
         completed=completed,
@@ -37,12 +43,25 @@ def assessment(
             score,
             confidence if completed else "low",
             [] if decision == "eligible" else [decision],
+            ai_grade="B",
+            risk_grade="C" if decision == "rejected" else "B",
+            overall_grade="C" if decision == "rejected" else "B",
         ),
         consecutive_full_passes=passes,
         consecutive_unavailable_runs=unavailable_runs,
         fresh_full_completed=fresh_full_completed and completed,
         fresh_full_usable=fresh_full_usable and fresh_full_completed and completed,
         fresh_full_attempt=full,
+        healthy_streak_days=healthy_days,
+        consecutive_unavailable_valid_days=unavailable_days,
+        unavailable_grace_active=grace_active,
+        daily_quality_history=(
+            history if history is not None else [
+                {"day": f"2026-07-{day}", "score": score, "evidence_valid": True}
+                for day in ("21", "22", "23")
+            ]
+        ),
+        evidence_valid=available and completed and fresh_full_usable,
     )
 
 
@@ -70,7 +89,7 @@ def test_maintenance_preserves_healthy_slots_and_replaces_only_failed_slot():
 def test_low_confidence_node_fills_stable_slot_in_degraded_mode():
     items = [assessment("a", 90, completed=False), assessment("b", 80)]
     slots, dynamic, _ = assign_region_slots("maintenance", items, {}, 3)
-    assert slots == {"1": "b", "2": "a"}
+    assert slots == {"1": "a", "2": "b"}
     assert dynamic == []
 
 
@@ -80,6 +99,105 @@ def test_rebuild_reselects_top_three_without_old_slot_bias():
     slots, dynamic, _ = assign_region_slots("rebuild", items, previous, 3)
     assert slots == {"1": "f", "2": "e", "3": "d"}
     assert dynamic == ["c", "b", "a"]
+
+
+def test_grade_precedes_score_and_latency_in_ranking():
+    grade_a = assessment("grade-a", 40)
+    grade_a.evaluation.ai_grade = "A"
+    grade_a.evaluation.risk_grade = "A"
+    grade_a.evaluation.overall_grade = "A"
+    grade_a.quick.latency_ms = 1200
+    grade_b = assessment("grade-b", 99)
+    grade_b.quick.latency_ms = 10
+
+    slots, dynamic, _ = assign_region_slots(
+        "rebuild", [grade_b, grade_a], {}, 1
+    )
+
+    assert slots == {"1": "grade-a"}
+    assert dynamic == ["grade-b"]
+
+
+def test_c_grade_fallback_prefers_lower_risk_before_total_score():
+    high_risk = assessment("high-risk", 90, decision="rejected")
+    high_risk.evaluation.components["risk"] = 0
+    high_risk.evaluation.reasons = ["multiple-high-risk-sources:3"]
+    low_risk = assessment("low-risk", 80, decision="rejected")
+    low_risk.evaluation.components["risk"] = 20
+    low_risk.evaluation.reasons = ["ai-double-failure"]
+
+    slots, dynamic, _ = assign_region_slots(
+        "rebuild", [high_risk, low_risk], {}, 1
+    )
+
+    assert slots == {"1": "low-risk"}
+    assert dynamic == ["high-risk"]
+
+
+def test_one_fresh_challenger_replaces_only_one_of_multiple_c_slots():
+    first = assessment("c-one", 20, decision="rejected")
+    second = assessment("c-two", 30, decision="rejected")
+    stable = assessment("stable", 70)
+    challenger = assessment("challenger", 90)
+    challenger.evaluation.ai_grade = "A"
+    challenger.evaluation.risk_grade = "A"
+    challenger.evaluation.overall_grade = "A"
+
+    slots, dynamic, _ = assign_region_slots(
+        "maintenance",
+        [first, second, stable, challenger],
+        {"1": "c-one", "2": "c-two", "3": "stable"},
+        3,
+    )
+
+    assert slots == {"1": "challenger", "2": "c-two", "3": "stable"}
+    assert dynamic == ["c-one"]
+
+
+def test_fresh_challenger_replaces_the_riskiest_c_incumbent_first():
+    low_risk = assessment("low-risk-c", 20, decision="rejected")
+    low_risk.evaluation.risk_grade = "A"
+    low_risk.evaluation.components["risk"] = 24
+    low_risk.evaluation.reasons = ["ai-services-unavailable"]
+    tor = assessment("tor-c", 90, decision="rejected")
+    tor.full = FullResult(
+        completed=True,
+        tor=True,
+        risk_sources={"one": "low", "two": "low", "three": "low"},
+        details={"Media": {"ChatGPT": {"Status": "Yes"}}},
+    )
+    tor.evaluation = evaluate_node(
+        tor.node, tor.quick, tor.full, PolicyConfig(), 2
+    )
+    severe_risk = assessment("high-risk-c", 90, decision="rejected")
+    severe_risk.full = FullResult(
+        completed=True,
+        risk_sources={"one": "high", "two": "high", "three": "low"},
+        details={"Media": {"ChatGPT": {"Status": "Yes"}}},
+    )
+    severe_risk.evaluation = evaluate_node(
+        severe_risk.node,
+        severe_risk.quick,
+        severe_risk.full,
+        PolicyConfig(),
+        2,
+    )
+    stable = assessment("stable", 70)
+    challenger = assessment("challenger", 95)
+    challenger.evaluation.ai_grade = "A"
+    challenger.evaluation.risk_grade = "A"
+    challenger.evaluation.overall_grade = "A"
+
+    slots, dynamic, _ = assign_region_slots(
+        "maintenance",
+        [low_risk, tor, severe_risk, stable, challenger],
+        {"1": "tor-c", "2": "high-risk-c", "3": "stable"},
+        3,
+    )
+
+    assert tor.evaluation.components["risk"] > severe_risk.evaluation.components["risk"]
+    assert slots == {"1": "challenger", "2": "high-risk-c", "3": "stable"}
+    assert dynamic.index("low-risk-c") < dynamic.index("tor-c")
 
 
 @pytest.mark.parametrize("node_count", [0, 1, 2, 3])
@@ -139,7 +257,10 @@ def test_slot_assignment_partition_invariants_across_status_combinations():
                     mode, items, previous, 3, 3
                 )
                 ordered = [*slots.values(), *dynamic]
-                assert len(slots) == min(3, node_count)
+                available_count = sum(
+                    1 for status in statuses if not status.startswith("offline")
+                )
+                assert len(slots) == min(3, available_count)
                 assert len(ordered) == node_count
                 assert len(set(ordered)) == node_count
                 assert set(ordered) == keys
@@ -174,8 +295,8 @@ def test_fresh_full_failure_fills_slot_only_when_no_safe_candidate_exists():
     slots, dynamic, _ = assign_region_slots(
         "maintenance", [old, cached_candidate], {"1": "old"}, 1
     )
-    assert slots == {"1": "candidate"}
-    assert dynamic == ["old"]
+    assert slots == {"1": "old"}
+    assert dynamic == ["candidate"]
 
     slots, dynamic, _ = assign_region_slots(
         "rebuild", [cached_candidate], {"1": "old"}, 1
@@ -292,10 +413,10 @@ def test_unavailable_nodes_are_retained_at_the_dynamic_tail():
         assessment("c", 0, decision="unavailable", available=False),
     ]
     slots, dynamic, rejected = assign_region_slots("maintenance", items, {"1": "a"}, 1)
-    assert slots["1"] == "a"
+    assert slots["1"] == "b"
     assert "a" not in rejected
     assert rejected == {}
-    assert dynamic == ["b", "c"]
+    assert dynamic == ["a", "c"]
 
 
 def test_unavailable_nodes_keep_historical_scores_when_ordering_tail():
@@ -310,41 +431,21 @@ def test_unavailable_nodes_keep_historical_scores_when_ordering_tail():
     assert rejected == {}
 
 
-def test_unavailable_stable_is_replaced_only_after_three_consecutive_failures():
+def test_unavailable_stable_uses_one_day_grace_only_after_six_healthy_days():
     candidate = assessment("b", 80, confidence="high", passes=3)
-    policy = PolicyConfig(stable_unavailable_replace_after_runs=3)
+    policy = PolicyConfig()
     previous = {"united-states": {"1": "a"}}
 
-    for unavailable_runs in (1, 2):
-        current = assessment(
-            "a",
-            0,
-            decision="unavailable",
-            available=False,
-            unavailable_runs=unavailable_runs,
-        )
-        regions, changes = assign_all_regions(
-            "maintenance",
-            [current, candidate],
-            previous,
-            1,
-            ["united-states"],
-            {"a": {"last_score": 90}, "b": {"last_score": 80}},
-            policy,
-        )
-        assert regions["united-states"]["stable_slots"]["1"] == "a"
-        assert changes == []
-
-    current = assessment(
+    unprotected = assessment(
         "a",
         0,
         decision="unavailable",
         available=False,
-        unavailable_runs=3,
+        unavailable_days=1,
     )
     regions, changes = assign_all_regions(
         "maintenance",
-        [current, candidate],
+        [unprotected, candidate],
         previous,
         1,
         ["united-states"],
@@ -353,10 +454,31 @@ def test_unavailable_stable_is_replaced_only_after_three_consecutive_failures():
     )
     assert regions["united-states"]["stable_slots"]["1"] == "b"
     assert regions["united-states"]["ranked"] == ["a"]
-    assert [change["reason"] for change in changes] == ["consecutive-unavailable"]
+    assert [change["reason"] for change in changes] == ["confirmed-unavailable"]
+
+    protected = assessment(
+        "a", 0, decision="unavailable", available=False,
+        unavailable_days=1, healthy_days=0, grace_active=True,
+    )
+    regions, changes = assign_all_regions(
+        "maintenance", [protected, candidate], previous, 1,
+        ["united-states"], {"a": {"last_score": 90}}, policy,
+    )
+    assert regions["united-states"]["stable_slots"]["1"] == "a"
+    assert changes == []
+
+    second_failure = assessment(
+        "a", 0, decision="unavailable", available=False,
+        unavailable_days=2, grace_active=False,
+    )
+    regions, _ = assign_all_regions(
+        "maintenance", [second_failure, candidate], previous, 1,
+        ["united-states"], {"a": {"last_score": 90}}, policy,
+    )
+    assert regions["united-states"]["stable_slots"]["1"] == "b"
 
 
-def test_three_failures_move_dynamic_node_behind_more_recent_failures():
+def test_unavailable_dynamic_nodes_do_not_keep_special_demotion_positions():
     items = [
         assessment(
             "failed-three",
@@ -377,7 +499,7 @@ def test_three_failures_move_dynamic_node_behind_more_recent_failures():
     slots, dynamic, _ = assign_region_slots("maintenance", items, {}, 0, 3)
 
     assert slots == {}
-    assert dynamic == ["failed-two", "failed-three"]
+    assert dynamic == ["failed-three", "failed-two"]
 
 
 def test_three_failure_fallback_still_fills_slots_when_safe_nodes_are_insufficient():
@@ -401,11 +523,11 @@ def test_three_failure_fallback_still_fills_slots_when_safe_nodes_are_insufficie
         3,
     )
 
-    assert slots == {"1": "safe", "2": "risk", "3": "failed-three"}
-    assert dynamic == []
+    assert slots == {"2": "safe", "3": "risk"}
+    assert dynamic == ["failed-three"]
 
 
-def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown():
+def test_conservative_promotion_requires_sustained_margin_and_respects_cooldown():
     items = [
         assessment("a", 50, confidence="high", passes=3),
         assessment("b", 60, confidence="high", passes=3),
@@ -440,7 +562,7 @@ def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown(
     assert changes[0]["before_name"] == "a"
     assert changes[0]["after_name"] == "f"
     assert changes[0]["score_margin"] == "30.00"
-    assert changes[0]["candidate_full_passes"] == "2"
+    assert changes[0]["candidate_healthy_days"] == "6"
     assert "a" in regions["united-states"]["ranked"]
     assert regions["united-states"]["stable_slots"]["2"] == "b"
 
@@ -459,16 +581,16 @@ def test_conservative_promotion_requires_two_round_margin_and_respects_cooldown(
     assert changes == []
 
 
-def test_default_promotion_requires_two_distinct_days_and_ten_point_margin():
+def test_default_promotion_requires_six_healthy_days_and_three_day_fifteen_point_margin():
     previous_slots = {"united-states": {"1": "a", "2": "b", "3": "c"}}
     policy = PolicyConfig()
 
-    def run(candidate_score: float, passes: int):
+    def run(candidate_score: float, healthy_days: int):
         items = [
             assessment("a", 60, confidence="high", passes=3),
             assessment("b", 70, confidence="high", passes=3),
             assessment("c", 75, confidence="high", passes=3),
-            assessment("f", candidate_score, confidence="high", passes=passes),
+            assessment("f", candidate_score, confidence="high", healthy_days=healthy_days),
         ]
         previous_nodes = previous_day_scores(items)
         return assign_all_regions(
@@ -483,20 +605,20 @@ def test_default_promotion_requires_two_distinct_days_and_ten_point_margin():
             datetime(2026, 7, 24, tzinfo=timezone.utc),
         )
 
-    regions, changes = run(80, 1)
+    regions, changes = run(80, 5)
     assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
     assert changes == []
 
-    regions, changes = run(69, 2)
+    regions, changes = run(74, 6)
     assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
     assert changes == []
 
-    regions, changes = run(70, 2)
+    regions, changes = run(75, 6)
     assert regions["united-states"]["stable_slots"]["1"] == "f"
     assert [change["reason"] for change in changes] == ["superior-candidate"]
 
 
-def test_degraded_rerank_fills_three_slots_and_keeps_rejected_nodes():
+def test_fallback_fills_only_affected_slots_and_keeps_rejected_nodes():
     items = [
         assessment("safe", 80, confidence="high", passes=3),
         assessment("risk-low", 70, decision="rejected", confidence="rejected"),
@@ -516,14 +638,16 @@ def test_degraded_rerank_fills_three_slots_and_keeps_rejected_nodes():
         3,
     )
 
-    assert slots == {"1": "safe", "2": "risk-low", "3": "risk-high"}
+    # A same-grade C fallback fills the mandatory vacancy but does not shuffle
+    # another still-usable C incumbent out of its fixed slot.
+    assert slots == {"1": "risk-high", "2": "safe", "3": "risk-low"}
     assert dynamic == ["offline"]
     assert set(rejected) == {"risk-low", "risk-high"}
 
 
 def test_all_rejected_nodes_fill_slots_by_risk_then_score():
     items = [
-        assessment("worst", 95, decision="rejected", confidence="rejected"),
+        assessment("worst", 30, decision="rejected", confidence="rejected"),
         assessment("best", 90, decision="rejected", confidence="rejected"),
         assessment("middle", 50, decision="rejected", confidence="rejected"),
     ]
@@ -549,7 +673,8 @@ def test_two_simultaneous_redlines_replace_only_their_slots_with_best_dynamic_no
         "maintenance", items, {"1": "a", "2": "b", "3": "c"}, 3
     )
 
-    assert slots == {"1": "d", "2": "e", "3": "c"}
+    # The best challenger repairs the weakest C incumbent first.
+    assert slots == {"1": "e", "2": "d", "3": "c"}
     assert dynamic == ["a", "b"]
     assert set(rejected) == {"a", "b"}
 
@@ -559,7 +684,14 @@ def test_promotion_requires_previous_day_margin_even_when_current_margin_is_larg
         assessment("a", 60, confidence="high", passes=3),
         assessment("b", 70, confidence="high", passes=3),
         assessment("c", 75, confidence="high", passes=3),
-        assessment("f", 90, confidence="high", passes=2),
+        assessment(
+            "f", 90, confidence="high", passes=2,
+            history=[
+                {"day": "2026-07-21", "score": 69, "evidence_valid": True},
+                {"day": "2026-07-22", "score": 90, "evidence_valid": True},
+                {"day": "2026-07-23", "score": 90, "evidence_valid": True},
+            ],
+        ),
     ]
     previous_slots = {"united-states": {"1": "a", "2": "b", "3": "c"}}
     previous_nodes = previous_day_scores(items)
@@ -582,7 +714,7 @@ def test_promotion_requires_previous_day_margin_even_when_current_margin_is_larg
     assert changes == []
 
 
-def test_rotated_stable_uses_fresh_score_against_two_day_challenger():
+def test_rotated_stable_uses_fresh_score_against_qualified_challenger():
     items = [
         assessment("a", 75, confidence="high", passes=3),
         assessment("b-new", 60, confidence="high", passes=1),
@@ -606,7 +738,7 @@ def test_rotated_stable_uses_fresh_score_against_two_day_challenger():
         ["united-states"],
         previous_nodes,
         PolicyConfig(),
-        {"united-states": "2026-07-20T00:00:00+00:00"},
+        {"united-states": "2026-07-01T00:00:00+00:00"},
         datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
 
@@ -622,7 +754,7 @@ def test_rotated_stable_uses_fresh_score_against_two_day_challenger():
     assert changes[0]["after_score"] == "80.00"
 
 
-def test_rotated_stable_quality_promotion_still_respects_two_day_cooldown():
+def test_rotated_stable_quality_promotion_still_respects_seven_day_cooldown():
     items = [
         assessment("a", 75, confidence="high", passes=3),
         assessment("b-new", 60, confidence="high", passes=1),
@@ -657,11 +789,11 @@ def test_rotated_stable_quality_promotion_still_respects_two_day_cooldown():
 @pytest.mark.parametrize(
     ("cooldown_at", "promotes"),
     [
-        ("2026-07-22T00:00:01+00:00", False),
-        ("2026-07-22T00:00:00+00:00", True),
+        ("2026-07-18T00:00:00+00:00", False),
+        ("2026-07-17T23:59:59+00:00", True),
     ],
 )
-def test_quality_promotion_cooldown_has_exact_two_day_boundary(cooldown_at, promotes):
+def test_quality_promotion_cooldown_has_exact_seven_day_boundary(cooldown_at, promotes):
     items = [
         assessment("a", 60, confidence="high", passes=3),
         assessment("b", 70, confidence="high", passes=3),
@@ -685,6 +817,29 @@ def test_quality_promotion_cooldown_has_exact_two_day_boundary(cooldown_at, prom
     assert bool(changes) is promotes
 
 
+def test_quality_promotion_cooldown_uses_configured_local_calendar_day():
+    items = [
+        assessment("a", 60, confidence="high", passes=3),
+        assessment("b", 70, confidence="high", passes=3),
+        assessment("c", 75, confidence="high", passes=3),
+        assessment("f", 90, confidence="high", passes=3),
+    ]
+    regions, changes = assign_all_regions(
+        "maintenance",
+        items,
+        {"united-states": {"1": "a", "2": "b", "3": "c"}},
+        3,
+        ["united-states"],
+        previous_day_scores(items),
+        PolicyConfig(),
+        {"united-states": "2026-07-25T00:30:00+14:00"},
+        datetime(2026, 7, 31, 23, tzinfo=ZoneInfo("America/Los_Angeles")),
+    )
+
+    assert regions["united-states"]["stable_slots"]["1"] == "f"
+    assert changes[0]["reason"] == "superior-candidate"
+
+
 def test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence():
     previous_slots = {
         "united-states": {"1": "a", "2": "b", "3": "c"}
@@ -703,7 +858,6 @@ def test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence(
 
     for weakest in (
         assessment("a", 50, confidence="high", passes=3, fresh_full_usable=False),
-        assessment("a", 50, confidence="provisional", passes=3),
     ):
         items = [
             weakest,
@@ -802,7 +956,7 @@ def test_redline_replacement_ignores_active_quality_promotion_cooldown():
         "2": "f",
         "3": "c",
     }
-    assert [change["reason"] for change in changes] == ["quality-redline"]
+    assert [change["reason"] for change in changes] == ["quality-severe"]
 
 
 def test_vacant_slot_fill_blocks_same_run_promotion_after_cooldown():

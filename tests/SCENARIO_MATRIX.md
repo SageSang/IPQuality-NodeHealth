@@ -28,30 +28,52 @@ health processing may reorder nodes but may not remove them.
 | ID | Scenario | Required result | Automated coverage |
 |---|---|---|---|
 | SL-01 | Three or more safe usable nodes, no redline | Preserve healthy fixed identities | `test_maintenance_preserves_healthy_slots_and_replaces_only_failed_slot` |
-| SL-02 | A fixed node hits a confirmed redline | Replace it immediately with the best safe dynamic node | `test_maintenance_quality_redline_replaces_only_one_slot` |
+| SL-02 | A fixed node becomes severe grade C and a better-grade candidate exists | Replace only that slot | `test_maintenance_quality_redline_replaces_only_one_slot` |
 | SL-03 | Two fixed nodes hit redlines together | Replace only those slots with the best two dynamic candidates | `test_two_simultaneous_redlines_replace_only_their_slots_with_best_dynamic_nodes` |
 | SL-04 | Redline occurs during an active quality-promotion cooldown | Risk replacement still executes immediately | `test_redline_replacement_ignores_active_quality_promotion_cooldown` |
-| SL-05 | Fixed node fails one or two consecutive quick-scan rounds | Preserve its slot and wait for recovery | `test_unavailable_stable_is_replaced_only_after_three_consecutive_failures`, `test_maintenance_keeps_temporarily_unavailable_stable_slot` |
-| SL-06 | Fixed node fails the third consecutive round | Replace it with the best candidate and move it to the regional tail | `test_three_consecutive_unavailable_runs_replace_stable_and_move_it_to_tail` |
-| SL-07 | Dynamic node reaches three failures | Sort it behind nodes with fewer consecutive failures | `test_three_failures_move_dynamic_node_behind_more_recent_failures` |
-| SL-08 | Any failed node becomes reachable | Reset its consecutive-failure counter to zero | `test_reachable_stable_node_resets_unavailable_counter`, `test_dynamic_unavailable_counter_is_consecutive_and_resets_on_recovery` |
-| SL-09 | Fewer than three safe nodes | Rerank the whole region by availability, risk, score, and latency; fill as many slots as possible | `test_degraded_rerank_fills_three_slots_and_keeps_rejected_nodes`, `test_three_failure_fallback_still_fills_slots_when_safe_nodes_are_insufficient` |
-| SL-10 | Every node is risky | Keep every node and put the least risky/highest-quality node first | `test_all_rejected_nodes_fill_slots_by_risk_then_score` |
-| SL-11 | Every node is unavailable | Still publish and fill slots from the complete regional inventory | `test_first_rebuild_publishes_even_when_all_nodes_are_unavailable` |
-| SL-12 | Region contains 0, 1, 2, or 3 total nodes | Create exactly `min(3, total)` unique slots and lose no node | `test_region_with_fewer_than_three_nodes_uses_every_node_once` |
+| SL-05 | Fixed node with fewer than six healthy days is confirmed unavailable after delayed retries | Replace it that day | `test_unavailable_stable_uses_one_day_grace_only_after_six_healthy_days` |
+| SL-06 | Fixed node with at least six healthy days has its first confirmed unavailable day | Preserve its slot, clear the streak, and activate one grace day | `test_maintenance_keeps_temporarily_unavailable_stable_slot` |
+| SL-07 | Grace-protected node is still unavailable on the next valid day | Replace it and return it to the ordinary dynamic tail | `test_protected_stable_is_replaced_on_second_valid_unavailable_day` |
+| SL-08 | Grace-protected node recovers on the next valid day | Keep its slot and restart the healthy streak at day one | `test_protected_stable_recovery_keeps_slot_and_restarts_at_day_one` |
+| SL-09 | A failed node is replaced and later recovers | Give it no original-slot or special fourth/fifth-position rights | `test_replaced_node_recovers_without_original_slot_rights`, `test_unavailable_dynamic_nodes_do_not_keep_special_demotion_positions` |
+| SL-10 | Every node is risky | Keep every node and compare risk before total score inside grade C | `test_all_rejected_nodes_fill_slots_by_risk_then_score`, `test_c_grade_fallback_prefers_lower_risk_before_total_score` |
+| SL-11 | A/B candidates are insufficient but usable C nodes remain | Fill only affected slots with the lowest-risk usable C nodes; do not rerank the whole fixed set | `test_fallback_fills_only_affected_slots_and_keeps_rejected_nodes` |
+| SL-12 | First run has no usable node | Publish no erroneous `current.json` | `test_first_rebuild_all_unavailable_aborts_without_publishing` |
 | SL-13 | Node disappears from the authoritative inventory | Remove it immediately and fill the vacancy if possible | `test_missing_inventory_node_is_immediately_replaced`, `test_missing_entire_region_releases_absent_slots_in_maintenance` |
+| SL-14 | Initial failure recovers during delayed retry | Keep it usable, mark transient recovery, cap the success component, and pause the streak | `test_initial_unavailable_node_retries_and_transient_recovery_pauses_streak` |
+| SL-15 | Global or regional availability collapses below the configured 20%/60% threshold | Freeze slots, order, counters, grace, history, and baselines | `test_global_all_unavailable_freezes_slots_order_and_counters`, `test_availability_collapse_threshold_freezes_without_all_nodes_failing` |
+| SL-16 | A prior fixed-slot map already contains an empty slot | Deep-audit every usable regional candidate before filling it | `test_existing_vacant_slot_full_audits_every_available_candidate` |
+| SL-17 | Several healthy C slots have fewer fresh A/B challengers | Replace the riskiest C incumbents first and only one slot per challenger; never retain Tor while evicting a lower-risk C | `test_one_fresh_challenger_replaces_only_one_of_multiple_c_slots`, `test_fresh_challenger_replaces_the_riskiest_c_incumbent_first` |
+| SL-18 | Availability protection freezes a region | Preserve trusted AI/score state and rejected membership; store current failure only as a frozen observation | `test_outage_freeze_preserves_trusted_ai_and_score_state`, `test_outage_freeze_preserves_rejected_membership_and_runtime_version` |
 
 ## Quality promotion and cooldown
 
 | ID | Scenario | Required result | Automated coverage |
 |---|---|---|---|
-| PR-01 | Candidate leads by at least 10 points today and yesterday and has two distinct-day passes | Promote at most one candidate | `test_default_promotion_requires_two_distinct_days_and_ten_point_margin` |
-| PR-02 | Current margin is sufficient but previous-day margin is below 10 | Do not promote | `test_promotion_requires_previous_day_margin_even_when_current_margin_is_large` |
+| PR-01 | Candidate has six healthy days and leads by at least 15 points on each of the latest three valid days | Promote at most one candidate | `test_default_promotion_requires_six_healthy_days_and_three_day_fifteen_point_margin` |
+| PR-02 | Any of the three daily margins is insufficient | Do not promote | `test_promotion_requires_previous_day_margin_even_when_current_margin_is_large` |
 | PR-03 | Same-day maintenance is run repeatedly | Do not increment the distinct-day pass count | `test_full_passes_count_distinct_calendar_days_not_same_day_reruns` |
 | PR-04 | Candidate or compared stable node lacks fresh, high-confidence evidence | Do not promote | `test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence`, `test_promotion_requires_fresh_usable_evidence_from_the_candidate` |
-| PR-05 | Quality-promotion cooldown is just under or exactly two days | Block just under two days; allow at the exact boundary | `test_quality_promotion_cooldown_has_exact_two_day_boundary` |
+| PR-05 | Quality-promotion cooldown is just under or exactly seven configured-timezone calendar days | Block just under seven days; allow at the exact local-day boundary | `test_quality_promotion_cooldown_has_exact_seven_day_boundary`, `test_quality_promotion_cooldown_uses_configured_local_calendar_day` |
 | PR-06 | Redline, failure replacement, disappearance, degraded fill, or rebuild changes a slot | Do not start or reset quality-promotion cooldown | `test_only_quality_promotion_starts_or_resets_promotion_cooldown` |
-| PR-07 | A normal superior-candidate promotion occurs | Start/reset that region's two-day quality-promotion cooldown | `test_only_quality_promotion_starts_or_resets_promotion_cooldown` |
+| PR-07 | A normal superior-candidate promotion occurs | Start/reset that region's seven-day quality-promotion cooldown | `test_only_quality_promotion_starts_or_resets_promotion_cooldown` |
+| PR-08 | A required vacancy/failure replacement occurred first in the region | Skip ordinary promotion in that run | `test_vacant_slot_fill_blocks_same_run_promotion_after_cooldown` |
+
+## Quality, Claude, and audit coverage
+
+| ID | Scenario | Required result | Automated coverage |
+|---|---|---|---|
+| QA-01 | A higher-score/lower-latency B node competes with an A node | Grade A ranks first | `test_grade_precedes_score_and_latency_in_ranking` |
+| QA-02 | Residential evidence is confirmed, probable, auxiliary-only, or conflicts with Hosting | Award 10, 5, or 0 points according to the evidence rules | `test_residential_evidence_levels` |
+| QA-03 | Risk coverage is insufficient, Tor/DNSBL/high-risk consensus is severe, or crawler is the only signal | Cap insufficient evidence, grade confirmed severe evidence C, and treat crawler as a small penalty only | `test_unknown_risk_values_do_not_count_as_coverage_or_full_score`, `test_dnsbl_requires_multiple_listings_for_a_confirmed_redline`, `test_three_source_proxy_consensus_is_risk_c`, `test_crawler_only_is_a_small_penalty_but_not_a_risk_downgrade` |
+| QA-04 | Claude uses a dedicated egress | Keep trace country authoritative for service support, record provider country separately, score routes independently, and pause quality evidence when the two country sources conflict | `test_claude_split_route_collects_two_source_risk_intelligence`, `test_claude_trace_country_is_not_overwritten_by_risk_provider_country`, `test_claude_route_evidence_does_not_fill_generic_risk_coverage`, `test_high_risk_and_factor_consensus_do_not_cross_egress_routes`, `test_two_high_risk_sources_on_claude_route_are_risk_c`, `test_claude_country_conflict_pauses_quality_evidence` |
+| QA-05 | Claude is supported, restricted, partially reachable, unreachable, rate-limited, or times out | Produce `available`, `restricted`, `degraded`, `unreachable`, or `unknown` deterministically and reject HTTP errors as successful reachability | `test_claude_status_classification`, `test_quick_http_get_rejects_http_error_responses` |
+| QA-06 | At least five distinct supported service egresses exist and 80% fail or degrade on the same AI service | Deduplicate aliases by ChatGPT/Claude egress, reject a zero threshold, retain trusted AI evidence, and use same-egress historical country only when current country is missing | `test_ai_service_outage_preserves_previous_ai_grade_and_blocks_history_growth`, `test_ai_service_outage_guard_requires_minimum_sample`, `test_ai_service_outage_guard_deduplicates_shared_service_egresses`, `test_ai_outage_country_fallback_requires_same_exit_ip`, `test_chatgpt_outage_denominator_excludes_unsupported_exit_countries`, `test_claude_degraded_fleet_triggers_service_outage_guard`, `test_ai_service_failure_ratio_must_be_positive` |
+| QA-07 | Stable slots and top challengers need daily evidence while the remainder rotates | Audit all fixed slots plus three challengers daily, force any Claude-route change including empty-to-known, and cover the rest within two days at the default 50% rate | `test_default_audit_plan_checks_three_challengers_daily_and_covers_pool_in_two_days`, `test_newly_observed_claude_route_forces_a_full_audit` |
+| QA-08 | A prior risk result conflicts across sources | Force a fresh full audit outside the normal rotation | `test_risk_conflict_forces_full_audit_outside_rotation` |
+| QA-09 | A pre-upgrade schema-v2 state lacks all new fields | Preserve slots and initialize the new state incrementally | `test_legacy_v2_state_keeps_slots_and_initializes_new_history_incrementally` |
+| QA-10 | A temporary subscription audit sees a transient node failure or fleet-wide AI failure | Reuse delayed quick retries and the distinct-egress AI outage guard without changing production ranking state | `test_subscription_audit_retries_transient_quick_failure`, `test_subscription_audit_applies_ai_service_outage_guard` |
+| QA-11 | A split Claude route has no current country | Reuse only the country from the same historical Claude egress; never borrow a different generic egress country | `test_claude_outage_country_fallback_is_scoped_to_claude_egress` |
 
 ## Frozen `other` ordering
 
@@ -74,6 +96,10 @@ health processing may reorder nodes but may not remove them.
 | OUT-05 | Connection keys rotate while current ranking is stale | Resolve safe logical identities and keep their prior order | `testLogicalIdentityKeepsRankingAcrossConnectionRotation` |
 | OUT-06 | Public ranking is served | Publish schema v2 and non-secret `identity_index`; do not expose credentials or private node results | `test_http_endpoints_and_token` |
 | OUT-07 | OpenWrt/local-socks sees aliases sharing one connection | Preserve all aliases and assign distinct listeners | `testDuplicateNodeAliasesAreAllPreserved` |
+| OUT-08 | Reports disable exit-IP output | Remove generic, Claude, full-audit, evidence, regional-status, and free-form error-string IPs from JSON and Markdown | `test_report_exit_ip_redaction_covers_nested_claude_full_and_region_fields`, `test_exit_ip_redaction_removes_literals_embedded_in_error_strings` |
+| OUT-09 | Only a rejected-node reason string changes | Keep the runtime version stable; change it only when rejected membership or actual ordering changes | `test_runtime_version_ignores_rejected_reason_text_but_tracks_membership` |
+| OUT-10 | A report contains Claude-route risk or country-conflict reasons | Render Chinese labels instead of exposing internal reason codes | `test_claude_risk_reasons_have_chinese_report_labels` |
+| OUT-11 | Runtime order is unchanged across scans or current commit fails | Give every scan a unique state revision/archive and let old current select only its committed snapshot | `test_same_runtime_version_failed_commit_cannot_advance_state`, `test_each_scheduled_run_has_an_immutable_versioned_archive` |
 
 ## Deployment gates
 

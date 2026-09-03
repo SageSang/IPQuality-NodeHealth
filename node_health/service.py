@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .config import AppConfig
 from .audit import (
@@ -25,11 +28,16 @@ from .inventory import (
     inventory_digest,
     parse_clash_inventory,
 )
-from .models import Evaluation, FullResult, Node, NodeAssessment, QuickResult
+from .models import ClaudeResult, Evaluation, FullResult, Node, NodeAssessment, QuickResult
 from .policy import (
+    GRADE_ORDER,
+    chatgpt_explicitly_allowed,
+    chatgpt_is_redline,
+    chatgpt_status,
     evaluate_node,
     full_has_confirmed_redline,
     full_has_usable_reputation,
+    risk_sources_conflict,
     select_full_audit_nodes,
 )
 from .probe import (
@@ -56,6 +64,10 @@ class ScanStartError(RuntimeError):
     pass
 
 
+class NoPublishSafetyAbort(RuntimeError):
+    """The run detected an unsafe first-run outage and kept public output intact."""
+
+
 def _full_from_dict(value: Any) -> FullResult | None:
     if not isinstance(value, dict):
         return None
@@ -80,6 +92,67 @@ def _full_from_dict(value: Any) -> FullResult | None:
         return result
     except TypeError:
         return None
+
+
+def _chatgpt_detail(details: dict[str, Any]) -> Any:
+    media = details.get("Media")
+    if not isinstance(media, dict):
+        media = details.get("media")
+    if not isinstance(media, dict):
+        return None
+    return next(
+        (value for key, value in media.items() if str(key).lower() == "chatgpt"),
+        None,
+    )
+
+
+def _merge_full_with_cached_chatgpt(
+    fresh: FullResult,
+    prior: FullResult | None,
+) -> FullResult:
+    """Keep fresh risk/geo evidence without caching a fleet-wide AI anomaly."""
+    merged = copy.deepcopy(fresh)
+    if not isinstance(merged.details, dict):
+        merged.details = {}
+    media_key = next(
+        (key for key in merged.details if str(key).lower() == "media"),
+        "Media",
+    )
+    media = merged.details.get(media_key)
+    if not isinstance(media, dict):
+        media = {}
+        merged.details[media_key] = media
+    for key in list(media):
+        if str(key).lower() == "chatgpt":
+            del media[key]
+    prior_chatgpt = (
+        _chatgpt_detail(prior.details)
+        if prior is not None and isinstance(prior.details, dict)
+        else None
+    )
+    if prior_chatgpt is not None:
+        media["ChatGPT"] = copy.deepcopy(prior_chatgpt)
+    return merged
+
+
+def _claude_from_dict(value: Any) -> ClaudeResult:
+    if not isinstance(value, dict):
+        return ClaudeResult()
+    allowed = set(ClaudeResult.__dataclass_fields__)
+    try:
+        return ClaudeResult(**{key: item for key, item in value.items() if key in allowed})
+    except TypeError:
+        return ClaudeResult()
+
+
+def _previous_ranked_order(state: dict[str, Any]) -> dict[str, list[str]]:
+    value = state.get("ranked_order")
+    if isinstance(value, dict):
+        return {
+            str(region): [str(key) for key in keys]
+            for region, keys in value.items() if isinstance(keys, list)
+        }
+    return {}
 
 
 def _all_stable_keys(state: dict[str, Any]) -> set[str]:
@@ -147,6 +220,7 @@ class NodeHealthService:
         audit_downloader: Callable[[str, float, int], bytes] | None = None,
         store: StateStore | None = None,
         clock: Callable[[], datetime] | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ):
         self.config = config
         self.downloader = downloader
@@ -156,6 +230,7 @@ class NodeHealthService:
         self.audit_downloader = audit_downloader or download_subscription
         self.store = store or StateStore(config)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.sleeper = sleeper or time.sleep
         self._run_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._running_mode = ""
@@ -460,19 +535,14 @@ class NodeHealthService:
             return update
 
         with self.environment.open(nodes) as ports:
-            quick_raw = run_parallel(
+            quick_results = self._run_quick_with_retries(
                 nodes,
                 ports,
-                self.quick_probe,
-                self.config.probe.concurrency,
-                "quick",
                 audit_progress_callback("quick-scan", len(nodes)),
             )
-            quick_results = {
-                key: value for key, value in quick_raw.items() if isinstance(value, QuickResult)
-            }
-            if len(quick_results) != len(nodes):
-                raise RuntimeError("quick audit did not return one result for every node")
+            ai_service_outages = self._apply_ai_service_outage_guard(
+                nodes, quick_results
+            )
             available_nodes = [node for node in nodes if quick_results[node.key].available]
             full_extra = {
                 "quick_completed": len(nodes),
@@ -566,6 +636,10 @@ class NodeHealthService:
                 "completed_at": completed_at,
             }
         )
+        current["outage_protection"] = {
+            "regions": {},
+            "ai_services": ai_service_outages,
+        }
         current["source"].update(initial_status["source"])
         publishing_progress = self._set_progress(
             "publishing", len(nodes), len(nodes), len(nodes)
@@ -586,10 +660,15 @@ class NodeHealthService:
             ),
             "eligible": sum(1 for item in assessments if item.evaluation.eligible),
             "rejected": sum(1 for item in assessments if item.evaluation.redline),
+            "ai_service_outages": sorted(ai_service_outages),
         }
         outcome = (
             "completed"
-            if not summary["unavailable"] and not summary["full_incomplete"]
+            if (
+                not summary["unavailable"]
+                and not summary["full_incomplete"]
+                and not summary["ai_service_outages"]
+            )
             else "completed_with_warnings"
         )
         return self.store.update_audit_status(
@@ -626,6 +705,253 @@ class NodeHealthService:
                     f"{result.audited_exit_ip} != {expected_ip}"
                 )
 
+    def _run_quick_with_retries(
+        self,
+        nodes: list[Node],
+        ports: dict[str, int],
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> dict[str, QuickResult]:
+        quick_raw = run_parallel(
+            nodes,
+            ports,
+            self.quick_probe,
+            self.config.probe.concurrency,
+            "quick",
+            progress_callback
+            or self._scan_progress_callback("quick-scan", len(nodes)),
+        )
+        results = {
+            key: value for key, value in quick_raw.items() if isinstance(value, QuickResult)
+        }
+        if len(results) != len(nodes):
+            raise RuntimeError("quick scan did not return one result for every inventory node")
+        initially_failed = {node.key for node in nodes if not results[node.key].available}
+        pending = set(initially_failed)
+        retry_errors = {key: [results[key].error] for key in pending}
+        attempts = {key: 0 for key in pending}
+        for delay in self.config.probe.unavailable_retry_delays_seconds:
+            if not pending:
+                break
+            self.sleeper(float(delay))
+            retry_nodes = [node for node in nodes if node.key in pending]
+            retry_raw = run_parallel(
+                retry_nodes,
+                ports,
+                self.quick_probe,
+                self.config.probe.concurrency,
+                "quick",
+            )
+            for node in retry_nodes:
+                attempts[node.key] += 1
+                value = retry_raw.get(node.key)
+                if not isinstance(value, QuickResult):
+                    continue
+                retry_errors[node.key].append(value.error)
+                if value.available:
+                    value.transient_recovery = True
+                    value.retry_count = attempts[node.key]
+                    results[node.key] = value
+                    pending.remove(node.key)
+                else:
+                    value.retry_count = attempts[node.key]
+                    results[node.key] = value
+        for key in initially_failed:
+            results[key].retry_count = attempts.get(key, 0)
+            errors = [value for value in retry_errors.get(key, []) if value]
+            if errors:
+                results[key].error = "; ".join(errors)[-1000:]
+        return results
+
+    def _apply_ai_service_outage_guard(
+        self,
+        nodes: list[Node],
+        results: dict[str, QuickResult],
+        previous: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        healthy = [node for node in nodes if results[node.key].available]
+        threshold = self.config.policy.claude_service_failure_ratio
+        minimum_egresses = self.config.policy.ai_service_outage_min_egresses
+        prior_nodes = (previous or {}).get("nodes", {})
+
+        def observed_country(node: Node) -> str:
+            result = results[node.key]
+            current = str(result.country or "").upper()
+            if current:
+                return current
+            prior = prior_nodes.get(node.key, {})
+            if (
+                result.exit_ip
+                and str(prior.get("last_exit_ip") or "") == result.exit_ip
+            ):
+                return str(prior.get("last_country") or "").upper()
+            return ""
+
+        def claude_observed_country(node: Node) -> str:
+            result = results[node.key]
+            current = str(result.claude.country or "").upper()
+            if current:
+                return current
+            claude_exit = str(result.claude.exit_ip or "")
+            if claude_exit:
+                prior_claude = _claude_from_dict(
+                    prior_nodes.get(node.key, {}).get("last_claude")
+                )
+                if prior_claude.exit_ip == claude_exit and prior_claude.country:
+                    return str(prior_claude.country).upper()
+                if claude_exit != result.exit_ip:
+                    return ""
+            return observed_country(node)
+
+        def group_by_egress(
+            scoped_nodes: list[Node], service: str
+        ) -> dict[str, list[Node]]:
+            grouped: dict[str, list[Node]] = {}
+            for node in scoped_nodes:
+                result = results[node.key]
+                egress = (
+                    result.claude.exit_ip or result.exit_ip
+                    if service == "claude"
+                    else result.exit_ip
+                )
+                egress = str(egress or "").strip().lower()
+                if egress:
+                    grouped.setdefault(egress, []).append(node)
+            return grouped
+
+        status: dict[str, Any] = {}
+        if healthy:
+            chatgpt_countries = set(self.config.probe.chatgpt_supported_countries)
+            chatgpt_supported = [
+                node
+                for node in healthy
+                if observed_country(node) in chatgpt_countries
+            ]
+            chatgpt_routes = group_by_egress(chatgpt_supported, "chatgpt")
+            chatgpt_failed = [
+                route
+                for route, route_nodes in chatgpt_routes.items()
+                if all(results[node.key].chatgpt_ok is False for node in route_nodes)
+            ]
+            ratio = (
+                len(chatgpt_failed) / len(chatgpt_routes)
+                if chatgpt_routes
+                else 0.0
+            )
+            if len(chatgpt_routes) >= minimum_egresses and ratio >= threshold:
+                for node in chatgpt_supported:
+                    results[node.key].chatgpt_service_outage = True
+                status["chatgpt"] = {
+                    "active": True,
+                    "failure_ratio": round(ratio, 4),
+                    "sample_size": len(chatgpt_routes),
+                    "node_count": len(chatgpt_supported),
+                }
+
+            supported_countries = set(self.config.probe.claude_supported_countries)
+            supported = [
+                node
+                for node in healthy
+                if (
+                    results[node.key].claude.supported is True
+                    or (
+                        results[node.key].claude.supported is None
+                        and claude_observed_country(node) in supported_countries
+                    )
+                )
+            ]
+            claude_routes = group_by_egress(supported, "claude")
+            if len(claude_routes) >= minimum_egresses:
+                claude_failed = [
+                    route
+                    for route, route_nodes in claude_routes.items()
+                    if all(
+                        results[node.key].claude.status
+                        in {"degraded", "unreachable", "unknown"}
+                        for node in route_nodes
+                    )
+                ]
+                ratio = len(claude_failed) / len(claude_routes)
+                if ratio >= threshold:
+                    for node in supported:
+                        results[node.key].claude.service_outage = True
+                        results[node.key].claude.status = "unknown"
+                    status["claude"] = {
+                        "active": True,
+                        "failure_ratio": round(ratio, 4),
+                        "sample_size": len(claude_routes),
+                        "node_count": len(supported),
+                    }
+        diagnose = getattr(self.quick_probe, "diagnose_ai_service", None)
+        if callable(diagnose):
+            for service in list(status):
+                try:
+                    status[service]["diagnostics"] = diagnose(service)
+                except Exception as error:
+                    status[service]["diagnostics"] = {
+                        "diagnostic_only": True,
+                        "error": str(error)[:500],
+                    }
+        return status
+
+    def _detect_outage_freezes(
+        self,
+        nodes: list[Node],
+        quick_results: dict[str, QuickResult],
+        previous: dict[str, Any],
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        by_region: dict[str, list[Node]] = {}
+        for node in nodes:
+            by_region.setdefault(node.region, []).append(node)
+        baselines = previous.get("availability_baselines", {})
+        if not isinstance(baselines, dict):
+            baselines = {}
+        frozen: dict[str, str] = {}
+        diagnostics: dict[str, Any] = {}
+
+        def inspect(scope: str, scoped_nodes: list[Node]) -> None:
+            if not scoped_nodes:
+                return
+            current_keys = {node.key for node in scoped_nodes}
+            available = sum(1 for node in scoped_nodes if quick_results[node.key].available)
+            current_ratio = available / len(scoped_nodes)
+            prior = baselines.get(scope, {}) if isinstance(baselines.get(scope), dict) else {}
+            prior_keys = {str(key) for key in prior.get("node_keys", [])}
+            overlap = len(current_keys & prior_keys) / len(current_keys) if current_keys else 0.0
+            try:
+                previous_ratio = float(prior.get("available_ratio"))
+            except (TypeError, ValueError):
+                previous_ratio = -1.0
+            reason = ""
+            if available == 0:
+                reason = "all-nodes-unavailable"
+            elif (
+                len(scoped_nodes) >= self.config.policy.mass_outage_min_nodes
+                and overlap >= self.config.policy.mass_outage_min_identity_overlap
+                and previous_ratio >= 0
+                and current_ratio < self.config.policy.mass_outage_current_ratio
+                and previous_ratio - current_ratio >= self.config.policy.mass_outage_drop_ratio
+            ):
+                reason = "availability-collapse"
+            diagnostics[scope] = {
+                "nodes": len(scoped_nodes),
+                "available": available,
+                "available_ratio": round(current_ratio, 4),
+                "previous_available_ratio": None if previous_ratio < 0 else previous_ratio,
+                "identity_overlap": round(overlap, 4),
+                "frozen": bool(reason),
+                "reason": reason or None,
+            }
+            if reason:
+                frozen[scope] = reason
+
+        inspect("__global__", nodes)
+        for region, region_nodes in by_region.items():
+            inspect(region, region_nodes)
+        if "__global__" in frozen:
+            for region in by_region:
+                frozen[region] = "global-" + frozen["__global__"]
+        return frozen, diagnostics
+
     def _run_locked(self, requested_mode: str) -> dict[str, Any]:
         started_at = self.clock()
         if started_at.tzinfo is None:
@@ -650,21 +976,17 @@ class NodeHealthService:
 
         with self.environment.open(nodes) as ports:
             self._set_progress("quick-scan", 0, len(nodes), len(nodes))
-            quick_raw = run_parallel(
-                nodes,
-                ports,
-                self.quick_probe,
-                self.config.probe.concurrency,
-                "quick",
-                self._scan_progress_callback("quick-scan", len(nodes)),
+            quick_results = self._run_quick_with_retries(nodes, ports)
+            ai_service_outages = self._apply_ai_service_outage_guard(
+                nodes, quick_results, previous
             )
-            quick_results = {key: value for key, value in quick_raw.items() if isinstance(value, QuickResult)}
-            if len(quick_results) != len(nodes):
-                raise RuntimeError("quick scan did not return one result for every inventory node")
-            # Availability is a node property, not a publication guard. A
-            # country (or even the whole inventory) may temporarily have no
-            # reachable nodes; those nodes are retained at the ranking tail or
-            # preserved in existing stable slots.
+            frozen_regions, outage_diagnostics = self._detect_outage_freezes(
+                nodes, quick_results, previous
+            )
+            if "__global__" in frozen_regions and not _has_usable_slots(previous):
+                raise NoPublishSafetyAbort(
+                    "all nodes are unavailable on the first run; existing public output was preserved"
+                )
 
             selected = select_full_audit_nodes(
                 effective_mode,
@@ -683,6 +1005,39 @@ class NodeHealthService:
                 for event in identity_events
                 if event.get("after") in quick_results
             )
+            prior_nodes = previous.get("nodes", {})
+            previous_slots = previous.get("stable_slots", {})
+            fixed_regions = {
+                node.region for node in nodes if node.region != "other"
+            } | set(previous_slots)
+            for region in fixed_regions:
+                slots = previous_slots.get(region, {})
+                if region in frozen_regions or not isinstance(slots, dict):
+                    continue
+                needs_replacement_evidence = any(
+                    not slots.get(str(index))
+                    for index in range(1, self.config.policy.stable_slots + 1)
+                )
+                for key in slots.values():
+                    key = str(key)
+                    quick = quick_results.get(key)
+                    prior = prior_nodes.get(key, {}) if isinstance(prior_nodes, dict) else {}
+                    if quick is None:
+                        needs_replacement_evidence = True
+                        break
+                    if quick.available:
+                        continue
+                    if prior.get("unavailable_grace_active"):
+                        needs_replacement_evidence = True
+                        break
+                    if int(prior.get("healthy_streak_days", 0) or 0) < self.config.policy.stable_protection_min_healthy_days:
+                        needs_replacement_evidence = True
+                        break
+                if needs_replacement_evidence:
+                    selected.update(
+                        node.key for node in nodes
+                        if node.region == region and quick_results[node.key].available
+                    )
             selected_nodes = [node for node in nodes if node.key in selected]
             self._set_progress("full-scan", 0, len(selected_nodes), len(nodes))
             full_raw = run_parallel(
@@ -717,6 +1072,8 @@ class NodeHealthService:
             quick_results,
             scanned_full,
             previous,
+            started_at,
+            frozen_regions,
         )
         regions, changes = assign_all_regions(
             effective_mode,
@@ -727,13 +1084,17 @@ class NodeHealthService:
             previous.get("nodes", {}),
             self.config.policy,
             previous.get("promotion_cooldown_at", {}),
-            started_at,
+            started_at.astimezone(ZoneInfo(self.config.schedule.timezone)),
             previous.get("frozen_order", {}),
+            frozen_regions,
+            _previous_ranked_order(previous),
+            previous.get("rejected_by_region", {}),
         )
         generated_at = self.clock()
         if generated_at.tzinfo is None:
             generated_at = generated_at.replace(tzinfo=timezone.utc)
-        iso_time = generated_at.astimezone().isoformat(timespec="seconds")
+        configured_timezone = ZoneInfo(self.config.schedule.timezone)
+        iso_time = generated_at.astimezone(configured_timezone).isoformat(timespec="seconds")
         version = self._runtime_version(source_digest, regions)
 
         current = self._build_current(
@@ -748,8 +1109,12 @@ class NodeHealthService:
             previous,
             identity_events,
         )
+        current["outage_protection"] = {
+            "regions": outage_diagnostics,
+            "ai_services": ai_service_outages,
+        }
         state = self._build_state(current, previous, assessments, regions, changes)
-        self.store.publish(current, state, assessments, changes, generated_at.astimezone())
+        self.store.publish(current, state, assessments, changes, generated_at.astimezone(configured_timezone))
         return current
 
     @staticmethod
@@ -768,7 +1133,7 @@ class NodeHealthService:
                 region: {
                     "stable_slots": payload.get("stable_slots", {}),
                     "ranked": payload.get("ranked", []),
-                    "rejected": payload.get("rejected", {}),
+                    "rejected": sorted(payload.get("rejected", {})),
                 }
                 for region, payload in sorted(regions.items())
             },
@@ -782,10 +1147,17 @@ class NodeHealthService:
         quick_results: dict[str, QuickResult],
         scanned_full: dict[str, FullResult],
         previous: dict[str, Any],
+        run_at: datetime | None = None,
+        frozen_regions: dict[str, str] | None = None,
     ) -> list[NodeAssessment]:
         prior_nodes = previous.get("nodes", {})
         stable_keys = _all_stable_keys(previous)
         stable_regions = _stable_region_by_key(previous)
+        frozen_regions = frozen_regions or {}
+        run_at = run_at or self.clock()
+        if run_at.tzinfo is None:
+            run_at = run_at.replace(tzinfo=timezone.utc)
+        current_day = run_at.astimezone(ZoneInfo(self.config.schedule.timezone)).date().isoformat()
         assessments: list[NodeAssessment] = []
         for node in nodes:
             if node.key in stable_regions and node.region != stable_regions[node.key]:
@@ -801,6 +1173,30 @@ class NodeHealthService:
                 )
             quick = quick_results[node.key]
             prior = prior_nodes.get(node.key, {})
+            prior_claude = _claude_from_dict(prior.get("last_claude"))
+            if quick.claude.service_outage and prior_claude.status != "unknown":
+                quick.claude = prior_claude
+                quick.claude.service_outage = True
+            elif (
+                quick.claude.exit_ip
+                and quick.claude.exit_ip != quick.exit_ip
+                and not quick.claude.intelligence_complete
+                and prior_claude.exit_ip == quick.claude.exit_ip
+                and prior_claude.intelligence_complete
+            ):
+                quick.claude.asn = prior_claude.asn
+                quick.claude.organization = prior_claude.organization
+                quick.claude.intelligence_country = prior_claude.intelligence_country
+                quick.claude.risk_sources = dict(prior_claude.risk_sources)
+                quick.claude.factors = dict(prior_claude.factors)
+                quick.claude.residential = prior_claude.residential
+                quick.claude.intelligence_complete = True
+                quick.claude.intelligence_cached = True
+            if quick.chatgpt_service_outage:
+                quick.chatgpt_ok = None
+            if quick.claude.exit_ip:
+                previous_claude_ip = str(prior_claude.exit_ip or "")
+                quick.claude.route_stable = not previous_claude_ip or previous_claude_ip == quick.claude.exit_ip
             prior_full = _full_from_dict(prior.get("last_full"))
             prior_full_exit_ip = str(
                 prior.get("last_full_exit_ip")
@@ -821,7 +1217,7 @@ class NodeHealthService:
             # ambiguous completed response (for example ChatGPT=Failed or
             # empty risk sources) cannot wash it away. Only a new trustworthy
             # clean result, or another confirmed redline, supersedes it.
-            fresh_is_trustworthy = bool(
+            fresh_risk_is_trustworthy = bool(
                 fresh_full
                 and fresh_full.completed
                 and (
@@ -829,23 +1225,41 @@ class NodeHealthService:
                     or full_has_confirmed_redline(fresh_full, self.config.policy)
                 )
             )
-            prior_redline_latched = bool(
-                safe_prior_full
-                and full_has_confirmed_redline(safe_prior_full, self.config.policy)
+            fresh_chatgpt_is_trustworthy = bool(
+                fresh_full
+                and fresh_full.completed
+                and not quick.chatgpt_service_outage
+                and (
+                    chatgpt_explicitly_allowed(fresh_full)
+                    or chatgpt_is_redline(chatgpt_status(fresh_full.details))
+                )
+            )
+            fresh_is_trustworthy = bool(
+                fresh_risk_is_trustworthy and fresh_chatgpt_is_trustworthy
             )
             if fresh_full and fresh_full.completed:
-                full = (
-                    safe_prior_full
-                    if prior_redline_latched and not fresh_is_trustworthy
-                    else fresh_full
-                )
+                # A completed response can still be unusable evidence (for
+                # example one AI endpoint failed, or too few risk sources
+                # answered). Keep the last result that was actually trusted
+                # for scoring and slot decisions until fresh trustworthy
+                # evidence supersedes it.
+                if fresh_is_trustworthy:
+                    full = fresh_full
+                elif fresh_risk_is_trustworthy and not full_has_confirmed_redline(
+                    safe_prior_full, self.config.policy
+                ):
+                    full = _merge_full_with_cached_chatgpt(
+                        fresh_full, safe_prior_full
+                    )
+                else:
+                    full = safe_prior_full
             else:
                 full = safe_prior_full
             if full is None and fresh_full is not None:
                 full = fresh_full
 
             passes = int(prior.get("consecutive_full_passes", 0) or 0)
-            if full_has_usable_reputation(fresh_full, self.config.policy):
+            if fresh_is_trustworthy and not full_has_confirmed_redline(fresh_full, self.config.policy):
                 fresh_pass_day = str(fresh_full.checked_at or "")[:10]
                 prior_pass_day = str(prior.get("last_full_pass_day") or "")
                 if (
@@ -859,7 +1273,10 @@ class NodeHealthService:
                     passes = max(1, passes)
                 else:
                     passes = 1
-            elif fresh_full is not None:
+            elif fresh_full is not None and not (
+                fresh_risk_is_trustworthy
+                and (quick.chatgpt_service_outage or quick.claude.service_outage)
+            ):
                 passes = 0
 
             unavailable_runs = 0
@@ -867,6 +1284,96 @@ class NodeHealthService:
                 unavailable_runs = int(
                     prior.get("consecutive_unavailable_runs", 0) or 0
                 ) + 1
+
+            frozen = node.region in frozen_regions
+            if frozen:
+                passes = int(prior.get("consecutive_full_passes", 0) or 0)
+            prior_streak = int(prior.get("healthy_streak_days", 0) or 0)
+            prior_last_healthy_day = str(prior.get("last_healthy_day") or "")
+            prior_unavailable_days = int(prior.get("consecutive_unavailable_valid_days", 0) or 0)
+            prior_last_unavailable_day = str(prior.get("last_unavailable_day") or "")
+            healthy_streak = prior_streak
+            last_healthy_day = prior_last_healthy_day
+            unavailable_days = prior_unavailable_days
+            last_unavailable_day = prior_last_unavailable_day
+            grace_active = bool(prior.get("unavailable_grace_active"))
+
+            preliminary = evaluate_node(
+                node,
+                quick,
+                full,
+                self.config.policy,
+                passes,
+                previous_exit_ip=str(prior.get("last_exit_ip") or ""),
+                was_stable=node.key in stable_keys,
+                healthy_streak_days=prior_streak,
+            )
+            evidence_valid = bool(
+                quick.available
+                and not quick.transient_recovery
+                and fresh_full
+                and fresh_full.completed
+                and fresh_is_trustworthy
+                and not quick.chatgpt_service_outage
+                and not quick.claude.service_outage
+                and quick.claude.status not in {"unknown", "degraded"}
+                and not quick.claude.intelligence_cached
+                and not (
+                    quick.claude.country
+                    and quick.claude.intelligence_country
+                    and quick.claude.country.upper()
+                    != quick.claude.intelligence_country.upper()
+                )
+                and (
+                    not quick.claude.exit_ip
+                    or quick.claude.exit_ip == quick.exit_ip
+                    or quick.claude.intelligence_complete
+                )
+                and preliminary.overall_grade in {"A", "B"}
+                and preliminary.risk_grade != "C"
+                and preliminary.ai_grade != "C"
+            )
+            if frozen:
+                unavailable_runs = int(prior.get("consecutive_unavailable_runs", 0) or 0)
+                evidence_valid = False
+            elif not quick.available:
+                healthy_streak = 0
+                last_healthy_day = ""
+                if prior_last_unavailable_day != current_day:
+                    unavailable_days = prior_unavailable_days + 1
+                last_unavailable_day = current_day
+                if node.key in stable_keys:
+                    if grace_active:
+                        grace_active = unavailable_days <= self.config.policy.stable_unavailable_grace_days
+                    else:
+                        grace_active = bool(
+                            prior_streak >= self.config.policy.stable_protection_min_healthy_days
+                            and unavailable_days <= self.config.policy.stable_unavailable_grace_days
+                        )
+                else:
+                    grace_active = False
+            elif quick.transient_recovery:
+                unavailable_days = 0
+                last_unavailable_day = ""
+                grace_active = False
+            elif preliminary.overall_grade == "C":
+                healthy_streak = 0
+                last_healthy_day = ""
+                unavailable_days = 0
+                last_unavailable_day = ""
+                grace_active = False
+            elif evidence_valid:
+                if prior_last_healthy_day != current_day:
+                    try:
+                        previous_day = datetime.fromisoformat(prior_last_healthy_day).date()
+                        current_date = datetime.fromisoformat(current_day).date()
+                        healthy_streak = prior_streak + 1 if (current_date - previous_day).days == 1 else 1
+                    except ValueError:
+                        healthy_streak = 1
+                last_healthy_day = current_day
+                unavailable_days = 0
+                last_unavailable_day = ""
+                grace_active = False
 
             evaluation = evaluate_node(
                 node,
@@ -876,7 +1383,37 @@ class NodeHealthService:
                 passes,
                 previous_exit_ip=str(prior.get("last_exit_ip") or ""),
                 was_stable=node.key in stable_keys,
+                healthy_streak_days=healthy_streak,
             )
+            if (
+                (quick.chatgpt_service_outage or quick.claude.service_outage)
+                and str(prior.get("ai_grade") or "") in GRADE_ORDER
+                and isinstance(prior.get("score_components"), dict)
+            ):
+                previous_ai_grade = str(prior["ai_grade"])
+                try:
+                    previous_ai_points = float(prior["score_components"].get("ai", 0))
+                except (TypeError, ValueError):
+                    previous_ai_points = evaluation.components.get("ai", 0)
+                evaluation.components["ai"] = max(0.0, min(25.0, previous_ai_points))
+                evaluation.ai_grade = previous_ai_grade
+                if evaluation.overall_grade != "C":
+                    evaluation.overall_grade = max(
+                        (evaluation.ai_grade, evaluation.risk_grade),
+                        key=lambda value: GRADE_ORDER.get(value, 2),
+                    )
+                evaluation.score = round(
+                    sum(
+                        value
+                        for name, value in evaluation.components.items()
+                        if name != "risk_source_count"
+                    ),
+                    2,
+                )
+                if quick.chatgpt_service_outage:
+                    evaluation.reasons.append("chatgpt-service-outage")
+                if quick.claude.service_outage:
+                    evaluation.reasons.append("claude-service-outage")
             if (
                 not fresh_is_trustworthy
                 and prior.get("last_score") is not None
@@ -888,6 +1425,10 @@ class NodeHealthService:
                     pass
             if fresh_full is not None and not fresh_full.completed:
                 evaluation.reasons.append("full-audit-incomplete")
+            elif fresh_full is not None and not fresh_is_trustworthy:
+                evaluation.reasons.append(
+                    f"fresh-ai-unconfirmed:{chatgpt_status(fresh_full.details) or 'unknown'}"
+                )
             if fresh_full is not None and evaluation.confidence == "low":
                 passes = 0
             if evaluation.redline or (
@@ -899,7 +1440,32 @@ class NodeHealthService:
                     score=evaluation.score,
                     confidence=evaluation.confidence,
                     reasons=evaluation.reasons,
+                    components=evaluation.components,
+                    ai_grade=evaluation.ai_grade,
+                    risk_grade=evaluation.risk_grade,
+                    overall_grade=evaluation.overall_grade,
+                    residential_grade=evaluation.residential_grade,
+                    evidence=evaluation.evidence,
                 )
+            if frozen:
+                passes = int(prior.get("consecutive_full_passes", 0) or 0)
+            history = [
+                dict(entry) for entry in prior.get("daily_quality_history", [])
+                if isinstance(entry, dict) and entry.get("day") != current_day
+            ]
+            if not frozen:
+                history.append({
+                    "day": current_day,
+                    "score": evaluation.score,
+                    "ai_grade": evaluation.ai_grade,
+                    "risk_grade": evaluation.risk_grade,
+                    "overall_grade": evaluation.overall_grade,
+                    "residential_grade": evaluation.residential_grade,
+                    "evidence_valid": evidence_valid,
+                    "available": quick.available,
+                    "transient_recovery": quick.transient_recovery,
+                })
+            history = sorted(history, key=lambda entry: str(entry.get("day") or ""))[-7:]
             assessments.append(
                 NodeAssessment(
                     node=node,
@@ -909,10 +1475,15 @@ class NodeHealthService:
                     consecutive_full_passes=passes,
                     consecutive_unavailable_runs=unavailable_runs,
                     fresh_full_completed=bool(fresh_full and fresh_full.completed),
-                    fresh_full_usable=full_has_usable_reputation(
-                        fresh_full, self.config.policy
-                    ),
+                    fresh_full_usable=fresh_is_trustworthy,
                     fresh_full_attempt=fresh_full,
+                    healthy_streak_days=healthy_streak,
+                    last_healthy_day=last_healthy_day,
+                    consecutive_unavailable_valid_days=unavailable_days,
+                    last_unavailable_day=last_unavailable_day,
+                    unavailable_grace_active=grace_active,
+                    daily_quality_history=history,
+                    evidence_valid=evidence_valid,
                 )
             )
         return assessments
@@ -943,6 +1514,14 @@ class NodeHealthService:
                 "decision": item.evaluation.decision,
                 "reasons": item.evaluation.reasons,
                 "consecutive_unavailable_runs": item.consecutive_unavailable_runs,
+                "healthy_streak_days": item.healthy_streak_days,
+                "consecutive_unavailable_valid_days": item.consecutive_unavailable_valid_days,
+                "unavailable_grace_active": item.unavailable_grace_active,
+                "ai_grade": item.evaluation.ai_grade,
+                "risk_grade": item.evaluation.risk_grade,
+                "overall_grade": item.evaluation.overall_grade,
+                "residential_grade": item.evaluation.residential_grade,
+                "components": item.evaluation.components,
             }
             for item in assessments
         }
@@ -1000,13 +1579,20 @@ class NodeHealthService:
         }
         node_state: dict[str, Any] = {}
         current_score_day = str(current.get("generated_at") or "")[:10]
+        frozen_regions = {
+            str(region)
+            for region, payload in regions.items()
+            if isinstance(payload, dict) and payload.get("outage_freeze", {}).get("active")
+        }
         for item in assessments:
             prior = prior_nodes.get(item.node.key, {})
             fresh_cacheworthy = bool(
                 item.fresh_full_attempt
                 and item.fresh_full_attempt.completed
                 and (
-                    item.fresh_full_usable
+                    full_has_usable_reputation(
+                        item.fresh_full_attempt, self.config.policy
+                    )
                     or full_has_confirmed_redline(
                         item.fresh_full_attempt, self.config.policy
                     )
@@ -1019,7 +1605,7 @@ class NodeHealthService:
                 or prior.get("last_exit_ip")
                 or ""
             )
-            trusted_full = item.fresh_full_attempt if fresh_cacheworthy else prior_full
+            trusted_full = item.full if fresh_cacheworthy else prior_full
             effective_score = (
                 prior.get("last_score", item.evaluation.score)
                 if item.node.key in assigned_keys
@@ -1033,8 +1619,15 @@ class NodeHealthService:
             else:
                 previous_day_score = prior.get("previous_day_score")
                 previous_score_day = str(prior.get("previous_score_day") or "")
-            if item.fresh_full_usable and item.fresh_full_attempt:
+            if item.node.region in frozen_regions:
+                last_full_pass_day = str(prior.get("last_full_pass_day") or "")
+            elif item.fresh_full_usable and item.fresh_full_attempt:
                 last_full_pass_day = str(item.fresh_full_attempt.checked_at or "")[:10]
+            elif fresh_cacheworthy and (
+                item.quick.chatgpt_service_outage
+                or item.quick.claude.service_outage
+            ):
+                last_full_pass_day = str(prior.get("last_full_pass_day") or "")
             elif item.fresh_full_attempt is not None:
                 last_full_pass_day = ""
             else:
@@ -1047,6 +1640,18 @@ class NodeHealthService:
                 "normalized_name": item.node.normalized_name,
                 "logical_id": item.node.logical_id,
                 "last_exit_ip": item.quick.exit_ip or prior.get("last_exit_ip", ""),
+                "last_country": (
+                    str(item.quick.country or "").upper()
+                    or (
+                        str(prior.get("last_country") or "").upper()
+                        if (
+                            not item.quick.exit_ip
+                            or str(prior.get("last_exit_ip") or "")
+                            == item.quick.exit_ip
+                        )
+                        else ""
+                    )
+                ),
                 "last_quick_checked_at": item.quick.checked_at,
                 "last_full_checked_at": (
                     trusted_full.checked_at
@@ -1078,6 +1683,22 @@ class NodeHealthService:
                 "consecutive_full_passes": item.consecutive_full_passes,
                 "last_full_pass_day": last_full_pass_day,
                 "consecutive_unavailable_runs": item.consecutive_unavailable_runs,
+                "healthy_streak_days": item.healthy_streak_days,
+                "last_healthy_day": item.last_healthy_day,
+                "consecutive_unavailable_valid_days": item.consecutive_unavailable_valid_days,
+                "last_unavailable_day": item.last_unavailable_day,
+                "unavailable_grace_active": item.unavailable_grace_active,
+                "daily_quality_history": item.daily_quality_history,
+                "last_claude": item.quick.claude.to_dict(),
+                "transient_recovery": item.quick.transient_recovery,
+                "ai_grade": item.evaluation.ai_grade,
+                "risk_grade": item.evaluation.risk_grade,
+                "overall_grade": item.evaluation.overall_grade,
+                "residential_grade": item.evaluation.residential_grade,
+                "score_components": item.evaluation.components,
+                "score_evidence": item.evaluation.evidence,
+                "last_risk_source_count": item.evaluation.components.get("risk_source_count", 0),
+                "risk_data_conflict": risk_sources_conflict(trusted_full),
                 "last_score": effective_score,
                 "score_day": current_score_day,
                 "previous_day_score": previous_day_score,
@@ -1085,6 +1706,24 @@ class NodeHealthService:
                 "last_decision": item.evaluation.decision,
                 "current_status": item.evaluation.decision,
             }
+            if item.node.region in frozen_regions and prior:
+                frozen_observation = {
+                    "checked_at": item.quick.checked_at,
+                    "available": item.quick.available,
+                    "error": item.quick.error,
+                    "claude": item.quick.claude.to_dict(),
+                    "evaluation": item.evaluation.to_dict(),
+                }
+                node_state[item.node.key] = {
+                    **copy.deepcopy(prior),
+                    "name": item.node.name,
+                    "region": item.node.region,
+                    "source_id": item.node.source_id,
+                    "original_name": item.node.original_name,
+                    "normalized_name": item.node.normalized_name,
+                    "logical_id": item.node.logical_id,
+                    "last_frozen_observation": frozen_observation,
+                }
         for key in assigned_keys - set(node_state):
             prior = prior_nodes.get(key, {})
             node_state[key] = {
@@ -1131,6 +1770,22 @@ class NodeHealthService:
         promotion_cooldown_at = _updated_promotion_cooldown(
             previous, changes, current["generated_at"]
         )
+        prior_baselines = previous.get("availability_baselines", {})
+        availability_baselines = dict(prior_baselines) if isinstance(prior_baselines, dict) else {}
+        outage_regions = current.get("outage_protection", {}).get("regions", {})
+        if isinstance(outage_regions, dict):
+            for scope, diagnostic in outage_regions.items():
+                if not isinstance(diagnostic, dict) or diagnostic.get("frozen"):
+                    continue
+                if scope == "__global__":
+                    keys = [item.node.key for item in assessments]
+                else:
+                    keys = [item.node.key for item in assessments if item.node.region == scope]
+                availability_baselines[str(scope)] = {
+                    "available_ratio": float(diagnostic.get("available_ratio") or 0),
+                    "node_keys": keys,
+                    "updated_at": current["generated_at"],
+                }
         return {
             "schema_version": SCHEMA_VERSION,
             "version": current["version"],
@@ -1144,6 +1799,19 @@ class NodeHealthService:
             }
             if "other" in regions
             else {},
+            "ranked_order": {
+                region: [str(key) for key in payload.get("ranked", [])]
+                for region, payload in regions.items()
+            },
+            "rejected_by_region": {
+                region: {
+                    str(key): str(reason)
+                    for key, reason in payload.get("rejected", {}).items()
+                }
+                for region, payload in regions.items()
+            },
+            "availability_baselines": availability_baselines,
+            "outage_protection": current.get("outage_protection", {}),
             "slot_changed_at": slot_changed_at,
             "promotion_cooldown_at": promotion_cooldown_at,
             "nodes": node_state,
