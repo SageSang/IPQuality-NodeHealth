@@ -10,6 +10,20 @@ from node_health.policy import evaluate_node
 from node_health.slots import assign_all_regions, assign_region_slots
 
 
+def test_promotion_compares_valid_days_across_a_platform_outage():
+    from node_health.slots import _promotion_margin_holds
+    days = ["2026-07-21", "2026-07-23", "2026-07-24"]
+    candidate = assessment("candidate", 90, history=[
+        {"day": day, "score": 90, "evidence_valid": True} for day in days
+    ])
+    incumbent = assessment("incumbent", 70, history=[
+        {"day": day, "score": 70, "evidence_valid": True} for day in days
+    ])
+    assert _promotion_margin_holds(candidate, incumbent, 3, 15)
+    candidate.daily_quality_history[1]["score"] = 80
+    assert not _promotion_margin_holds(candidate, incumbent, 3, 15)
+
+
 def assessment(
     key: str,
     score: float,

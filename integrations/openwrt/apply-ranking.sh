@@ -55,8 +55,16 @@ BACKUP=''
 EXPORT_STAGE=''
 EXPORT_BACKUP=''
 REPLACED=0
+COMMITTED=0
+ROLLBACK_ATTEMPTED=0
 
 cleanup() {
+  # Interruption must use the same rollback path as a readiness failure.
+  # All functions are defined before CONFIG_PATH is replaced.
+  if [ "$REPLACED" -eq 1 ] && [ "$COMMITTED" -eq 0 ] && [ "$ROLLBACK_ATTEMPTED" -eq 0 ]; then
+    trap '' HUP INT TERM
+    rollback || echo 'apply-ranking: interrupted apply rollback failed' >&2
+  fi
   if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
     rm -f -- "$CANDIDATE"
   fi
@@ -69,6 +77,9 @@ cleanup() {
     else
       echo "apply-ranking: warning: TXT export backup remains at $EXPORT_BACKUP" >&2
     fi
+  fi
+  if [ "$COMMITTED" -eq 1 ] && [ -n "$EXPORT_BACKUP" ] && [ -d "$EXPORT_BACKUP" ]; then
+    rm -rf -- "$EXPORT_BACKUP"
   fi
 }
 trap cleanup EXIT
@@ -131,16 +142,6 @@ fi
 if ! "$MIHOMO_VALIDATE_BIN" -d "$WORK_DIR" -t -f "$CANDIDATE" >/dev/null 2>&1; then
   fail 'Mihomo rejected candidate config'
 fi
-
-if [ -f "$CONFIG_PATH" ]; then
-  BACKUP="$(mktemp "$CACHE_DIR/config.previous.XXXXXX")" || fail 'cannot create rollback copy'
-  cp -p "$CONFIG_PATH" "$BACKUP" || fail 'cannot copy rollback config'
-  chmod 600 "$BACKUP" || fail 'cannot protect rollback config'
-fi
-
-mv -f "$CANDIDATE" "$CONFIG_PATH" || fail 'atomic config replacement failed'
-CANDIDATE=''
-REPLACED=1
 
 service_running() {
   if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
@@ -257,7 +258,12 @@ NODE
 }
 
 rollback() {
+  ROLLBACK_ATTEMPTED=1
   restore_ok=1
+  if [ -n "$EXPORT_BACKUP" ] && [ -d "$EXPORT_BACKUP" ]; then
+    rm -rf -- "$EXPORT_DIR" && mv "$EXPORT_BACKUP" "$EXPORT_DIR" || restore_ok=0
+    [ "$restore_ok" -ne 1 ] || EXPORT_BACKUP=''
+  fi
   cp -p "$CONFIG_PATH" "$CACHE_DIR/failed-config.yaml" 2>/dev/null || true
   chmod 600 "$CACHE_DIR/failed-config.yaml" 2>/dev/null || true
 
@@ -315,12 +321,8 @@ publish_exports() {
 
   if mv "$EXPORT_STAGE" "$EXPORT_DIR"; then
     EXPORT_STAGE=''
-    if [ -n "$EXPORT_BACKUP" ] && [ -d "$EXPORT_BACKUP" ]; then
-      if ! rm -rf -- "$EXPORT_BACKUP"; then
-        echo "apply-ranking: warning: old TXT export remains at $EXPORT_BACKUP" >&2
-      fi
-      EXPORT_BACKUP=''
-    fi
+    # Retain the old export until the transaction is committed, including
+    # the signal window immediately after this rename.
     return 0
   fi
 
@@ -331,6 +333,16 @@ publish_exports() {
   fi
   return 1
 }
+
+if [ -f "$CONFIG_PATH" ]; then
+  BACKUP="$(mktemp "$CACHE_DIR/config.previous.XXXXXX")" || fail 'cannot create rollback copy'
+  cp -p "$CONFIG_PATH" "$BACKUP" || fail 'cannot copy rollback config'
+  chmod 600 "$BACKUP" || fail 'cannot protect rollback config'
+fi
+
+REPLACED=1
+mv -f "$CANDIDATE" "$CONFIG_PATH" || fail 'atomic config replacement failed'
+CANDIDATE=''
 
 if ! "$SERVICE_SCRIPT" restart >/dev/null 2>&1; then
   fail_after_rollback 'service restart failed'
@@ -344,6 +356,7 @@ fi
 if ! publish_exports; then
   fail_after_rollback 'TXT export publish failed'
 fi
+COMMITTED=1
 
 if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
   if mv -f "$BACKUP" "$CACHE_DIR/config.previous.yaml"; then

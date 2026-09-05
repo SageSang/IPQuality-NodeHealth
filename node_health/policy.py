@@ -920,7 +920,8 @@ def select_full_audit_nodes(
 
     def review_age_key(node: Node) -> tuple[datetime, str]:
         checked_at = _parse_time(
-            prior_nodes.get(node.key, {}).get("last_full_checked_at")
+            prior_nodes.get(node.key, {}).get("last_full_attempt_at")
+            or prior_nodes.get(node.key, {}).get("last_full_checked_at")
         )
         return checked_at or datetime.min.replace(tzinfo=timezone.utc), node.key
 

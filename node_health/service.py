@@ -31,6 +31,7 @@ from .inventory import (
 from .models import ClaudeResult, Evaluation, FullResult, Node, NodeAssessment, QuickResult
 from .policy import (
     GRADE_ORDER,
+    _full_country_majority,
     chatgpt_explicitly_allowed,
     chatgpt_is_redline,
     chatgpt_status,
@@ -235,7 +236,9 @@ class NodeHealthService:
         self._status_lock = threading.Lock()
         self._running_mode = ""
         self._last_error = ""
-        self._last_success = str(self.store.load_current().get("generated_at") or "")
+        published = self.store.load_current()
+        self._last_success = str(published.get("generated_at") or "")
+        self._last_quality_summary = dict(published.get("quality_summary") or {})
         self._active_audit_id = ""
         self._task_started_at = ""
         self._progress: dict[str, Any] | None = None
@@ -248,6 +251,7 @@ class NodeHealthService:
                 "running_mode": self._running_mode or None,
                 "last_success": self._last_success or None,
                 "last_error": self._last_error or None,
+                "quality_summary": dict(self._last_quality_summary),
                 "active_audit_id": self._active_audit_id or None,
                 "started_at": self._task_started_at or None,
                 "progress": dict(self._progress) if self._progress is not None else None,
@@ -711,6 +715,9 @@ class NodeHealthService:
         ports: dict[str, int],
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> dict[str, QuickResult]:
+        begin_scan = getattr(self.quick_probe, "begin_scan", None)
+        if callable(begin_scan):
+            begin_scan()
         quick_raw = run_parallel(
             nodes,
             ports,
@@ -783,7 +790,12 @@ class NodeHealthService:
                 result.exit_ip
                 and str(prior.get("last_exit_ip") or "") == result.exit_ip
             ):
-                return str(prior.get("last_country") or "").upper()
+                country = str(prior.get("last_country") or "").upper()
+                if country:
+                    return country
+                full = _full_from_dict(prior.get("last_full"))
+                if full and full.completed and full.audited_exit_ip == result.exit_ip:
+                    return _full_country_majority(full.details)
             return ""
 
         def claude_observed_country(node: Node) -> str:
@@ -819,6 +831,7 @@ class NodeHealthService:
             return grouped
 
         status: dict[str, Any] = {}
+        self._ai_guard_samples = {}
         if healthy:
             chatgpt_countries = set(self.config.probe.chatgpt_supported_countries)
             chatgpt_supported = [
@@ -837,6 +850,14 @@ class NodeHealthService:
                 if chatgpt_routes
                 else 0.0
             )
+            self._ai_guard_samples = {
+                "chatgpt": {
+                    "sample_size": len(chatgpt_routes),
+                    "minimum_sample_size": minimum_egresses,
+                    "excluded_unknown_or_unsupported_country": len(healthy) - len(chatgpt_supported),
+                    "failure_ratio": round(ratio, 4),
+                }
+            }
             if len(chatgpt_routes) >= minimum_egresses and ratio >= threshold:
                 for node in chatgpt_supported:
                     results[node.key].chatgpt_service_outage = True
@@ -860,6 +881,11 @@ class NodeHealthService:
                 )
             ]
             claude_routes = group_by_egress(supported, "claude")
+            self._ai_guard_samples["claude"] = {
+                "sample_size": len(claude_routes),
+                "minimum_sample_size": minimum_egresses,
+                "excluded_unknown_or_unsupported_country": len(healthy) - len(supported),
+            }
             if len(claude_routes) >= minimum_egresses:
                 claude_failed = [
                     route
@@ -1113,8 +1139,23 @@ class NodeHealthService:
             "regions": outage_diagnostics,
             "ai_services": ai_service_outages,
         }
+        current["started_at"] = started_at.astimezone(configured_timezone).isoformat(timespec="seconds")
+        current["completed_at"] = iso_time
+        current["duration_seconds"] = round((generated_at - started_at).total_seconds(), 3)
+        diagnostics = getattr(self.quick_probe, "diagnostics", None)
+        current["probe_diagnostics"] = diagnostics() if callable(diagnostics) else {}
+        current["ai_guard_samples"] = getattr(self, "_ai_guard_samples", {})
+        current["quality_summary"] = {
+            "nodes": len(assessments),
+            "fresh_full_attempts": sum(item.fresh_full_attempt is not None for item in assessments),
+            "fresh_full_completed": sum(item.fresh_full_completed for item in assessments),
+            "fresh_full_usable": sum(item.fresh_full_usable for item in assessments),
+            "evidence_valid": sum(item.evidence_valid for item in assessments),
+        }
         state = self._build_state(current, previous, assessments, regions, changes)
         self.store.publish(current, state, assessments, changes, generated_at.astimezone(configured_timezone))
+        with self._status_lock:
+            self._last_quality_summary = dict(current["quality_summary"])
         return current
 
     @staticmethod
@@ -1364,12 +1405,10 @@ class NodeHealthService:
                 grace_active = False
             elif evidence_valid:
                 if prior_last_healthy_day != current_day:
-                    try:
-                        previous_day = datetime.fromisoformat(prior_last_healthy_day).date()
-                        current_date = datetime.fromisoformat(current_day).date()
-                        healthy_streak = prior_streak + 1 if (current_date - previous_day).days == 1 else 1
-                    except ValueError:
-                        healthy_streak = 1
+                    # Invalid observations pause the counter. Real unhealthy
+                    # observations reset it above, so a calendar gap alone
+                    # must not take away an earned protection period.
+                    healthy_streak = prior_streak + 1
                 last_healthy_day = current_day
                 unavailable_days = 0
                 last_unavailable_day = ""
@@ -1420,6 +1459,10 @@ class NodeHealthService:
                 and (not quick.available or safe_prior_full is not None)
             ):
                 try:
+                    evaluation.evidence["observed_score"] = evaluation.score
+                    evaluation.evidence["ranking_score_source"] = "previous"
+                    previous_evidence = prior.get("score_evidence") or {}
+                    evaluation.evidence["ranking_score_day"] = str(previous_evidence.get("ranking_score_day") or prior.get("score_day") or "")
                     evaluation.score = float(prior["last_score"])
                 except (TypeError, ValueError):
                     pass

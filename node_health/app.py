@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from .config import AppConfig, load_config
 from .service import NodeHealthService, ScanStartError
 
-SOFTWARE_VERSION = "0.3.0"
+SOFTWARE_VERSION = "0.3.1"
 MAX_API_BODY_BYTES = 16 * 1024
 LOGGER = logging.getLogger("node_health")
 
@@ -239,7 +239,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             current = self.server.service.store.load_current()
             self._json(
                 HTTPStatus.OK,
-                {"service_version": SOFTWARE_VERSION, "ranking_version": current.get("version")},
+                {"service_version": SOFTWARE_VERSION, "ranking_version": current.get("version"), "source_revision": os.environ.get("NODE_HEALTH_REVISION", "unknown")},
             )
             return
         if path == "/current.json":

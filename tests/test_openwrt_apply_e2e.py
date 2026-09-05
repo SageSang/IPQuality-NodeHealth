@@ -1,10 +1,12 @@
 import json
+import hashlib
 import os
 import shutil
 import signal
 import socket
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -41,7 +43,7 @@ def _tool(name: str) -> str | None:
 
 @pytest.mark.parametrize(
     ("mode", "expected_success"),
-    [("listening", True), ("zero", True), ("missing", False)],
+    [("listening", True), ("zero", True), ("missing", False), ("interrupted", False)],
 )
 def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expected_success):
     bash = _tool("bash")
@@ -141,6 +143,11 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
         #!/bin/sh
         case "$1" in
           restart)
+            if [ "${MOCK_APPLY_MODE:-}" = 'interrupted' ] && [ ! -f "$MOCK_PID_FILE.interrupted" ]; then
+              touch "$MOCK_PID_FILE.interrupted"
+              kill -TERM "$PPID"
+              exit 0
+            fi
             if [ -s "$MOCK_PID_FILE" ]; then
               kill "$(cat "$MOCK_PID_FILE")" 2>/dev/null || true
               rm -f "$MOCK_PID_FILE"
@@ -265,4 +272,39 @@ def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expect
     else:
         assert config.read_text(encoding="utf-8") == "old-config\n"
         assert (export / "sentinel.txt").read_text(encoding="utf-8") == "old-export\n"
-        assert "previous config restored and ready" in result.stderr
+        if mode != "interrupted":
+            assert "previous config restored and ready" in result.stderr
+
+
+def test_upstream_backoff_does_not_skip_local_runtime_recovery(tmp_path):
+    if os.name == "nt" or not _tool("sh") or not _tool("sha256sum"):
+        pytest.skip("POSIX shell and sha256sum required")
+    work = tmp_path / "work"
+    cache = work / "cache"
+    export = tmp_path / "exports"
+    cache.mkdir(parents=True)
+    export.mkdir()
+    config = work / "config.yaml"
+    config.write_text("known-good-config\n")
+    (cache / "applied.sha256").write_text(hashlib.sha256(config.read_bytes()).hexdigest())
+    (cache / "applied.version").write_text("v1\n")
+    (cache / "backoff.state").write_text(f"{int(time.time())+21600} 6\n")
+    for region in "hong-kong taiwan japan singapore united-states south-korea united-kingdom germany france canada australia other all all-plain".split():
+        (export / f"{region}.txt").write_text("")
+    (export / "README.txt").write_text("ranking v1\n")
+    service = tmp_path / "service"
+    log = tmp_path / "calls"
+    _write(service, f'#!/bin/sh\nprintf "%s\\n" "$1" >>"{log}"\nexit 1\n', executable=True)
+    env_file = tmp_path / "env"
+    # A failing fake service confirms that recovery is attempted; no network
+    # request is reached, and no real service or configuration is touched.
+    env_file.write_text("\n".join([
+        "RANKING_URL=https://ranking.invalid/current.json", "SOURCE_URL=https://inventory.invalid/",
+        f"WORK_DIR='{work}'", f"CACHE_DIR='{cache}'", f"EXPORT_DIR='{export}'",
+        f"CONFIG_PATH='{config}'", f"SERVICE_SCRIPT='{service}'",
+    ]))
+    environment = dict(os.environ, NODE_HEALTH_ENV_FILE=str(env_file))
+    result = subprocess.run(["sh", str(ROOT / "integrations/openwrt/check-ranking.sh")], env=environment, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 1
+    assert log.read_text().splitlines() == ["status", "restart"]
+    assert int((cache / "backoff.state").read_text().split()[0]) > time.time()

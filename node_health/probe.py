@@ -8,6 +8,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -196,6 +197,76 @@ class FullAuditor(Protocol):
 class CurlQuickProbe:
     def __init__(self, config: AppConfig):
         self.config = config
+        self._provider_lock = threading.Lock()
+        self._provider_locks: dict[str, threading.Lock] = {}
+        self._provider_cache: dict[str, tuple[float, str, float]] = {}
+        self._provider_backoff: dict[str, tuple[float, str]] = {}
+        self._provider_counts: dict[str, Counter] = {}
+
+    def begin_scan(self) -> None:
+        # Evidence may be shared for one IP within a scan, but never promoted
+        # into another day's fresh evidence just because it was cached.
+        with self._provider_lock:
+            self._provider_cache.clear()
+            self._provider_counts.clear()
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._provider_lock:
+            return {source: dict(counts) for source, counts in self._provider_counts.items()}
+
+    def _provider_get(self, port: int, url: str, timeout_seconds: float | None = None) -> tuple[str, float]:
+        source = urllib.parse.urlsplit(url).hostname or "unknown"
+        with self._provider_lock:
+            lock = self._provider_locks.setdefault(source, threading.Lock())
+        # Serialize each provider to avoid a quota burst, and coalesce lookups
+        # for the same explicit target IP. Reachability probes are never cached.
+        with lock:
+            now = time.monotonic()
+            with self._provider_lock:
+                counts = self._provider_counts.setdefault(source, Counter())
+                cached = self._provider_cache.get(url)
+                if cached and cached[0] > now:
+                    counts["cache_hits"] += 1
+                    return cached[1], cached[2]
+                until, reason = self._provider_backoff.get(source, (0.0, ""))
+                if until > now:
+                    counts["backoff_skips"] += 1
+                    raise RuntimeError(f"provider backoff: {reason}")
+                counts["requests"] += 1
+            try:
+                body, elapsed = self._get(port, url, timeout_seconds)
+                payload = json.loads(body)
+                if not isinstance(payload, dict) or payload.get("error"):
+                    raise ValueError("provider returned an error or invalid object")
+            except Exception as error:
+                # Do not persist request URLs: they can contain credentials.
+                message = str(error)
+                if "429" in message:
+                    code = "http_429"
+                elif "403" in message:
+                    code = "http_403"
+                elif re.search(r"\b5\d\d\b", message):
+                    code = "http_5xx"
+                elif "SSL" in message or "TLS" in message:
+                    code = "tls_error"
+                elif isinstance(error, subprocess.TimeoutExpired) or "timed out" in message.lower():
+                    code = "timeout"
+                elif isinstance(error, ValueError):
+                    code = "invalid_response"
+                else:
+                    code = "request_failed"
+                with self._provider_lock:
+                    counts[code] += 1
+                    if code in {"http_429", "http_403", "http_5xx"}:
+                        self._provider_backoff[source] = (time.monotonic() + 300, code)
+                raise RuntimeError(f"provider lookup failed: {code}") from None
+            with self._provider_lock:
+                # Bound memory even for repeated independent audit jobs.
+                if len(self._provider_cache) >= 4096:
+                    self._provider_cache.pop(next(iter(self._provider_cache)))
+                self._provider_cache[url] = (time.monotonic() + 3600, body, elapsed)
+                counts["successes"] += 1
+            return body, elapsed
 
     def _get(
         self, port: int, url: str, timeout_seconds: float | None = None
@@ -315,7 +386,7 @@ class CurlQuickProbe:
         risk_providers: set[str] = set()
 
         try:
-            body, _ = self._get(
+            body, _ = self._provider_get(
                 port,
                 _provider_url(
                     self.config.probe.claude_ipinfo_url_template,
@@ -385,7 +456,7 @@ class CurlQuickProbe:
             payload["errors"].append(f"ipinfo: {error}")
 
         try:
-            body, _ = self._get(
+            body, _ = self._provider_get(
                 port,
                 _provider_url(
                     self.config.probe.claude_ipapi_url_template,
@@ -568,7 +639,7 @@ class CurlQuickProbe:
         country = ""
         asn = ""
         try:
-            body, _ = self._get(port, self.config.probe.geo_url_template.format(ip=exit_ip))
+            body, _ = self._provider_get(port, self.config.probe.geo_url_template.format(ip=exit_ip))
             geo = json.loads(body)
             country = str(geo.get("country_code") or geo.get("country") or "").upper()
             asn = str(geo.get("asn") or geo.get("org") or "")
@@ -670,22 +741,34 @@ class IPQualityAuditor:
             "-n",
             "-f",
         ]
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=max(120, self.config.probe.request_timeout_seconds * 20),
-                check=False,
-                env={
-                    **os.environ,
-                    "IPQUALITY_AUTOMATION": "1",
-                    "IPQUALITY_SKIP_MAIL": "1",
-                    "IPQUALITY_DNSBL_FILE": BUNDLED_DNSBL_FILE,
-                },
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return FullResult(completed=False, checked_at=checked_at, error=str(error))
+        with tempfile.TemporaryDirectory(prefix="ipquality-audit-") as directory:
+            checkpoint = Path(directory) / "partial.json"
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(120, self.config.probe.request_timeout_seconds * 20),
+                    check=False,
+                    env={
+                        **os.environ,
+                        "IPQUALITY_AUTOMATION": "1",
+                        "IPQUALITY_CHECKPOINT_FILE": str(checkpoint),
+                        "IPQUALITY_REQUEST_TIMEOUT": str(self.config.probe.request_timeout_seconds),
+                        "IPQUALITY_SKIP_MAIL": "1",
+                        "IPQUALITY_DNSBL_FILE": BUNDLED_DNSBL_FILE,
+                    },
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                partial = None
+                try:
+                    partial = _extract_json(checkpoint.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError):
+                    pass
+                saved = normalize_ipquality(partial, checked_at) if partial else FullResult(completed=False, checked_at=checked_at)
+                saved.completed = False
+                saved.error = str(error)
+                return saved
         details = _extract_json(result.stdout)
         if details is None:
             suffix = (result.stderr or result.stdout)[-1800:]
@@ -712,7 +795,12 @@ def _extract_json(output: str) -> dict[str, Any] | None:
             value, _ = decoder.raw_decode(output[offset:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict):
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("Head"), dict)
+            and value["Head"].get("IP")
+            and isinstance(value.get("Score"), dict)
+        ):
             return value
     return None
 

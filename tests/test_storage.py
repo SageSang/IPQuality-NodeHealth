@@ -1,6 +1,51 @@
 from datetime import datetime, timezone
+import json
 
 import pytest
+
+
+def test_latest_views_never_advance_before_current_commit(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    at = datetime(2026, 7, 24, tzinfo=timezone.utc)
+    publish(store, "v1", "stable-v1", at)
+    original = storage.atomic_write_json
+    def fail_current(path, value):
+        if path == store.current_path:
+            raise OSError("commit failed")
+        return original(path, value)
+    monkeypatch.setattr(storage, "atomic_write_json", fail_current)
+    with pytest.raises(OSError, match="commit failed"):
+        publish(store, "v2", "stable-v2", at)
+    for path in (store.scheduled_reports_dir / "latest.json", store.config.reports_dir / "2026-07-24.json"):
+        assert json.loads(path.read_text())["version"] == "v1"
+    assert "ranking v1" in (store.local_socks_reports_dir / "latest/README.txt").read_text()
+
+
+def test_committed_snapshot_is_recovered_despite_corrupt_working_state(tmp_path):
+    store = make_store(tmp_path)
+    publish(store, "v1", "stable-v1", datetime(2026, 7, 24, tzinfo=timezone.utc))
+    store.state_path.write_text("{broken")
+    assert store.load_state()["version"] == "v1"
+    publish(store, "v2", "stable-v2", datetime(2026, 7, 25, tzinfo=timezone.utc))
+    assert store.load_state()["version"] == "v2"
+
+
+def test_committed_latest_report_recovers_after_post_commit_failure(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    at = datetime(2026, 7, 24, tzinfo=timezone.utc)
+    publish(store, "v1", "stable-v1", at)
+    original = storage.atomic_write_text
+    def fail_latest(path, content):
+        if path == store.scheduled_reports_dir / "latest.json" and store.load_current().get("version") == "v2":
+            raise OSError("latest unavailable")
+        return original(path, content)
+    with monkeypatch.context() as context:
+        context.setattr(storage, "atomic_write_text", fail_latest)
+        publish(store, "v2", "stable-v2", at)
+        assert store.load_current()["version"] == "v2"
+        assert json.loads((store.scheduled_reports_dir / "latest.json").read_text())["version"] == "v1"
+    restarted = StateStore(store.config)
+    assert json.loads((restarted.scheduled_reports_dir / "latest.json").read_text())["version"] == "v2"
 
 from node_health import storage
 from node_health.config import AppConfig, InventoryConfig, ReportConfig

@@ -109,16 +109,6 @@ else
   printf '%s %s\n' "$$" "$process_start" > "$LOCK_OWNER_FILE" || exit 1
 fi
 
-now_epoch="$(date +%s)"
-if [ -s "$BACKOFF_FILE" ]; then
-  read -r retry_after _attempts < "$BACKOFF_FILE" || true
-  case "${retry_after:-}" in
-    *[!0-9]*|'') retry_after=0 ;;
-  esac
-  if [ "$now_epoch" -lt "$retry_after" ]; then
-    exit 0
-  fi
-fi
 
 record_failure() {
   reason="$1"
@@ -141,7 +131,7 @@ record_failure() {
     count=$((count + 1))
   done
 
-  retry_after=$((now_epoch + delay))
+  retry_after=$(($(date +%s) + delay))
   printf '%s %s\n' "$retry_after" "$attempts" > "$BACKOFF_FILE.tmp"
   mv -f "$BACKOFF_FILE.tmp" "$BACKOFF_FILE"
   log "$reason; retry delayed ${delay}s (attempt ${attempts})"
@@ -399,6 +389,17 @@ if [ -n "$cached_version" ] \
     exit 0
   fi
   record_failure 'local-socks runtime self-heal failed'
+fi
+
+now_epoch="$(date +%s)"
+if [ -s "$BACKOFF_FILE" ]; then
+  read -r retry_after _attempts < "$BACKOFF_FILE" || true
+  case "${retry_after:-}" in
+    *[!0-9]*|'') retry_after=0 ;;
+  esac
+  if [ "$now_epoch" -lt "$retry_after" ]; then
+    exit 0
+  fi
 fi
 
 STAGE_DIR="$(mktemp -d "$CACHE_DIR/stage.XXXXXX")" || record_failure 'cannot create staging directory'

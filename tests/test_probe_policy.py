@@ -31,6 +31,139 @@ from node_health.probe import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_json_output_preserves_escapes_and_rejects_an_internal_head():
+    from node_health.probe import _extract_json
+    script = (PROJECT_ROOT / "ip.sh").read_text()
+    emit = next(line for line in script.splitlines() if line.startswith('[[ mode_json -eq 1 ]]'))
+    original = {"Head": {"IP": "8.8.8.8"}, "Score": {}, "Info": {"Organization": "line one\nline two"}}
+    result = subprocess.run(["bash", "-c", 'mode_json=1; ipjson="$1"\n' + emit, "_", json.dumps(original)], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == original
+    malformed = json.dumps(original).replace('line one\\nline two', 'line one\nline two')
+    assert _extract_json(malformed) is None
+
+
+@pytest.mark.parametrize("response", [
+    {"error": "rate limit exceeded"}, {}, {"company": {"abuser_score": None}},
+    {"company": {"abuser_score": "invalid"}}, {"company": {"abuser_score": "2.0 (High)"}},
+])
+def test_bash_ipapi_errors_never_create_zero_risk(response):
+    if not shutil.which("bash") or not shutil.which("jq"):
+        pytest.skip("bash and jq required")
+    script = (PROJECT_ROOT / "ip.sh").read_text()
+    function = script[script.index('db_ipapi(){'):script.index('\ndb_abuseipdb(){')]
+    setup = '''declare -A sinfo stype sscore ipapi
+IP=8.8.8.8
+payload="$1"
+show_progress_bar(){ return 0; }
+kill_progress_bar(){ return 0; }
+curl(){ printf '%s\\n' "$payload"; }
+'''
+    result = subprocess.run(["bash", "-c", setup + function + '\ndb_ipapi 4\nprintf "%s" "${ipapi[score]}"', "_", json.dumps(response)], capture_output=True, text=True, check=True)
+    assert result.stdout == ""
+
+
+def test_full_timeout_keeps_partial_diagnostics_without_claiming_completion():
+    config = AppConfig(inventory=InventoryConfig("https://inventory.invalid"))
+    def timeout(command, **kwargs):
+        checkpoint = Path(kwargs["env"]["IPQUALITY_CHECKPOINT_FILE"])
+        checkpoint.write_text(json.dumps({"Head": {"IP": "8.8.8.8"}, "Score": {"a": "low"}, "Automation": {"stage": "risk"}}))
+        raise subprocess.TimeoutExpired(command, 300)
+    with patch("node_health.probe.subprocess.run", side_effect=timeout):
+        result = IPQualityAuditor(config).check(node("a"), 20000)
+    assert not result.completed
+    assert result.details["Automation"]["stage"] == "risk"
+    assert result.audited_exit_ip == "8.8.8.8"
+
+
+def test_automation_shell_emits_complete_json_and_phase_checkpoints(tmp_path):
+    if not shutil.which("bash") or not shutil.which("jq"):
+        pytest.skip("bash and jq required")
+    script = (PROJECT_ROOT / "ip.sh").read_text()
+    definitions = script[:script.rindex('\ngenerate_random_user_agent\nadapt_locale')]
+    runner = tmp_path / "automation.sh"
+    runner.write_text(definitions + r'''
+IPQUALITY_AUTOMATION=1
+IPQUALITY_CHECKPOINT_FILE="$1"
+IPQUALITY_SKIP_MAIL=1
+mode_json=1
+mode_privacy=1
+mode_lite=0
+fullIP=1
+for function in hide_ipv4 countRunTimes db_maxmind db_ipinfo db_scamalytics db_ipregistry db_ipapi db_abuseipdb db_ip2location db_dbip db_ipdata db_ipqs skip_mail check_dnsbl show_head show_basic show_type show_score show_factor show_media show_mail show_tail; do
+  eval "$function(){ :; }"
+done
+OpenAITest(){ chatgpt[status]=Yes; }
+for function in MediaUnlockTest_TikTok MediaUnlockTest_DisneyPlus MediaUnlockTest_Netflix MediaUnlockTest_YouTube_Premium MediaUnlockTest_PrimeVideo_Region MediaUnlockTest_Reddit; do
+  eval "$function(){ echo unexpected-media-call >&2; }"
+done
+check_IP 8.8.8.8 4
+''')
+    checkpoint = tmp_path / "partial.json"
+    result = subprocess.run(["bash", str(runner), str(checkpoint)], capture_output=True, text=True, timeout=15, check=True)
+    completed = json.loads(result.stdout)
+    partial = json.loads(checkpoint.read_text())
+    assert completed["Head"]["IP"] == "8.8.8.8"
+    assert completed["Automation"]["complete"] is True
+    assert set(completed["Automation"]["stage_elapsed_seconds"]) == {"risk", "ai", "dnsbl"}
+    assert partial["Automation"]["complete"] is False
+    assert partial["Automation"]["stage"] == "dnsbl"
+    assert "unexpected-media-call" not in result.stderr
+
+
+def test_provider_cache_is_target_specific_and_fresh_for_each_scan():
+    probe = CurlQuickProbe(AppConfig(inventory=InventoryConfig("https://inventory.invalid")))
+    calls = []
+    def get(port, url, timeout=None):
+        calls.append(url)
+        return '{"country_code":"US"}', 1.0
+    probe._get = get
+    probe._provider_get(20000, "https://geo.invalid/8.8.8.8")
+    probe._provider_get(20001, "https://geo.invalid/8.8.8.8")
+    probe._provider_get(20001, "https://geo.invalid/1.1.1.1")
+    assert len(calls) == 2
+    assert probe.diagnostics()["geo.invalid"]["cache_hits"] == 1
+    probe.begin_scan()
+    probe._provider_get(20000, "https://geo.invalid/8.8.8.8")
+    assert len(calls) == 3
+
+
+def test_provider_quota_backoff_is_bounded_and_does_not_expose_credentials(monkeypatch):
+    probe = CurlQuickProbe(AppConfig(inventory=InventoryConfig("https://inventory.invalid")))
+    clock = [0.0]
+    monkeypatch.setattr("node_health.probe.time.monotonic", lambda: clock[0])
+    calls = []
+    def fail(port, url, timeout=None):
+        calls.append(url)
+        raise RuntimeError("HTTP 429 secret-token")
+    probe._get = fail
+    for url in ["https://geo.invalid/8.8.8.8", "https://geo.invalid/1.1.1.1"]:
+        with pytest.raises(RuntimeError) as error:
+            probe._provider_get(20000, url)
+        assert "secret-token" not in str(error.value)
+    assert len(calls) == 1
+    clock[0] = 301
+    with pytest.raises(RuntimeError):
+        probe._provider_get(20000, "https://geo.invalid/1.1.1.1")
+    assert len(calls) == 2
+
+
+def test_failed_full_audits_do_not_starve_other_rotation_candidates():
+    nodes = [Node(str(i), str(i), "us", {}) for i in range(10)]
+    results = {n.key: QuickResult(True, exit_ip="8.8.8.8", claude=ClaudeResult(exit_ip="8.8.8.8")) for n in nodes}
+    previous = {"stable_slots": {"us": {"1": "0", "2": "1", "3": "2"}}, "nodes": {
+        n.key: {"last_exit_ip": "8.8.8.8", "last_claude": {"exit_ip": "8.8.8.8"},
+                "last_risk_source_count": 3, "overall_grade": "A", "last_score": 100-int(n.key),
+                "last_decision": "eligible", "last_full_checked_at": "2026-07-01T00:00:00+00:00",
+                "last_full_attempt_at": "2026-07-23T00:00:00+00:00"} for n in nodes}}
+    covered = set()
+    for day in (24, 25):
+        selected = select_full_audit_nodes("maintenance", nodes, results, previous, PolicyConfig(), datetime(2026, 7, day, tzinfo=timezone.utc))
+        covered.update(selected)
+        for key in selected:
+            previous["nodes"][key]["last_full_attempt_at"] = f"2026-07-{day}T00:00:00+00:00"
+    assert covered == set(results)
+
+
 def node(key: str, name: str = "US") -> Node:
     return Node(
         key=key,
@@ -307,7 +440,7 @@ def test_full_auditor_uses_bundled_dnsbl_file():
     completed = subprocess.CompletedProcess(
         args=[],
         returncode=0,
-        stdout='{"Score":{},"Factor":{},"Mail":{"DNSBlacklist":{"Blacklisted":0}}}',
+        stdout='{"Head":{"IP":"8.8.8.8"},"Score":{},"Factor":{},"Mail":{"DNSBlacklist":{"Blacklisted":0}}}',
         stderr="",
     )
     with patch("node_health.probe.subprocess.run", return_value=completed) as run:

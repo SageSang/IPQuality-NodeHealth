@@ -611,6 +611,45 @@ def test_full_passes_count_distinct_calendar_days_not_same_day_reruns(tmp_path):
     assert next_day["nodes"][key]["healthy_streak_days"] == 2
 
 
+def test_outage_pause_preserves_earned_grace_after_recovery(tmp_path, monkeypatch):
+    service, quick, full, _ = make_service(tmp_path, count=5)
+    first = service.run_once("rebuild")
+    key = first["regions"]["united-states"]["stable_slots"]["1"]
+    previous = service.store.load_state()
+    for item in previous["nodes"].values():
+        item["healthy_streak_days"] = 6
+        item["last_healthy_day"] = "2026-07-24"
+    quick.chatgpt_fail.update(first["nodes"])
+    quick.claude_unreachable.update(first["nodes"])
+    service.clock = lambda: datetime(2026, 7, 25, tzinfo=timezone.utc)
+    full.checked_at = "2026-07-25T00:01:00+00:00"
+    with monkeypatch.context() as context:
+        context.setattr(service.store, "load_state", lambda: previous)
+        service.run_once("maintenance")
+    assert service.store.load_state()["nodes"][key]["healthy_streak_days"] == 6
+    quick.chatgpt_fail.clear()
+    quick.claude_unreachable.clear()
+    service.clock = lambda: datetime(2026, 7, 26, tzinfo=timezone.utc)
+    full.checked_at = "2026-07-26T00:01:00+00:00"
+    service.run_once("maintenance")
+    assert service.store.load_state()["nodes"][key]["healthy_streak_days"] == 7
+    quick.unavailable.add(key)
+    service.clock = lambda: datetime(2026, 7, 27, tzinfo=timezone.utc)
+    full.checked_at = "2026-07-27T00:01:00+00:00"
+    current = service.run_once("maintenance")
+    assert key in current["regions"]["united-states"]["stable_slots"].values()
+    assert service.store.load_state()["nodes"][key]["unavailable_grace_active"] is True
+
+
+def test_scheduled_report_persists_duration_and_evidence_coverage(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=1)
+    current = service.run_once("rebuild")
+    report = json.loads((service.config.reports_dir / "scheduled/latest.json").read_text())
+    assert report["started_at"] == current["started_at"]
+    assert report["duration_seconds"] == 0
+    assert report["quality_summary"]["evidence_valid"] == 1
+
+
 def test_dynamic_unavailable_counter_is_consecutive_and_resets_on_recovery(tmp_path):
     service, quick, _, _ = make_service(tmp_path, count=4)
     first = service.run_once("rebuild")
@@ -1006,6 +1045,20 @@ def test_observed_country_is_persisted_with_the_exit_ip(tmp_path):
 
     assert state["last_country"] == "US"
     assert state["last_exit_ip"]
+
+
+def test_outage_guard_uses_only_same_exit_full_country_majority(tmp_path):
+    service, _, _, _ = make_service(tmp_path, count=5)
+    nodes = [Node(str(index), str(index), "united-states", {}) for index in range(5)]
+    results = {node.key: QuickResult(True, exit_ip=f"8.8.8.{index+1}", chatgpt_ok=False) for index, node in enumerate(nodes)}
+    previous = {"nodes": {node.key: {
+        "last_exit_ip": results[node.key].exit_ip,
+        "last_full": FullResult(True, audited_exit_ip=results[node.key].exit_ip,
+            details={"Factor": {"CountryCode": {"one": "US", "two": "US"}}}).to_dict(),
+    } for node in nodes}}
+    assert service._apply_ai_service_outage_guard(nodes, results, previous)["chatgpt"]["sample_size"] == 5
+    previous["nodes"][nodes[0].key]["last_full"]["audited_exit_ip"] = "1.1.1.1"
+    assert "chatgpt" not in service._apply_ai_service_outage_guard(nodes, results, previous)
 
 
 def test_claude_degraded_fleet_triggers_service_outage_guard(tmp_path):

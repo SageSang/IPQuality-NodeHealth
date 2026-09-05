@@ -214,10 +214,23 @@ class StateStore:
         )
 
     def _finalize_committed_alerts(self, current: dict[str, Any]) -> None:
-        """Publish alert views only for the revision selected by current.json."""
+        """Publish report, export and alert views selected by current.json."""
         archive_dir = self._committed_alert_archive_dir(current)
         if archive_dir is None:
             return
+        # Every latest view follows the durable current.json commit, just as
+        # alerts do. Replay on startup and before another revision can commit.
+        day = str(current.get("generated_at") or "")[:10]
+        for extension, enabled in (("json", self.config.report.json), ("md", self.config.report.markdown)):
+            source = archive_dir / f"report.{extension}"
+            if enabled and source.is_file():
+                content = source.read_text(encoding="utf-8")
+                atomic_write_text(self.scheduled_reports_dir / f"latest.{extension}", content)
+                atomic_write_text(self.config.reports_dir / f"{day}.{extension}", content)
+        exports = archive_dir / "local-socks"
+        if exports.is_dir():
+            for source in sorted(exports.glob("*.txt"), key=lambda path: path.name == "README.txt"):
+                atomic_write_text(self.local_socks_reports_dir / "latest" / source.name, source.read_text(encoding="utf-8"))
         latest_source = archive_dir / "alert-latest-run.md"
         if not latest_source.exists():
             return
@@ -262,7 +275,7 @@ class StateStore:
             # however, the caller requires success so an older committed slot
             # change cannot be permanently skipped by the next revision.
             LOGGER.warning(
-                "committed %s but alert finalization is pending: %s",
+                "committed %s but report/export/alert finalization is pending: %s",
                 selected.get("state_revision") or selected.get("version"),
                 error,
             )
@@ -313,10 +326,7 @@ class StateStore:
             "frozen_order": {},
             "nodes": {},
         }
-        state = read_json(self.state_path, empty)
         current = read_json(self.current_path, {})
-        if state.get("schema_version") != SCHEMA_VERSION:
-            state = empty
         if current and current.get("schema_version") != SCHEMA_VERSION:
             current = {}
         current_version = str(current.get("version") or "")
@@ -336,6 +346,9 @@ class StateStore:
                 )
             ):
                 return _seed_frozen_order(snapshot, current)
+        state = read_json(self.state_path, empty)
+        if state.get("schema_version") != SCHEMA_VERSION:
+            state = empty
         if current_revision:
             selected = (
                 state
@@ -370,7 +383,6 @@ class StateStore:
             revision = f"s-{stamp}-{uuid.uuid4().hex[:12]}"
         current["state_revision"] = revision
         state["state_revision"] = revision
-        day = generated_at.date().isoformat()
         report_json = build_report_json(
             current,
             assessments,
@@ -403,10 +415,6 @@ class StateStore:
         # Reports are prepared first, then state, then the externally visible
         # current.json commit point. A crash cannot expose a ranking without
         # its matching durable state.
-        if self.config.report.json:
-            atomic_write_json(self.config.reports_dir / f"{day}.json", report_json)
-        if self.config.report.markdown:
-            atomic_write_text(self.config.reports_dir / f"{day}.md", report_markdown)
         archive_dir = (
             self.scheduled_reports_dir
             / generated_at.strftime("%Y")
@@ -416,17 +424,10 @@ class StateStore:
         )
         if self.config.report.json:
             atomic_write_json(archive_dir / "report.json", report_json)
-            atomic_write_json(self.scheduled_reports_dir / "latest.json", report_json)
         if self.config.report.markdown:
             atomic_write_text(archive_dir / "report.md", report_markdown)
-            atomic_write_text(self.scheduled_reports_dir / "latest.md", report_markdown)
         self._write_local_socks_exports(
             archive_dir / "local-socks", local_socks_exports, str(current["version"])
-        )
-        self._write_local_socks_exports(
-            self.local_socks_reports_dir / "latest",
-            local_socks_exports,
-            str(current["version"]),
         )
         # Alert consumers watch reports/alerts directly. Stage the content in
         # this revision's archive so a failed current.json commit cannot emit
@@ -437,7 +438,7 @@ class StateStore:
             atomic_write_text(archive_dir / "alert-slot-change.md", alert_markdown)
 
         previous_current = read_json(self.current_path, {})
-        previous_state = read_json(self.state_path, {})
+        previous_state = self.load_state()
         previous_version = str(previous_current.get("version") or "")
         previous_revision = str(previous_current.get("state_revision") or "")
         previous_snapshot = self._snapshot_path(previous_revision or previous_version)
@@ -937,6 +938,10 @@ def build_report_json(
         "generated_at": current["generated_at"],
         "started_at": current.get("started_at"),
         "completed_at": current.get("completed_at", current["generated_at"]),
+        "duration_seconds": current.get("duration_seconds"),
+        "probe_diagnostics": current.get("probe_diagnostics", {}),
+        "ai_guard_samples": current.get("ai_guard_samples", {}),
+        "quality_summary": current.get("quality_summary", {}),
         "name": current.get("name"),
         "mode": current["mode"],
         "source": current.get("source", {}),
@@ -1432,6 +1437,9 @@ def build_report_markdown(
                 f"`{_zh_confidence(item.evaluation.confidence)}`；综合等级：`{item.evaluation.overall_grade}`；"
                 f"AI=`{item.evaluation.ai_grade}`；风险=`{item.evaluation.risk_grade}`；家宽=`{item.evaluation.residential_grade}`；"
                 f"分数：`{item.evaluation.score:.2f}`",
+                f"- 本轮观察分：`{item.evaluation.evidence.get('observed_score', item.evaluation.score)}`；"
+                f"生效排名分来源：`{item.evaluation.evidence.get('ranking_score_source', 'current')}`；"
+                f"历史分日期：`{item.evaluation.evidence.get('ranking_score_day') or '-'}`",
                 f"- 分项得分：`{json.dumps(item.evaluation.components, ensure_ascii=False, sort_keys=True)}`",
                 f"- 评分证据：`{json.dumps(evaluation.get('evidence', {}), ensure_ascii=False, sort_keys=True)}`",
                 f"- 原因：{_markdown_escape(reasons)}",

@@ -343,11 +343,12 @@ def _promotion_margin_holds(candidate: NodeAssessment, incumbent: NodeAssessment
         return False
     compared = common[:days]
     try:
-        dates = [date.fromisoformat(value) for value in compared]
+        for value in compared:
+            date.fromisoformat(value)
     except ValueError:
         return False
-    if any(dates[index] - dates[index + 1] != timedelta(days=1) for index in range(len(dates) - 1)):
-        return False
+    # Compare the most recent shared valid observation days. Missing or
+    # platform-outage days are pauses, not failed quality evidence.
     for day in compared:
         try:
             candidate_score = float(candidate_history[day].get("score"))

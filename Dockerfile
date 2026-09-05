@@ -33,6 +33,9 @@ COPY ref/dnsbl.list /app/ref/dnsbl.list
 RUN chmod 0755 /app/ip.sh \
     && chmod 0444 /app/ref/dnsbl.list
 
+ARG VCS_REF=unknown
+ENV NODE_HEALTH_REVISION=${VCS_REF}
+
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/bin/tini", "--"]

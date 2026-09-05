@@ -564,6 +564,17 @@ get_ipv4(){
 local response
 IPV4=""
 local API_NET=("ipinfo.io/ip" "myip.check.place" "ip.sb" "ping0.cc" "icanhazip.com" "api64.ipify.org" "ifconfig.co" "ident.me")
+if [[ ${IPQUALITY_AUTOMATION:-0} == 1 ]];then
+local timeout=${IPQUALITY_REQUEST_TIMEOUT:-15}
+for p in "https://api.ipify.org" "https://api4.ipify.org" "https://icanhazip.com";do
+response=$(curl $CurlARG -fsSL4 --connect-timeout "$timeout" --max-time "$timeout" "$p")
+if [[ $? -eq 0 && $response =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]];then
+IPV4="$response"
+return 0
+fi
+done
+return 1
+fi
 for p in "${API_NET[@]}";do
 response=$(curl $CurlARG -s4 --max-time 2 "$p")
 if [[ $? -eq 0 && $response =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]];then
@@ -601,6 +612,10 @@ fi
 return 1
 }
 get_ipv6(){
+if [[ ${IPQUALITY_AUTOMATION:-0} == 1 && $IPV6check -eq 0 ]];then
+IPV6=""
+return 0
+fi
 local response
 IPV6=""
 local API_NET=("myip.check.place" "ip.sb" "ping0.cc" "icanhazip.com" "api64.ipify.org" "ifconfig.co" "ident.me")
@@ -931,11 +946,11 @@ bar_pid="$!"&&disown "$bar_pid"
 trap "kill_progress_bar" RETURN
 ipapi=()
 if [[ $IP == *:* ]];then
-local RESPONSE=$(curl -Ls -m 10 "https://api.ipapi.is/?q=$IP")
+local RESPONSE=$(curl -fLs -m 10 "https://api.ipapi.is/?q=$IP")
 else
-local RESPONSE=$(curl $CurlARG -sL -m 10 "https://api.ipapi.is/?q=$IP")
+local RESPONSE=$(curl $CurlARG -fsL -m 10 "https://api.ipapi.is/?q=$IP")
 fi
-echo "$RESPONSE"|jq . >/dev/null 2>&1||RESPONSE=""
+printf '%s\n' "$RESPONSE"|jq -e 'type == "object" and (.error | not) and (.company.abuser_score != null)' >/dev/null 2>&1||return 1
 ipapi[usetype]=$(echo "$RESPONSE"|jq -r '.asn.type')
 ipapi[comtype]=$(echo "$RESPONSE"|jq -r '.company.type')
 shopt -s nocasematch
@@ -972,6 +987,7 @@ esac
 [[ -z $RESPONSE ]]&&return 1
 ipapi[scoretext]=$(echo "$RESPONSE"|jq -r '.company.abuser_score')
 ipapi[scorenum]=$(echo "${ipapi[scoretext]}"|awk '{print $1}')
+[[ ${ipapi[scorenum]} =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]||return 1
 ipapi[risktext]=$(echo "${ipapi[scoretext]}"|awk -F'[()]' '{print $2}')
 ipapi[score]=$(awk "BEGIN {printf \"%.2f%%\", ${ipapi[scorenum]} * 100}")
 case ${ipapi[risktext]} in
@@ -2598,8 +2614,16 @@ mail_updates+=".Mail |= . * { DNSBlacklist: { Marked: ${smail[m]:-null} } } | "
 mail_updates+=".Mail |= . * { DNSBlacklist: { Blacklisted: ${smail[b]:-null} } } | "
 ipjson=$(echo "$ipjson"|jq "$head_updates$basic_updates$type_updates$score_updates$factor_updates$media_updates$mail_updates.")
 }
+automation_checkpoint(){
+[[ ${IPQUALITY_AUTOMATION:-0} == 1 && -n ${IPQUALITY_CHECKPOINT_FILE:-} ]]||return 0
+save_json
+automation_timings=$(printf '%s\n' "$automation_timings"|jq --arg stage "$1" --argjson elapsed "$((SECONDS-automation_started))" '. + {($stage): $elapsed}')
+printf '%s\n' "$ipjson"|jq --arg stage "$1" --argjson timings "$automation_timings" '.Automation = {stage:$stage, stage_elapsed_seconds:$timings, complete:false}' >"${IPQUALITY_CHECKPOINT_FILE}.tmp" && mv -f "${IPQUALITY_CHECKPOINT_FILE}.tmp" "$IPQUALITY_CHECKPOINT_FILE"
+}
 check_IP(){
 IP=$1
+local automation_started=$SECONDS
+local automation_timings='{}'
 ibar_step=0
 ipjson='{
       "Head": {},
@@ -2623,19 +2647,24 @@ db_ipapi $2
 db_dbip
 [[ $mode_lite -eq 0 ]]&&db_ipdata $2||ipdata=()
 [[ $mode_lite -eq 0 ]]&&db_ipqs $2||ipqs=()
+automation_checkpoint risk
+if [[ ${IPQUALITY_AUTOMATION:-0} != 1 ]];then
 MediaUnlockTest_TikTok $2
 MediaUnlockTest_DisneyPlus $2
 MediaUnlockTest_Netflix $2
 MediaUnlockTest_YouTube_Premium $2
 MediaUnlockTest_PrimeVideo_Region $2
 MediaUnlockTest_Reddit $2
+fi
 OpenAITest $2
+automation_checkpoint ai
 if [[ -n $usePROXY || ${IPQUALITY_SKIP_MAIL:-0} == 1 ]];then
 skip_mail
 else
 check_mail
 fi
 [[ $2 -eq 4 ]]&&check_dnsbl "$IP" 50
+automation_checkpoint dnsbl
 echo -ne "$Font_LineClear" 1>&2
 if [ $2 -eq 4 ]||[[ $IPV4work -eq 0 || $IPV4check -eq 0 ]];then
 for ((i=0; i<ADLines; i++));do
@@ -2664,16 +2693,19 @@ show_tail)
 fi
 local report_link=""
 [[ mode_json -eq 1 || mode_output -eq 1 || mode_privacy -eq 0 ]]&&save_json
+if [[ ${IPQUALITY_AUTOMATION:-0} == 1 ]];then
+ipjson=$(printf '%s\n' "$ipjson"|jq --argjson timings "$automation_timings" --argjson elapsed "$((SECONDS-automation_started))" '.Automation = {stage:"complete", stage_elapsed_seconds:$timings, elapsed_seconds:$elapsed, complete:true}')
+fi
 [[ $mode_lite -eq 0 && mode_privacy -eq 0 ]]&&report_link=$(curl -$2 -s -X POST https://upload.check.place -d "type=ip" --data-urlencode "json=$ipjson" --data-urlencode "content=$ip_report")
 [[ mode_json -eq 0 ]]&&echo -ne "\r$ip_report\n"
 [[ mode_json -eq 0 && mode_privacy -eq 0 && $report_link == *"https://Report.Check.Place/"* ]]&&echo -ne "\r${stail[link]}$report_link$Font_Suffix\n"
-[[ mode_json -eq 1 ]]&&echo -ne "\r$ipjson\n"
+[[ mode_json -eq 1 ]]&&printf '%s\n' "$ipjson"
 echo -ne "\r\n"
 if [[ mode_output -eq 1 ]];then
 case "$outputfile" in
 *.[aA][nN][sS][iI])echo "$ip_report" >>"$outputfile" 2>/dev/null
 ;;
-*.[jJ][sS][oO][nN])echo "$ipjson" >>"$outputfile" 2>/dev/null
+*.[jJ][sS][oO][nN])printf '%s\n' "$ipjson" >>"$outputfile" 2>/dev/null
 ;;
 *)echo -e "$ip_report"|sed 's/\x1b\[[0-9;]*[mGKHF]//g' >>"$outputfile" 2>/dev/null
 esac
@@ -2681,12 +2713,14 @@ fi
 }
 generate_random_user_agent
 adapt_locale
+if [[ ${IPQUALITY_AUTOMATION:-0} != 1 ]];then
 check_connectivity
 read_ref
 get_ipv4
 get_ipv6
 is_valid_ipv4 $IPV4
 is_valid_ipv6 $IPV6
+fi
 get_opts "$@"
 [[ mode_no -eq 0 ]]&&install_dependencies 1>&2
 set_language
