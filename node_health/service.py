@@ -3,17 +3,24 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import ipaddress
 import json
 import logging
 import math
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig
+from .errors import SafeFailure, safe_error_text, safe_error_value, safe_failure, sanitize_error_fields
+from .evidence_migration import (
+    UnsupportedEvidenceVersion,
+    finalize_evidence_migration, invalidate_removed_migration_slots,
+    migrate_evidence_state, migration_grace_for_observation,
+)
 from .audit import (
     download_subscription,
     new_audit_id,
@@ -28,8 +35,12 @@ from .inventory import (
     inventory_digest,
     parse_clash_inventory,
 )
-from .models import ClaudeResult, Evaluation, FullResult, Node, NodeAssessment, QuickResult
+from .identity import node_aliases, node_identity
+from .models import ClaudeResult, Evaluation, FullResult, Node, NodeAssessment, QuickResult, SiteProbeResult
 from .policy import (
+    EVIDENCE_POLICY_VERSION,
+    PROBE_CONTRACT_VERSION,
+    RISK_EVIDENCE_VERSION,
     GRADE_ORDER,
     _full_country_majority,
     chatgpt_explicitly_allowed,
@@ -40,6 +51,9 @@ from .policy import (
     full_has_usable_reputation,
     risk_sources_conflict,
     select_full_audit_nodes,
+    attach_quick_ai_evidence,
+    sample_qualified,
+    site_probe_valid,
 )
 from .probe import (
     CurlQuickProbe,
@@ -50,7 +64,8 @@ from .probe import (
     QuickProbe,
     run_parallel,
 )
-from .reconcile import SCHEMA_VERSION, reconcile_previous_state
+from .reconcile import SCHEMA_VERSION, reconcile_previous_state, resolve_effective_regions
+from .port_mapping import MapError, build_port_mapping, mapping_digest
 from .slots import assign_all_regions
 from .storage import StateStore
 
@@ -83,9 +98,13 @@ def _full_from_dict(value: Any) -> FullResult | None:
         "details",
         "checked_at",
         "error",
+        "chatgpt",
+        "risk_evidence_version",
+        "chatgpt_evidence_version",
     }
     try:
         result = FullResult(**{key: item for key, item in value.items() if key in allowed})
+        result.chatgpt = SiteProbeResult.from_dict(result.chatgpt)
         if not result.audited_exit_ip and isinstance(result.details, dict):
             head = result.details.get("Head")
             if isinstance(head, dict):
@@ -133,6 +152,14 @@ def _merge_full_with_cached_chatgpt(
     )
     if prior_chatgpt is not None:
         media["ChatGPT"] = copy.deepcopy(prior_chatgpt)
+    if prior is not None and (
+        fresh.chatgpt.exit_ip
+        and fresh.chatgpt.exit_ip == prior.chatgpt.exit_ip
+        and site_probe_valid(prior.chatgpt)
+        and prior.chatgpt_evidence_version == PROBE_CONTRACT_VERSION
+    ):
+        merged.chatgpt = copy.deepcopy(prior.chatgpt)
+        merged.chatgpt_evidence_version = prior.chatgpt_evidence_version
     return merged
 
 
@@ -141,7 +168,10 @@ def _claude_from_dict(value: Any) -> ClaudeResult:
         return ClaudeResult()
     allowed = set(ClaudeResult.__dataclass_fields__)
     try:
-        return ClaudeResult(**{key: item for key, item in value.items() if key in allowed})
+        result = ClaudeResult(**{key: item for key, item in value.items() if key in allowed})
+        result.site_probe = SiteProbeResult.from_dict(result.site_probe)
+        result.anthropic_probe = SiteProbeResult.from_dict(result.anthropic_probe)
+        return result
     except TypeError:
         return ClaudeResult()
 
@@ -236,6 +266,7 @@ class NodeHealthService:
         self._status_lock = threading.Lock()
         self._running_mode = ""
         self._last_error = ""
+        self._last_error_detail: dict[str, Any] | None = None
         published = self.store.load_current()
         self._last_success = str(published.get("generated_at") or "")
         self._last_quality_summary = dict(published.get("quality_summary") or {})
@@ -251,6 +282,7 @@ class NodeHealthService:
                 "running_mode": self._running_mode or None,
                 "last_success": self._last_success or None,
                 "last_error": self._last_error or None,
+                "last_error_detail": dict(self._last_error_detail) if self._last_error_detail else None,
                 "quality_summary": dict(self._last_quality_summary),
                 "active_audit_id": self._active_audit_id or None,
                 "started_at": self._task_started_at or None,
@@ -274,6 +306,8 @@ class NodeHealthService:
             "total_nodes": total,
             "remaining_nodes": max(0, total - completed),
             "percent": round(completed / total * 100, 2) if total else 0.0,
+            "phase_percent": round(completed / total * 100, 2) if total else 0.0,
+            "percent_scope": "phase",
         }
         payload.update(extra)
         return payload
@@ -311,6 +345,22 @@ class NodeHealthService:
             self._task_started_at = ""
             self._progress = None
 
+    def _record_failure(
+        self, error: BaseException, *, code: str | None = None, phase: str | None = None
+    ) -> SafeFailure:
+        if code is None and isinstance(error, UnsupportedEvidenceVersion):
+            code = "evidence_version_unsupported"
+        elif code is None and isinstance(error, NoPublishSafetyAbort):
+            code = "unsafe_first_run"
+        with self._status_lock:
+            selected_phase = phase or (self._progress or {}).get("phase", "unknown")
+        failure = safe_failure(error, selected_phase, code=code)
+        LOGGER.error("node-health failure: %s phase=%s", failure, failure.phase)
+        with self._status_lock:
+            self._last_error = str(failure)
+            self._last_error_detail = failure.to_dict()
+        return failure
+
     def run_once(self, mode: str = "maintenance") -> dict[str, Any]:
         if mode not in {"maintenance", "rebuild"}:
             raise ValueError("mode must be maintenance or rebuild")
@@ -319,6 +369,7 @@ class NodeHealthService:
         with self._status_lock:
             self._running_mode = mode
             self._last_error = ""
+            self._last_error_detail = None
             self._task_started_at = ""
             self._progress = self._progress_payload("queued")
         try:
@@ -327,9 +378,7 @@ class NodeHealthService:
                 self._last_success = current["generated_at"]
             return current
         except Exception as error:
-            LOGGER.exception("node-health scan failed")
-            with self._status_lock:
-                self._last_error = str(error)
+            self._record_failure(error)
             raise
         finally:
             self._clear_task_status()
@@ -345,6 +394,7 @@ class NodeHealthService:
         with self._status_lock:
             self._running_mode = mode
             self._last_error = ""
+            self._last_error_detail = None
             self._task_started_at = ""
             self._progress = self._progress_payload("queued")
 
@@ -354,9 +404,7 @@ class NodeHealthService:
                 with self._status_lock:
                     self._last_success = current["generated_at"]
             except Exception as error:
-                LOGGER.exception("background node-health scan failed")
-                with self._status_lock:
-                    self._last_error = str(error)
+                self._record_failure(error)
             finally:
                 self._clear_task_status()
                 self._run_lock.release()
@@ -365,15 +413,15 @@ class NodeHealthService:
             thread = threading.Thread(target=worker, name=f"node-health-{mode}", daemon=True)
             thread.start()
         except Exception as error:
-            message = f"failed to start background scan: {error}"
-            LOGGER.exception(message)
+            failure = self._record_failure(error, code="worker_start_failed", phase="queued")
+            message = str(failure)
             with self._status_lock:
                 self._running_mode = ""
                 self._task_started_at = ""
                 self._progress = None
                 self._last_error = message
             self._run_lock.release()
-            raise ScanStartError(message) from error
+            raise ScanStartError(message) from None
         return True
 
     def trigger_subscription_audit(self, subscription_url: str, name: str = "") -> str | None:
@@ -415,6 +463,7 @@ class NodeHealthService:
             self._running_mode = "subscription-audit"
             self._active_audit_id = audit_id
             self._last_error = ""
+            self._last_error_detail = None
             self._task_started_at = ""
             self._progress = self._progress_payload("queued")
 
@@ -422,7 +471,7 @@ class NodeHealthService:
             try:
                 self._run_subscription_audit_locked(audit_id, url, audit_name, status)
             except Exception as error:
-                LOGGER.exception("background subscription audit failed: %s", audit_id)
+                failure = self._record_failure(error)
                 completed_at = self.clock()
                 if completed_at.tzinfo is None:
                     completed_at = completed_at.replace(tzinfo=timezone.utc)
@@ -432,12 +481,11 @@ class NodeHealthService:
                         status="failed",
                         phase="failed",
                         completed_at=completed_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
-                        error=str(error)[:2000],
+                        error=str(failure),
+                        error_detail=failure.to_dict(),
                     )
-                except Exception:
-                    LOGGER.exception("failed to persist audit failure: %s", audit_id)
-                with self._status_lock:
-                    self._last_error = f"subscription audit {audit_id} failed: {error}"
+                except Exception as persist_error:
+                    LOGGER.error("audit failure persistence: %s", safe_error_text(persist_error, "publishing"))
             finally:
                 self._clear_task_status()
                 self._run_lock.release()
@@ -450,7 +498,8 @@ class NodeHealthService:
             )
             thread.start()
         except Exception as error:
-            message = f"failed to start subscription audit worker: {error}"
+            failure = self._record_failure(error, code="worker_start_failed", phase="queued")
+            message = str(failure)
             try:
                 self.store.update_audit_status(
                     audit_id,
@@ -458,9 +507,10 @@ class NodeHealthService:
                     phase="failed",
                     completed_at=created_at,
                     error=message,
+                    error_detail=failure.to_dict(),
                 )
-            except Exception:
-                LOGGER.exception("failed to persist audit worker-start failure: %s", audit_id)
+            except Exception as persist_error:
+                LOGGER.error("audit startup failure persistence: %s", safe_error_text(persist_error, "publishing"))
             finally:
                 with self._status_lock:
                     self._running_mode = ""
@@ -469,7 +519,7 @@ class NodeHealthService:
                     self._progress = None
                     self._last_error = message
                 self._run_lock.release()
-            raise ScanStartError(message) from error
+            raise ScanStartError(message) from None
         return audit_id
 
     def _run_subscription_audit_locked(
@@ -497,12 +547,13 @@ class NodeHealthService:
             self.config.inventory.timeout_seconds,
             self.config.audit.max_subscription_bytes,
         )
-        nodes = parse_clash_inventory(payload, self.config.region_patterns)
+        nodes = resolve_effective_regions(parse_clash_inventory(payload, self.config.region_patterns), {}, "rebuild")
         if not nodes:
             raise ValueError("subscription contains no proxies")
-        if len(nodes) > self.config.audit.max_nodes:
+        input_count = sum(len(node_aliases(node)) for node in nodes)
+        if input_count > self.config.audit.max_nodes:
             raise ValueError(
-                f"subscription contains {len(nodes)} nodes; audit.max_nodes is {self.config.audit.max_nodes}"
+                f"subscription contains {input_count} entries; audit.max_nodes is {self.config.audit.max_nodes}"
             )
         source_digest = inventory_digest(nodes)
         self._set_progress("quick-scan", 0, len(nodes), len(nodes))
@@ -531,7 +582,7 @@ class NodeHealthService:
                         LOGGER.warning(
                             "audit %s progress persistence failed: %s",
                             audit_id,
-                            error,
+                            safe_error_text(error, "publishing"),
                         )
                     finally:
                         last_persisted = completed
@@ -539,10 +590,17 @@ class NodeHealthService:
             return update
 
         with self.environment.open(nodes) as ports:
+            def persist_retry_progress(progress: dict[str, Any]) -> None:
+                try:
+                    self.store.update_audit_status(audit_id, phase=progress["phase"], progress=progress)
+                except OSError as error:
+                    LOGGER.warning("audit progress persistence: %s", safe_error_text(error, "publishing"))
+
             quick_results = self._run_quick_with_retries(
                 nodes,
                 ports,
                 audit_progress_callback("quick-scan", len(nodes)),
+                retry_progress_observer=persist_retry_progress,
             )
             ai_service_outages = self._apply_ai_service_outage_guard(
                 nodes, quick_results
@@ -575,6 +633,8 @@ class NodeHealthService:
             if len(full_results) != len(available_nodes):
                 raise RuntimeError("full audit did not return one result for every available node")
             self._validate_full_exit_ips(available_nodes, quick_results, full_results)
+            for key, full in full_results.items():
+                attach_quick_ai_evidence(full, quick_results[key])
 
         assessments: list[NodeAssessment] = []
         for node in nodes:
@@ -645,6 +705,7 @@ class NodeHealthService:
             "ai_services": ai_service_outages,
         }
         current["source"].update(initial_status["source"])
+        self._attach_port_mapping(current, nodes, purpose="audit-proposal")
         publishing_progress = self._set_progress(
             "publishing", len(nodes), len(nodes), len(nodes)
         )
@@ -714,10 +775,12 @@ class NodeHealthService:
         nodes: list[Node],
         ports: dict[str, int],
         progress_callback: Callable[[int, int], None] | None = None,
+        *,
+        retry_progress_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, QuickResult]:
         begin_scan = getattr(self.quick_probe, "begin_scan", None)
         if callable(begin_scan):
-            begin_scan()
+            begin_scan(request_routes=list(ports.values()))
         quick_raw = run_parallel(
             nodes,
             ports,
@@ -736,17 +799,34 @@ class NodeHealthService:
         pending = set(initially_failed)
         retry_errors = {key: [results[key].error] for key in pending}
         attempts = {key: 0 for key in pending}
-        for delay in self.config.probe.unavailable_retry_delays_seconds:
+        delays = self.config.probe.unavailable_retry_delays_seconds
+        for round_number, delay in enumerate(delays, 1):
             if not pending:
                 break
+            def retry_progress(phase: str, completed: int, total: int, *, waiting: bool = False) -> None:
+                now = self.clock()
+                if now.tzinfo is None:
+                    now = now.replace(tzinfo=timezone.utc)
+                progress = self._set_progress(
+                    phase, completed, total, len(nodes),
+                    retry_round=round_number, retry_limit=len(delays),
+                    retry_pending_nodes=len(pending),
+                    next_retry_at=(now + timedelta(seconds=float(delay))).isoformat(timespec="seconds") if waiting else None,
+                )
+                if retry_progress_observer:
+                    retry_progress_observer(progress)
+
+            retry_progress("waiting-retry", 0, len(pending), waiting=True)
             self.sleeper(float(delay))
             retry_nodes = [node for node in nodes if node.key in pending]
+            retry_progress("rechecking", 0, len(retry_nodes))
             retry_raw = run_parallel(
                 retry_nodes,
                 ports,
                 self.quick_probe,
                 self.config.probe.concurrency,
                 "quick",
+                lambda completed, total: retry_progress("rechecking", completed, total),
             )
             for node in retry_nodes:
                 attempts[node.key] += 1
@@ -762,6 +842,7 @@ class NodeHealthService:
                 else:
                     value.retry_count = attempts[node.key]
                     results[node.key] = value
+            retry_progress("rechecking", len(retry_nodes), len(retry_nodes))
         for key in initially_failed:
             results[key].retry_count = attempts.get(key, 0)
             errors = [value for value in retry_errors.get(key, []) if value]
@@ -782,6 +863,18 @@ class NodeHealthService:
 
         def observed_country(node: Node) -> str:
             result = results[node.key]
+            site = result.chatgpt
+            if site.country:
+                return site.country.upper()
+            if not site.exit_ip:
+                return ""
+            prior = prior_nodes.get(node.key, {})
+            prior_full = _full_from_dict(prior.get("last_full"))
+            prior_site = prior_full.chatgpt if prior_full else SiteProbeResult()
+            if prior_site.exit_ip == site.exit_ip and prior_site.country:
+                return prior_site.country.upper()
+            if site.exit_ip != result.exit_ip:
+                return ""
             current = str(result.country or "").upper()
             if current:
                 return current
@@ -812,7 +905,14 @@ class NodeHealthService:
                     return str(prior_claude.country).upper()
                 if claude_exit != result.exit_ip:
                     return ""
-            return observed_country(node)
+            if claude_exit and claude_exit == result.exit_ip:
+                country = str(result.country or "").upper()
+                if country:
+                    return country
+                prior = prior_nodes.get(node.key, {})
+                if prior.get("last_exit_ip") == claude_exit:
+                    return str(prior.get("last_country") or "").upper()
+            return ""
 
         def group_by_egress(
             scoped_nodes: list[Node], service: str
@@ -821,13 +921,17 @@ class NodeHealthService:
             for node in scoped_nodes:
                 result = results[node.key]
                 egress = (
-                    result.claude.exit_ip or result.exit_ip
+                    result.claude.exit_ip
                     if service == "claude"
-                    else result.exit_ip
+                    else result.chatgpt.exit_ip
                 )
                 egress = str(egress or "").strip().lower()
-                if egress:
-                    grouped.setdefault(egress, []).append(node)
+                try:
+                    address = ipaddress.ip_address(egress)
+                except ValueError:
+                    continue
+                if address.is_global:
+                    grouped.setdefault(str(address), []).append(node)
             return grouped
 
         status: dict[str, Any] = {}
@@ -837,13 +941,15 @@ class NodeHealthService:
             chatgpt_supported = [
                 node
                 for node in healthy
-                if observed_country(node) in chatgpt_countries
+                if results[node.key].chatgpt.attempted
+                and results[node.key].chatgpt.probe_contract_version == PROBE_CONTRACT_VERSION
+                and observed_country(node) in chatgpt_countries
             ]
             chatgpt_routes = group_by_egress(chatgpt_supported, "chatgpt")
             chatgpt_failed = [
                 route
                 for route, route_nodes in chatgpt_routes.items()
-                if all(results[node.key].chatgpt_ok is False for node in route_nodes)
+                if all(results[node.key].chatgpt.result_class != "available" for node in route_nodes)
             ]
             ratio = (
                 len(chatgpt_failed) / len(chatgpt_routes)
@@ -873,11 +979,13 @@ class NodeHealthService:
                 node
                 for node in healthy
                 if (
-                    results[node.key].claude.supported is True
+                    results[node.key].claude.site_probe.attempted
+                    and results[node.key].claude.site_probe.probe_contract_version == PROBE_CONTRACT_VERSION
+                    and (results[node.key].claude.supported is True
                     or (
                         results[node.key].claude.supported is None
                         and claude_observed_country(node) in supported_countries
-                    )
+                    ))
                 )
             ]
             claude_routes = group_by_egress(supported, "claude")
@@ -915,7 +1023,7 @@ class NodeHealthService:
                 except Exception as error:
                     status[service]["diagnostics"] = {
                         "diagnostic_only": True,
-                        "error": str(error)[:500],
+                        "error": safe_error_text(error, "quick-scan", code="probe_failed"),
                     }
         return status
 
@@ -986,9 +1094,11 @@ class NodeHealthService:
         with self._status_lock:
             self._task_started_at = started_iso
         self._set_progress("downloading")
-        previous = self.store.load_state()
+        previous = migrate_evidence_state(self.store.load_state(), self.config.policy, started_at)
         nodes, source_digest = fetch_inventory(self.config, self.downloader)
         nodes, previous, identity_events = reconcile_previous_state(nodes, previous)
+        nodes = resolve_effective_regions(nodes, previous, requested_mode)
+        invalidate_removed_migration_slots(previous, {node.key for node in nodes})
         # States published before frozen `other` ordering existed have no
         # durable baseline to preserve. Bootstrap them with one full rebuild
         # instead of letting the first maintenance run silently adopt an
@@ -1088,9 +1198,10 @@ class NodeHealthService:
                 elif result.audited_exit_ip != expected_ip:
                     result.completed = False
                     result.error = (
-                        "full audit egress changed during scan: "
-                        f"{result.audited_exit_ip} != {expected_ip}"
+                        safe_error_text(None, "full-scan", code="egress_mismatch")
                     )
+            for key, full in scanned_full.items():
+                attach_quick_ai_evidence(full, quick_results[key])
 
         self._set_progress("publishing", len(nodes), len(nodes), len(nodes))
         assessments = self._assess(
@@ -1152,11 +1263,31 @@ class NodeHealthService:
             "fresh_full_usable": sum(item.fresh_full_usable for item in assessments),
             "evidence_valid": sum(item.evidence_valid for item in assessments),
         }
+        self._attach_port_mapping(current, nodes)
         state = self._build_state(current, previous, assessments, regions, changes)
+        invalidate_removed_migration_slots(state, {node.key for node in nodes})
+        state = finalize_evidence_migration(state, generated_at, configured_timezone)
+        current["evidence_policy_version"] = EVIDENCE_POLICY_VERSION
+        current["evidence_migration"] = copy.deepcopy(state.get("evidence_migration"))
         self.store.publish(current, state, assessments, changes, generated_at.astimezone(configured_timezone))
         with self._status_lock:
             self._last_quality_summary = dict(current["quality_summary"])
         return current
+
+    def _attach_port_mapping(
+        self, current: dict[str, Any], nodes: list[Node], *, purpose: str = "production"
+    ) -> None:
+        try:
+            mapping = build_port_mapping(current, nodes, self.config)
+        except MapError:
+            current["runtime_target_status"] = "invalid"
+            current["runtime_target_error"] = safe_error_text(None, "publishing", code="mapping_unavailable")
+            current["port_mapping"] = None
+        else:
+            mapping["purpose"] = purpose
+            mapping["mapping_version"] = mapping_digest(mapping)
+            current["port_mapping"] = mapping
+            current["runtime_target_status"] = "ready" if purpose == "production" else "audit-proposal"
 
     @staticmethod
     def _runtime_version(
@@ -1193,7 +1324,6 @@ class NodeHealthService:
     ) -> list[NodeAssessment]:
         prior_nodes = previous.get("nodes", {})
         stable_keys = _all_stable_keys(previous)
-        stable_regions = _stable_region_by_key(previous)
         frozen_regions = frozen_regions or {}
         run_at = run_at or self.clock()
         if run_at.tzinfo is None:
@@ -1201,21 +1331,15 @@ class NodeHealthService:
         current_day = run_at.astimezone(ZoneInfo(self.config.schedule.timezone)).date().isoformat()
         assessments: list[NodeAssessment] = []
         for node in nodes:
-            if node.key in stable_regions and node.region != stable_regions[node.key]:
-                node = Node(
-                    key=node.key,
-                    name=node.name,
-                    region=stable_regions[node.key],
-                    proxy=node.proxy,
-                    source_id=node.source_id,
-                    original_name=node.original_name,
-                    normalized_name=node.normalized_name,
-                    logical_id=node.logical_id,
-                )
             quick = quick_results[node.key]
             prior = prior_nodes.get(node.key, {})
             prior_claude = _claude_from_dict(prior.get("last_claude"))
-            if quick.claude.service_outage and prior_claude.status != "unknown":
+            if (
+                quick.claude.service_outage
+                and quick.claude.exit_ip
+                and quick.claude.exit_ip == prior_claude.exit_ip
+                and site_probe_valid(prior_claude.site_probe)
+            ):
                 quick.claude = prior_claude
                 quick.claude.service_outage = True
             elif (
@@ -1224,6 +1348,7 @@ class NodeHealthService:
                 and not quick.claude.intelligence_complete
                 and prior_claude.exit_ip == quick.claude.exit_ip
                 and prior_claude.intelligence_complete
+                and prior_claude.risk_evidence_version == RISK_EVIDENCE_VERSION
             ):
                 quick.claude.asn = prior_claude.asn
                 quick.claude.organization = prior_claude.organization
@@ -1233,12 +1358,18 @@ class NodeHealthService:
                 quick.claude.residential = prior_claude.residential
                 quick.claude.intelligence_complete = True
                 quick.claude.intelligence_cached = True
+                quick.claude.risk_evidence_version = prior_claude.risk_evidence_version
             if quick.chatgpt_service_outage:
                 quick.chatgpt_ok = None
             if quick.claude.exit_ip:
                 previous_claude_ip = str(prior_claude.exit_ip or "")
                 quick.claude.route_stable = not previous_claude_ip or previous_claude_ip == quick.claude.exit_ip
             prior_full = _full_from_dict(prior.get("last_full"))
+            if prior_full and (
+                not quick.chatgpt.exit_ip or quick.chatgpt.exit_ip != prior_full.chatgpt.exit_ip
+            ):
+                # Historical AI evidence cannot score an unobserved service route.
+                prior_full.chatgpt_evidence_version = 0
             prior_full_exit_ip = str(
                 prior.get("last_full_exit_ip")
                 or (prior_full.audited_exit_ip if prior_full else "")
@@ -1261,6 +1392,7 @@ class NodeHealthService:
             fresh_risk_is_trustworthy = bool(
                 fresh_full
                 and fresh_full.completed
+                and fresh_full.risk_evidence_version == RISK_EVIDENCE_VERSION
                 and (
                     full_has_usable_reputation(fresh_full, self.config.policy)
                     or full_has_confirmed_redline(fresh_full, self.config.policy)
@@ -1271,8 +1403,8 @@ class NodeHealthService:
                 and fresh_full.completed
                 and not quick.chatgpt_service_outage
                 and (
-                    chatgpt_explicitly_allowed(fresh_full)
-                    or chatgpt_is_redline(chatgpt_status(fresh_full.details))
+                    fresh_full.chatgpt_evidence_version == PROBE_CONTRACT_VERSION
+                    and site_probe_valid(fresh_full.chatgpt)
                 )
             )
             fresh_is_trustworthy = bool(
@@ -1351,6 +1483,8 @@ class NodeHealthService:
             )
             evidence_valid = bool(
                 quick.available
+                and sample_qualified(quick, self.config.policy)
+                and not node.region_conflict
                 and not quick.transient_recovery
                 and fresh_full
                 and fresh_full.completed
@@ -1358,6 +1492,7 @@ class NodeHealthService:
                 and not quick.chatgpt_service_outage
                 and not quick.claude.service_outage
                 and quick.claude.status not in {"unknown", "degraded"}
+                and site_probe_valid(quick.claude.site_probe)
                 and not quick.claude.intelligence_cached
                 and not (
                     quick.claude.country
@@ -1373,6 +1508,7 @@ class NodeHealthService:
                 and preliminary.overall_grade in {"A", "B"}
                 and preliminary.risk_grade != "C"
                 and preliminary.ai_grade != "C"
+                and "chatgpt-intelligence-country-conflict" not in preliminary.reasons
             )
             if frozen:
                 unavailable_runs = int(prior.get("consecutive_unavailable_runs", 0) or 0)
@@ -1413,6 +1549,17 @@ class NodeHealthService:
                 unavailable_days = 0
                 last_unavailable_day = ""
                 grace_active = False
+            elif quick.available:
+                unavailable_days = 0
+                last_unavailable_day = ""
+                grace_active = False
+
+            grace_active = migration_grace_for_observation(
+                previous, node_key=node.key, region=node.region, now=run_at,
+                current_day=current_day, available=quick.available,
+                severe=quick.available and preliminary.overall_grade == "C",
+                frozen=frozen, normal_grace=grace_active, prior=prior,
+            )
 
             evaluation = evaluate_node(
                 node,
@@ -1426,21 +1573,47 @@ class NodeHealthService:
             )
             if (
                 (quick.chatgpt_service_outage or quick.claude.service_outage)
-                and str(prior.get("ai_grade") or "") in GRADE_ORDER
-                and isinstance(prior.get("score_components"), dict)
+                and prior.get("qualification_version") == EVIDENCE_POLICY_VERSION
             ):
-                previous_ai_grade = str(prior["ai_grade"])
-                try:
-                    previous_ai_points = float(prior["score_components"].get("ai", 0))
-                except (TypeError, ValueError):
-                    previous_ai_points = evaluation.components.get("ai", 0)
-                evaluation.components["ai"] = max(0.0, min(25.0, previous_ai_points))
-                evaluation.ai_grade = previous_ai_grade
+                scoring_quick, scoring_full = copy.deepcopy(quick), copy.deepcopy(full)
+                cached_services = []
+                if (
+                    quick.chatgpt_service_outage and scoring_full and prior_full
+                    and quick.chatgpt.exit_ip
+                    and quick.chatgpt.exit_ip == prior_full.chatgpt.exit_ip
+                    and prior_full.chatgpt_evidence_version == PROBE_CONTRACT_VERSION
+                    and site_probe_valid(prior_full.chatgpt)
+                ):
+                    scoring_quick.chatgpt_service_outage = False
+                    scoring_quick.chatgpt = copy.deepcopy(prior_full.chatgpt)
+                    scoring_full.chatgpt = copy.deepcopy(prior_full.chatgpt)
+                    scoring_full.chatgpt_evidence_version = PROBE_CONTRACT_VERSION
+                    cached_services.append("chatgpt")
+                if (
+                    quick.claude.service_outage and quick.claude.exit_ip
+                    and quick.claude.exit_ip == prior_claude.exit_ip
+                    and site_probe_valid(prior_claude.site_probe)
+                ):
+                    scoring_quick.claude = copy.deepcopy(prior_claude)
+                    scoring_quick.claude.service_outage = False
+                    cached_services.append("claude")
+                protected = evaluate_node(
+                    node, scoring_quick, scoring_full, self.config.policy, passes,
+                    previous_exit_ip=str(prior.get("last_exit_ip") or ""),
+                    was_stable=node.key in stable_keys, healthy_streak_days=healthy_streak,
+                )
+                evaluation.components["ai"] = protected.components["ai"]
+                evaluation.ai_grade = protected.ai_grade
+                evaluation.evidence["ai"] = protected.evidence.get("ai", {})
+                evaluation.evidence["ai"]["cached_services"] = cached_services
                 if evaluation.overall_grade != "C":
                     evaluation.overall_grade = max(
                         (evaluation.ai_grade, evaluation.risk_grade),
                         key=lambda value: GRADE_ORDER.get(value, 2),
                     )
+                if evaluation.overall_grade == "C":
+                    evaluation.decision = "rejected"
+                    evaluation.confidence = "rejected"
                 evaluation.score = round(
                     sum(
                         value
@@ -1455,6 +1628,11 @@ class NodeHealthService:
                     evaluation.reasons.append("claude-service-outage")
             if (
                 not fresh_is_trustworthy
+                and prior.get("qualification_version") == EVIDENCE_POLICY_VERSION
+                and not (quick.chatgpt_service_outage or quick.claude.service_outage)
+                and prior.get("overall_grade") == evaluation.overall_grade
+                and prior.get("ai_grade") == evaluation.ai_grade
+                and prior.get("risk_grade") == evaluation.risk_grade
                 and prior.get("last_score") is not None
                 and (not quick.available or safe_prior_full is not None)
             ):
@@ -1470,7 +1648,7 @@ class NodeHealthService:
                 evaluation.reasons.append("full-audit-incomplete")
             elif fresh_full is not None and not fresh_is_trustworthy:
                 evaluation.reasons.append(
-                    f"fresh-ai-unconfirmed:{chatgpt_status(fresh_full.details) or 'unknown'}"
+                    "fresh-ai-unconfirmed"
                 )
             if fresh_full is not None and evaluation.confidence == "low":
                 passes = 0
@@ -1494,7 +1672,7 @@ class NodeHealthService:
                 passes = int(prior.get("consecutive_full_passes", 0) or 0)
             history = [
                 dict(entry) for entry in prior.get("daily_quality_history", [])
-                if isinstance(entry, dict) and entry.get("day") != current_day
+                if isinstance(entry, dict) and (frozen or entry.get("day") != current_day)
             ]
             if not frozen:
                 history.append({
@@ -1507,6 +1685,16 @@ class NodeHealthService:
                     "evidence_valid": evidence_valid,
                     "available": quick.available,
                     "transient_recovery": quick.transient_recovery,
+                    "success_count": quick.success_count,
+                    "sample_count": quick.sample_count,
+                    "success_rate": quick.success_rate,
+                    "exit_ip_stable": quick.exit_ip_stable,
+                    "qualification_version": EVIDENCE_POLICY_VERSION,
+                    "fact_versions": {
+                        "chatgpt": fresh_full.chatgpt_evidence_version if fresh_full else 0,
+                        "risk": fresh_full.risk_evidence_version if fresh_full else 0,
+                        "claude": quick.claude.site_probe.probe_contract_version,
+                    },
                 })
             history = sorted(history, key=lambda entry: str(entry.get("day") or ""))[-7:]
             assessments.append(
@@ -1547,11 +1735,7 @@ class NodeHealthService:
         node_payload = {
             item.node.key: {
                 "name": item.node.name,
-                "region": item.node.region,
-                "source_id": item.node.source_id,
-                "original_name": item.node.original_name,
-                "normalized_name": item.node.normalized_name,
-                "logical_id": item.node.logical_id,
+                **node_identity(item.node),
                 "score": item.evaluation.score,
                 "confidence": item.evaluation.confidence,
                 "decision": item.evaluation.decision,
@@ -1585,21 +1769,21 @@ class NodeHealthService:
         return {
             "schema_version": SCHEMA_VERSION,
             "version": version,
+            "evidence_policy_version": EVIDENCE_POLICY_VERSION,
             "generated_at": generated_at,
             "requested_mode": requested_mode,
             "mode": effective_mode,
-            "source": {"digest": source_digest, "node_count": len(nodes)},
+            "source": {
+                "digest": source_digest, "node_count": len(nodes),
+                "connection_count": len(nodes),
+                "input_count": sum(len(node_aliases(node)) for node in nodes),
+                "alias_count": sum(len(node_aliases(node)) for node in nodes) - len(nodes),
+            },
             "region_order": self.config.region_order,
             "regions": regions,
             "nodes": node_payload,
             "identity_index": {
-                item.node.key: {
-                    "source_id": item.node.source_id,
-                    "original_name": item.node.original_name,
-                    "normalized_name": item.node.normalized_name,
-                    "logical_id": item.node.logical_id,
-                    "region": item.node.region,
-                }
+                item.node.key: node_identity(item.node)
                 for item in assessments
             },
             "identity_events": identity_events,
@@ -1677,11 +1861,9 @@ class NodeHealthService:
                 last_full_pass_day = str(prior.get("last_full_pass_day") or "")
             node_state[item.node.key] = {
                 "name": item.node.name,
-                "region": item.node.region,
-                "source_id": item.node.source_id,
-                "original_name": item.node.original_name,
-                "normalized_name": item.node.normalized_name,
-                "logical_id": item.node.logical_id,
+                **node_identity(item.node),
+                "qualification_version": EVIDENCE_POLICY_VERSION,
+                **({"legacy_evidence": copy.deepcopy(prior["legacy_evidence"])} if "legacy_evidence" in prior else {}),
                 "last_exit_ip": item.quick.exit_ip or prior.get("last_exit_ip", ""),
                 "last_country": (
                     str(item.quick.country or "").upper()
@@ -1749,6 +1931,22 @@ class NodeHealthService:
                 "last_decision": item.evaluation.decision,
                 "current_status": item.evaluation.decision,
             }
+            pending = set(prior.get("evidence_refresh_pending") or [])
+            if item.fresh_full_attempt and item.fresh_full_attempt.completed and full_has_usable_reputation(item.fresh_full_attempt, self.config.policy):
+                pending.discard("generic-risk")
+            if site_probe_valid(item.quick.chatgpt) and not item.quick.chatgpt_service_outage:
+                pending.discard("chatgpt")
+            if (
+                item.quick.claude.risk_evidence_version == RISK_EVIDENCE_VERSION
+                and item.quick.claude.intelligence_complete
+                and not item.quick.claude.intelligence_cached
+            ) or (
+                item.quick.claude.exit_ip == item.quick.exit_ip
+                and item.fresh_full_attempt is not None
+                and full_has_usable_reputation(item.fresh_full_attempt, self.config.policy)
+            ):
+                pending.discard("claude-risk")
+            node_state[item.node.key]["evidence_refresh_pending"] = sorted(pending)
             if item.node.region in frozen_regions and prior:
                 frozen_observation = {
                     "checked_at": item.quick.checked_at,
@@ -1760,11 +1958,8 @@ class NodeHealthService:
                 node_state[item.node.key] = {
                     **copy.deepcopy(prior),
                     "name": item.node.name,
-                    "region": item.node.region,
-                    "source_id": item.node.source_id,
-                    "original_name": item.node.original_name,
-                    "normalized_name": item.node.normalized_name,
-                    "logical_id": item.node.logical_id,
+                    **node_identity(item.node),
+                    "unavailable_grace_active": item.unavailable_grace_active,
                     "last_frozen_observation": frozen_observation,
                 }
         for key in assigned_keys - set(node_state):
@@ -1831,6 +2026,9 @@ class NodeHealthService:
                 }
         return {
             "schema_version": SCHEMA_VERSION,
+            "evidence_policy_version": EVIDENCE_POLICY_VERSION,
+            "minimum_evidence_reader_version": EVIDENCE_POLICY_VERSION,
+            **({"evidence_migration": copy.deepcopy(previous["evidence_migration"])} if previous.get("evidence_migration") else {}),
             "version": current["version"],
             "updated_at": current["generated_at"],
             "source": current["source"],

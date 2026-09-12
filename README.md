@@ -20,17 +20,13 @@
 
 ### 长期运行的节点健康服务（群晖）
 
-`0.3.1` 修复检测证据与恢复边界：健康保护按有效观测日累计，平台异常日暂停而不打断；动态轮转按最近尝试时间推进，失败节点不会长期挤占轮转名额。自动化深检只执行排名需要的风险、ChatGPT 和 DNSBL 检查，使用 HTTPS 出口发现；超时保留分阶段诊断，未完成结果仍不计作有效晋级证据。普通交互式 IPQuality 的流媒体检查保留。
-
-地理及 Claude 情报查询在单次扫描内按来源和目标出口去重，每家来源串行请求，403/429/5xx 触发 5 分钟退避；新扫描清除成功缓存，避免把前一天数据算作当天新证据。私有报告新增 `probe_diagnostics`、`ai_guard_samples`、`quality_summary` 和扫描耗时，`/healthz` 单独显示最近发布的证据覆盖率。错误对象与缺失风险分数不会转换为低风险。来源权限、凭据和网络故障仍需按诊断处理，退避不等于恢复来源可用性。
-
-报告与 SOCKS latest 视图跟随 `current.json` 提交并支持重放恢复；公开排名维持 schema v2。`/version` 新增构建源提交 `source_revision`。OpenWrt 集成脚本修复上游退避屏蔽本地自愈、应用中断不回滚的问题；这些脚本更新需单独安装到路由器，服务端镜像更新不会修改路由器文件。
+`0.4.0-dev` 已包含 D2 本地实现，实际部署仍需通过 [D2 部署门禁与迁移说明](deploy/DEPLOY_D2.md)。AI 指标明确为站点/地区探测，不表示账号或对话验证；旧健康加分与晋级资格按新证据重新累计，原已获保护的稳定节点可有一次、七日内到期的迁移宽限。错误接口/日志不再透传订阅解析片段，风险空值不计低风险，低采样成功率不授健康资格。真实同类环境正向校准未通过时，CI 阻止发布包含新证据语义的镜像。
 
 仓库现已包含可由群晖 Container Manager 部署的节点健康服务。日常 `maintenance` 保持每个固定地区 1-3 的稳定身份，使用“实际可用性、A/B/C 综合等级、100 分质量分、延迟”的分层排序；质量分重点考虑 ChatGPT/Claude 可用性、IP 风险、长期可靠性和住宅/家宽，延迟仅占 5 分。前三槽和每区 3 个最强挑战者每天深检，其余动态池轮转 50%。首次失败会在 120 秒、300 秒后复检；连续健康至少 6 天的节点拥有一次确认不可用宽限，其他节点确认失败后当日换槽。普通晋级需要连续健康 6 天、最近 3 个有效日每天领先至少 15 分且经过 7 天冷却。大面积连接或 AI 服务异常会冻结排序或沿用可信 AI 结果，避免批量误换；AI 服务异常至少需要 5 个不同服务出口，多个共享出口的节点别名只算一个样本。通用出口和 Claude 专用出口的国家、风险来源及风险共识分别判断，不能互相凑足证据；两类国家证据冲突时暂停稳定/晋级累计。`other` 没有前三槽：只在 `rebuild` 全量检测时按质量建立顺序，后续 `maintenance` 冻结既有顺序、删除已消失节点并把全新节点追加队尾。临时订阅审计复用相同的延迟复检和 AI 服务异常保护，但不会修改正式排名。
 
-node-health 始终从带 `target=ClashMeta&noCache=true` 的 Sub-Store `inventory` 获取完整节点，并发布带版本的完整质量顺序。Sub-Store 的 `healthy` 集合通过 Script Operator 只调整顺序，不删除风险、不可达、未检测或身份暂未匹配的节点；状态下载、校验或身份匹配失败时原样保留完整输入顺序。普通客户端与 OpenWrt 都使用同一完整节点集合，OpenWrt 再通过原 `rule_conf` 转换器生成固定地区端口，供 AdsPower 和地区 TXT 共同使用。
+node-health 从带 `target=ClashMeta&noCache=true` 的 Sub-Store `inventory` 获取完整条目，按连接去重探测但保留全部别名。普通客户端的 `healthy` 继续只排序、失败完整原序回退。D2 的 OpenWrt 消费者使用同一 inventory 和 `/local-socks-map.json` 明确映射，空槽不压紧、别名不挤占稳定槽；不可信或不一致时保留上次已验证配置。NAS TXT 是目标视图，路由器配对的 applied 回执/TXT 才表示实际应用。
 
-当前推荐的完整链路和操作步骤见 [群晖 + Sub-Store + OpenWrt 简化部署](deploy/DEPLOY_SIMPLE.md)。高级的 OpenWrt 直连排名方案保留在原运维文档中，但本次部署不使用。
+当前代码的操作步骤见 [D2 部署门禁与迁移说明](deploy/DEPLOY_D2.md)；[旧简化部署](deploy/DEPLOY_SIMPLE.md)仅作历史配置参考。升级代码不会自动修改路由器；端口差异、现场配置、维护窗口和回滚资料应先审阅，实际应用变化可能中断 local-socks 连接。
 
 ##### 屏幕截图
 ![截图](https://raw.githubusercontent.com/xykt/IPQuality/main/res/cn_IPv4.svg)
@@ -232,3 +228,7 @@ docker run --rm --net=host -it xykt/ipquality & docker rmi xykt/ipquality > NUL 
 **Daily Runs History:**
 
 ![daily_runs_history](https://hits.xykt.de/history/ip.svg?days=46&chartType=bar&title=IP%E8%B4%A8%E9%87%8F%E4%BD%93%E6%A3%80%E8%84%9A%E6%9C%AC%E6%AF%8F%E6%97%A5%E8%BF%90%E8%A1%8C%E9%87%8F%E7%BB%9F%E8%AE%A1&width=1024&height=400&color=green)
+
+## 长期维护上下文
+
+个人背景、历史决策、核验状态和待补事项统一维护在 [Sidney Vault](obsidian://open?vault=sidney-vault&file=20-Areas%2F%E8%BD%AF%E4%BB%B6%E9%A1%B9%E7%9B%AE%E7%BB%B4%E6%8A%A4%2F%E5%AE%9E%E4%BD%93%2FIPQuality-NodeHealth%2F%E6%96%87%E6%A1%A3%2F%E8%83%8C%E6%99%AF%E5%AE%9E%E7%8E%B0%E4%B8%8E%E5%8E%86%E5%8F%B2)。本仓库保留代码、使用说明与开发契约；不再复制个人维护日志。未接入该 Vault 的协作者仍可直接使用本文档。

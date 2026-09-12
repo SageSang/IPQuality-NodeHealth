@@ -11,19 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 
 
-DEFAULT_REGION_PATTERNS = {
-    "hong-kong": [r"🇭🇰|香港|港(?:[^A-Za-z]|$)|Hong\s*Kong|(?-i:\bHK\b)"],
-    "taiwan": [r"🇹🇼|台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|Taiwan|Taipei|Hinet|(?-i:\bTW\b)"],
-    "japan": [r"🇯🇵|日本|Japan|Tokyo|Osaka|东京|大阪|(?-i:\bJP\b)"],
-    "singapore": [r"🇸🇬|新加坡|狮城|獅城|Singapore|(?-i:\bSG\b)"],
-    "united-states": [r"🇺🇸|美国|美國|United\s*States|Los\s*Angeles|San\s*Francisco|Seattle|New\s*York|洛杉矶|洛杉磯|西雅图|西雅圖|纽约|紐約|夏威夷|(?-i:\bUS\b)|(?-i:\bUSA\b)"],
-    "south-korea": [r"🇰🇷|韩国|韓國|South\s*Korea|Korea|Seoul|首尔|首爾|(?-i:\bKR\b)"],
-    "united-kingdom": [r"🇬🇧|英国|英國|United\s*Kingdom|Great\s*Britain|Britain|England|London|Manchester|伦敦|倫敦|(?-i:\bUK\b)"],
-    "germany": [r"🇩🇪|德国|德國|Germany|Deutschland|Frankfurt|Berlin|法兰克福|法蘭克福|(?-i:\bDE\b)"],
-    "france": [r"🇫🇷|法国|法國|France|Paris|巴黎|(?-i:\bFR\b)"],
-    "canada": [r"🇨🇦|加拿大|Canada|Toronto|Vancouver|多伦多|多倫多|(?-i:\bCA\b)"],
-    "australia": [r"🇦🇺|澳大利亚|澳大利亞|澳洲|Australia|Sydney|Melbourne|Perth|Brisbane|悉尼|(?-i:\bAU\b)"],
-}
+from .regions import DEFAULT_REGION_PATTERNS
 
 DEFAULT_REGION_PORT_BASES = {
     "hong-kong": 62000,
@@ -116,6 +104,8 @@ class ProbeConfig:
     request_timeout_seconds: float = 12.0
     concurrency: int = 12
     full_concurrency: int = 3
+    provider_max_requests_per_scan: int = 1000
+    max_response_bytes: int = 1024 * 1024
     samples: int = 3
     ip_url: str = "https://api.ipify.org?format=json"
     geo_url_template: str = "https://ipapi.co/{ip}/json/"
@@ -224,6 +214,8 @@ class AppConfig:
     report: ReportConfig = field(default_factory=ReportConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
     local_socks_advertise_host: str = "127.0.0.1"
+    local_socks_namespace: str = "node-health-production"
+    local_socks_server_instance_id: str = ""
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
@@ -316,6 +308,12 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
         local_socks_advertise_host=str(
             local_socks_raw.get("advertise_host", "127.0.0.1")
         ).strip(),
+        local_socks_namespace=str(
+            local_socks_raw.get("namespace", "node-health-production")
+        ).strip(),
+        local_socks_server_instance_id=str(
+            local_socks_raw.get("server_instance_id", "")
+        ).strip(),
     )
     _validate_config(config, local_socks_raw)
     return config
@@ -391,6 +389,16 @@ def _validate_config(config: AppConfig, local_socks_raw: dict[str, Any]) -> None
         )
     if config.probe.concurrency < 1 or config.probe.full_concurrency < 1:
         raise ValueError("probe concurrency values must be positive")
+    for field_name in ("provider_max_requests_per_scan", "max_response_bytes"):
+        value = getattr(config.probe, field_name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"probe.{field_name} must be a positive integer")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", config.local_socks_namespace):
+        raise ValueError("local_socks.namespace must be a nonempty identifier")
+    if config.local_socks_server_instance_id and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", config.local_socks_server_instance_id
+    ):
+        raise ValueError("local_socks.server_instance_id must be an identifier")
     if config.probe.claude_timeout_seconds <= 0:
         raise ValueError("probe.claude_timeout_seconds must be positive")
     if not isinstance(config.probe.unavailable_retry_delays_seconds, list) or any(

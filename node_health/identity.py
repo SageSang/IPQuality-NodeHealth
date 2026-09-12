@@ -7,6 +7,8 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from .models import Node, NodeAlias
+
 
 SOURCE_ID_FIELDS = ("_nh_source_id", "_source_id")
 ORIGINAL_NAME_FIELDS = ("_nh_original_name", "_original_name")
@@ -92,3 +94,48 @@ def logical_id(source: str, normalized_name: str) -> str:
     if not source or not normalized_name:
         return ""
     return hashlib.sha256(f"{source}\0{normalized_name}".encode("utf-8")).hexdigest()
+
+
+def alias_entry_id(
+    connection_key: str,
+    source: str,
+    original: str,
+    name: str,
+    duplicate_ordinal: int = 1,
+) -> str:
+    payload = json.dumps(
+        [connection_key, source, original, name, duplicate_ordinal],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def node_aliases(node: Node) -> tuple[NodeAlias, ...]:
+    if node.aliases:
+        return node.aliases
+    original = node.original_name or original_name(node.proxy) or node.name
+    normalized = node.normalized_name or normalize_original_name(original)
+    return (NodeAlias(
+        entry_id=alias_entry_id(node.key, node.source_id, original, node.name),
+        name=node.name,
+        source_id=node.source_id,
+        original_name=original,
+        normalized_name=normalized,
+        logical_id=node.logical_id or logical_id(node.source_id, normalized),
+        declared_region=node.region,
+    ),)
+
+
+def node_identity(node: Node) -> dict[str, Any]:
+    aliases = node_aliases(node)
+    return {
+        "source_id": node.source_id,
+        "original_name": node.original_name,
+        "normalized_name": node.normalized_name,
+        "logical_id": node.logical_id,
+        "region": node.region,
+        "aliases": [alias.to_dict() for alias in aliases],
+        "representative_alias_id": node.representative_alias_id or aliases[0].entry_id,
+        "region_conflict": node.region_conflict,
+    }

@@ -17,9 +17,12 @@ from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig, load_config
+from .errors import safe_error_text
+from .policy import EVIDENCE_POLICY_VERSION
+from .port_mapping import MAP_SCHEMA_VERSION, CONSUMER_CONTRACT
 from .service import NodeHealthService, ScanStartError
 
-SOFTWARE_VERSION = "0.3.1"
+SOFTWARE_VERSION = "0.4.0-dev"
 MAX_API_BODY_BYTES = 16 * 1024
 LOGGER = logging.getLogger("node_health")
 
@@ -177,9 +180,13 @@ class ApiHandler(BaseHTTPRequestHandler):
     server: ApiServer
 
     def log_message(self, format: str, *args: Any) -> None:
-        if urlsplit(self.path).path == "/healthz":
+        path = urlsplit(self.path).path
+        if path == "/healthz":
             return
-        LOGGER.info("http %s - %s", self.client_address[0], format % args)
+        known = {"/version", "/current.json", "/local-socks-map.json", "/api/run", "/api/v1/run", "/api/audits", "/api/v1/audits"}
+        route = path if path in known else ("/api/audits/:id" if path.startswith(("/api/audits/", "/api/v1/audits/")) else "/unknown")
+        method = self.command if self.command in {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS"} else "OTHER"
+        LOGGER.info("http method=%s route=%s", method, route)
 
     def _json(self, status: int, value: Any) -> None:
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -228,7 +235,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         expected = self.server.config.http.api_token
         provided = self.headers.get("Authorization", "")
-        return not expected or hmac.compare_digest(provided, f"Bearer {expected}")
+        return not expected or hmac.compare_digest(provided.encode("utf-8"), f"Bearer {expected}".encode("utf-8"))
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = urlsplit(self.path).path
@@ -239,7 +246,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             current = self.server.service.store.load_current()
             self._json(
                 HTTPStatus.OK,
-                {"service_version": SOFTWARE_VERSION, "ranking_version": current.get("version"), "source_revision": os.environ.get("NODE_HEALTH_REVISION", "unknown")},
+                {"service_version": SOFTWARE_VERSION, "ranking_version": current.get("version"),
+                 "source_revision": os.environ.get("NODE_HEALTH_REVISION", "unknown"),
+                 "evidence_policy_version": EVIDENCE_POLICY_VERSION, "runtime_map_schema_version": MAP_SCHEMA_VERSION,
+                 "runtime_contract": CONSUMER_CONTRACT},
             )
             return
         if path == "/current.json":
@@ -248,6 +258,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no published ranking"})
             else:
                 self._json(HTTPStatus.OK, public_ranking_document(current))
+            return
+        if path == "/local-socks-map.json":
+            current = self.server.service.store.load_current()
+            mapping = current.get("port_mapping")
+            if current.get("runtime_target_status") != "ready" or not isinstance(mapping, dict):
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "runtime_target_unavailable"})
+            else:
+                self._json(HTTPStatus.OK, mapping)
             return
         match = re.fullmatch(
             r"/api(?:/v1)?/audits/([^/]+)(?:/report\.(json|md))?",
@@ -267,13 +285,26 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.NOT_FOUND, {"error": "audit not found"})
                 return
             if extension:
-                report_path = self.server.service.store.audit_report_path(audit_id, extension)
+                try:
+                    body = self.server.service.store.read_safe_audit_report(audit_id, extension)
+                except FileNotFoundError:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "report not found"})
+                    return
+                except (OSError, ValueError) as error:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": safe_error_text(error, "report")})
+                    return
                 content_type = (
                     "application/json; charset=utf-8"
                     if extension == "json"
                     else "text/markdown; charset=utf-8"
                 )
-                self._file(report_path, content_type)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("Content-Disposition", f'inline; filename="report.{extension}"')
+                self.end_headers()
+                self.wfile.write(body)
                 return
             status = dict(status)
             status["status_url"] = f"/api/v1/audits/{audit_id}"

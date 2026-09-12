@@ -1,15 +1,66 @@
 from __future__ import annotations
 
 import math
+import copy
+import ipaddress
 from datetime import datetime, timezone
 from statistics import median
 from typing import Any
 
 from .config import PolicyConfig
-from .models import Evaluation, FullResult, Node, QuickResult
+from .models import Evaluation, FullResult, Node, QuickResult, SiteProbeResult
 
 
 GRADE_ORDER = {"A": 0, "B": 1, "C": 2}
+EVIDENCE_POLICY_VERSION = 1
+PROBE_CONTRACT_VERSION = 1
+RISK_EVIDENCE_VERSION = 1
+
+
+def site_probe_valid(value: SiteProbeResult) -> bool:
+    value = SiteProbeResult.from_dict(value)
+    try:
+        public = ipaddress.ip_address(value.exit_ip).is_global
+    except ValueError:
+        public = False
+    return bool(
+        value.attempted
+        and value.probe_scope == "site-region"
+        and value.probe_contract_version == PROBE_CONTRACT_VERSION
+        and value.observation_id
+        and value.result_class in {"available", "restricted"}
+        and value.transport_code == 0
+        and value.http_status == 200
+        and public
+        and len(value.country) == 2
+        and value.country.isascii()
+        and value.country.isalpha()
+        and value.country == value.country.upper()
+        and value.host
+    )
+
+
+def sample_qualified(quick: QuickResult, policy: PolicyConfig) -> bool:
+    return bool(
+        isinstance(quick.success_count, int)
+        and not isinstance(quick.success_count, bool)
+        and isinstance(quick.sample_count, int)
+        and not isinstance(quick.sample_count, bool)
+        and 0 < quick.success_count <= quick.sample_count
+        and quick.success_count / quick.sample_count >= policy.minimum_candidate_success_rate
+    )
+
+
+def attach_quick_ai_evidence(full: FullResult, quick: QuickResult) -> FullResult:
+    existing = SiteProbeResult.from_dict(full.chatgpt)
+    current = SiteProbeResult.from_dict(quick.chatgpt)
+    if site_probe_valid(existing) and existing.result_class == "restricted":
+        return full
+    full.chatgpt = copy.deepcopy(current)
+    full.chatgpt_evidence_version = (
+        PROBE_CONTRACT_VERSION if site_probe_valid(current) else 0
+    )
+    return full
 
 
 _RISK_LABELS = {
@@ -82,7 +133,7 @@ def normalize_risk_value(value: Any) -> str:
 
 
 def valid_risk_sources(full: FullResult | None) -> dict[str, str]:
-    if full is None or not full.completed:
+    if full is None or not full.completed or full.risk_evidence_version != RISK_EVIDENCE_VERSION:
         return {}
     return {
         str(name): normalized
@@ -95,7 +146,7 @@ def risk_sources_conflict(full: FullResult | None) -> bool:
     values = [_risk_severity(value) for value in valid_risk_sources(full).values()]
     if len(values) >= 2 and max(values) - min(values) >= 0.5:
         return True
-    if full is None or not full.completed or not isinstance(full.details, dict):
+    if full is None or not full.completed or full.risk_evidence_version != RISK_EVIDENCE_VERSION or not isinstance(full.details, dict):
         return False
     factor = full.details.get("Factor")
     if not isinstance(factor, dict):
@@ -106,7 +157,7 @@ def risk_sources_conflict(full: FullResult | None) -> bool:
             None,
         )
         if isinstance(evidence, dict):
-            observed = {_as_bool(value) for value in evidence.values()}
+            observed = {value for value in evidence.values() if isinstance(value, bool)}
             if observed == {False, True}:
                 return True
     return False
@@ -148,7 +199,7 @@ def _is_high_risk(value: str) -> bool:
 
 
 def dnsbl_listed_count(full: FullResult | None) -> int:
-    if full is None or not full.completed:
+    if full is None or not full.completed or full.risk_evidence_version != RISK_EVIDENCE_VERSION:
         return 0
     try:
         count = max(0, int(full.dnsbl_listed_count))
@@ -227,30 +278,12 @@ def chatgpt_is_redline(status: str) -> bool:
 
 
 def chatgpt_explicitly_allowed(full: FullResult | None) -> bool:
-    if full is None or not full.completed:
-        return False
-    observed = chatgpt_status(full.details)
-    if chatgpt_is_redline(observed):
-        return False
-    normalized = observed.strip().lower().replace("_", " ").replace("-", " ")
-    if not normalized:
-        return False
-    allowed_words = {
-        "yes",
-        "available",
-        "unlock",
-        "unlocked",
-        "supported",
-        "ok",
-        "native",
-        "success",
-        "working",
-        "解锁",
-        "可用",
-        "正常",
-    }
-    words = set(normalized.replace("(", " ").replace(")", " ").split())
-    return normalized in allowed_words or bool(words & allowed_words)
+    return bool(
+        full and full.completed
+        and full.chatgpt_evidence_version == PROBE_CONTRACT_VERSION
+        and site_probe_valid(full.chatgpt)
+        and full.chatgpt.result_class == "available"
+    )
 
 
 def full_has_usable_reputation(full: FullResult | None, policy: PolicyConfig) -> bool:
@@ -265,14 +298,15 @@ def full_has_confirmed_redline(
     full: FullResult | None,
     policy: PolicyConfig | None = None,
 ) -> bool:
-    if full is None or not full.completed:
+    if full is None or not full.completed or full.risk_evidence_version != RISK_EVIDENCE_VERSION:
         return False
     dnsbl_threshold = _dnsbl_severe_threshold(policy) if policy is not None else _DEFAULT_DNSBL_REDLINE_THRESHOLD
     if full.tor or dnsbl_listed_count(full) >= dnsbl_threshold:
         return True
     if sum(1 for value in valid_risk_sources(full).values() if _is_high_risk(value)) >= 2:
         return True
-    return any(count >= 3 for count in _factor_source_counts(full).values())
+    factors = _factor_source_counts(full)
+    return any(factors[name] >= 3 for name in ("proxy", "vpn", "server", "abuser"))
 
 
 def _full_country_majority(details: dict[str, Any]) -> str:
@@ -307,7 +341,7 @@ def _as_bool(value: Any) -> bool:
 
 def _factor_source_counts(full: FullResult | None) -> dict[str, int]:
     counts = {name: 0 for name in ("proxy", "vpn", "server", "abuser", "robot", "tor")}
-    if full is not None and full.completed and isinstance(full.details, dict):
+    if full is not None and full.completed and full.risk_evidence_version == RISK_EVIDENCE_VERSION and isinstance(full.details, dict):
         factor = full.details.get("Factor")
         if isinstance(factor, dict):
             for name in counts:
@@ -332,6 +366,8 @@ def _factor_source_counts(full: FullResult | None) -> dict[str, int]:
 
 def _claude_factor_source_counts(quick: QuickResult) -> dict[str, int]:
     counts = {name: 0 for name in ("proxy", "vpn", "server", "abuser", "robot", "tor")}
+    if quick.claude.risk_evidence_version != RISK_EVIDENCE_VERSION:
+        return counts
     for name, sources in quick.claude.factors.items():
         normalized = str(name).strip().lower()
         if normalized not in counts:
@@ -442,6 +478,7 @@ def _risk_profile(
         claude_risks = {
             str(name): normalized
             for name, value in quick.claude.risk_sources.items()
+            if quick.claude.risk_evidence_version == RISK_EVIDENCE_VERSION
             if (normalized := normalize_risk_value(value))
         }
         routes["claude"] = _route_risk_profile(
@@ -511,25 +548,55 @@ def _media_chatgpt_field(full: FullResult | None, field: str) -> str:
 def _chatgpt_availability(quick: QuickResult, full: FullResult | None) -> str:
     if quick.chatgpt_service_outage:
         return "unknown"
-    if chatgpt_explicitly_allowed(full):
-        return "available"
-    observed = chatgpt_status(full.details) if full and full.completed else ""
-    if chatgpt_is_redline(observed):
+    observations = [SiteProbeResult.from_dict(quick.chatgpt)]
+    if full and full.completed and full.chatgpt_evidence_version == PROBE_CONTRACT_VERSION:
+        current_ip = quick.chatgpt.exit_ip
+        if not current_ip or full.chatgpt.exit_ip == current_ip:
+            observations.append(SiteProbeResult.from_dict(full.chatgpt))
+    valid = [value for value in observations if site_probe_valid(value)]
+    if any(value.result_class == "restricted" for value in valid):
         return "unavailable"
-    if observed:
-        return "unknown"
-    if quick.chatgpt_ok is True:
+    if any(value.result_class == "available" for value in valid):
         return "available"
-    if quick.chatgpt_ok is False:
-        return "unavailable"
     return "unknown"
+
+
+def claude_availability(quick: QuickResult) -> str:
+    if quick.claude.service_outage:
+        return "unknown"
+    site = SiteProbeResult.from_dict(quick.claude.site_probe)
+    secondary = SiteProbeResult.from_dict(quick.claude.anthropic_probe)
+    primary_ok = site_probe_valid(site)
+    secondary_ok = site_probe_valid(secondary) and secondary.result_class == "available"
+    if primary_ok and site.result_class == "restricted":
+        return "restricted"
+    if primary_ok and site.result_class == "available" and secondary_ok:
+        return "available"
+    if primary_ok or secondary_ok:
+        return "degraded"
+    return "unknown"
+
+
+def _chatgpt_geography(quick: QuickResult, full: FullResult | None) -> tuple[SiteProbeResult, str]:
+    observation = SiteProbeResult.from_dict(quick.chatgpt)
+    if not site_probe_valid(observation):
+        observation = (SiteProbeResult.from_dict(full.chatgpt)
+                       if full and full.completed and full.chatgpt_evidence_version == PROBE_CONTRACT_VERSION
+                       else SiteProbeResult())
+    independent_country = ""
+    if observation.exit_ip:
+        if full and full.completed and full.audited_exit_ip == observation.exit_ip:
+            independent_country = _full_country_majority(full.details)
+        if not independent_country and observation.exit_ip == quick.exit_ip:
+            independent_country = str(quick.country or "").upper()
+    return observation, independent_country
 
 
 def _ai_profile(
     node: Node, quick: QuickResult, full: FullResult | None, policy: PolicyConfig
 ) -> tuple[str, float, str, str]:
     chatgpt = _chatgpt_availability(quick, full)
-    claude = "unknown" if quick.claude.service_outage else quick.claude.status
+    claude = claude_availability(quick)
     claude_available = claude == "available"
     claude_failed = claude in {"restricted", "unreachable"}
     chatgpt_available = chatgpt == "available"
@@ -542,29 +609,25 @@ def _ai_profile(
         grade = "B"
 
     points = 0.0
-    if chatgpt_explicitly_allowed(full):
-        points += 8.0
-    chatgpt_region = _media_chatgpt_field(full, "Region").upper()
-    observed_exit_country = str(quick.country or "").upper()
-    if chatgpt_region and observed_exit_country and chatgpt_region == observed_exit_country:
-        points += 3.0
-    if _media_chatgpt_field(full, "Type").strip().lower() == "native":
-        points += 2.0
-    if quick.chatgpt_ok is True and not quick.chatgpt_service_outage:
-        points += 2.0
-    if quick.claude.trace_ok and not quick.claude.service_outage:
+    if chatgpt_available:
+        points += 12.0
+        observation, independent_country = _chatgpt_geography(quick, full)
+        if independent_country and independent_country == observation.country:
+            points += 3.0
+    primary_valid = site_probe_valid(quick.claude.site_probe)
+    if primary_valid and not quick.claude.service_outage:
         points += 4.0
-    if quick.claude.supported is True and not quick.claude.service_outage:
+    if primary_valid and quick.claude.site_probe.result_class == "available" and not quick.claude.service_outage:
         points += 3.0
-    if quick.claude.anthropic_ok and not quick.claude.service_outage:
+    if site_probe_valid(quick.claude.anthropic_probe) and quick.claude.anthropic_probe.result_class == "available" and not quick.claude.service_outage:
         points += 2.0
     same_route_usable = bool(
         quick.claude.exit_ip
         and quick.claude.exit_ip == quick.exit_ip
         and full_has_sufficient_risk_coverage(full, policy)
     )
-    if not quick.claude.service_outage and quick.claude.route_stable and (
-        quick.claude.intelligence_complete or same_route_usable
+    if primary_valid and not quick.claude.service_outage and quick.claude.route_stable and (
+        (quick.claude.intelligence_complete and quick.claude.risk_evidence_version == RISK_EVIDENCE_VERSION) or same_route_usable
     ):
         points += 1.0
     return grade, min(25.0, points), chatgpt, claude
@@ -678,7 +741,7 @@ def evaluate_node(
         reasons.append(f"quick-country-mismatch:{quick_country}!={expected}")
     elif expected and not observed_country:
         reasons.append("country-unconfirmed")
-    if quick.available and quick.success_rate < policy.minimum_candidate_success_rate:
+    if quick.available and not sample_qualified(quick, policy):
         reasons.append(f"insufficient-quick-success-rate:{quick.success_rate:.4f}")
 
     risk_grade, _, risk_source_count, factors, risk_routes = _risk_profile(
@@ -724,11 +787,15 @@ def evaluate_node(
     components, ai_grade, risk_grade, overall_grade, residential_grade, chatgpt, _ = quality_components(
         node, quick, full, policy, healthy_streak_days
     )
-    claude = "unknown" if quick.claude.service_outage else quick.claude.status
+    claude = claude_availability(quick)
     if chatgpt != "available":
         reasons.append(f"chatgpt-{chatgpt}")
     if claude != "available":
         reasons.append(f"claude-{claude}")
+    chatgpt_observation, chatgpt_country = _chatgpt_geography(quick, full)
+    if (site_probe_valid(chatgpt_observation) and chatgpt_country
+            and chatgpt_observation.country != chatgpt_country):
+        reasons.append("chatgpt-intelligence-country-conflict")
     if (
         quick.claude.exit_ip
         and quick.claude.exit_ip != quick.exit_ip
@@ -791,7 +858,7 @@ def evaluate_node(
     elif (
         overall_grade == "A"
         and full_has_usable_reputation(full, policy)
-        and quick.success_rate >= policy.minimum_candidate_success_rate
+        and sample_qualified(quick, policy)
         and "country-unconfirmed" not in reasons
         and not any(reason.startswith("quick-country-mismatch:") for reason in reasons)
     ):
@@ -899,7 +966,7 @@ def select_full_audit_nodes(
             source_count = int(float(prior.get("last_risk_source_count", 0) or 0))
         except (TypeError, ValueError):
             source_count = 0
-        if source_count < policy.min_valid_risk_sources:
+        if source_count < policy.min_valid_risk_sources and not prior.get("evidence_refresh_pending"):
             selected.add(node.key)
         if prior.get("risk_data_conflict"):
             selected.add(node.key)

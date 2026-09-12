@@ -1,310 +1,177 @@
+"""Real controller/renderer tests; the isolated core only models local readiness."""
 import json
-import hashlib
-import os
 import shutil
-import signal
 import socket
 import subprocess
-import textwrap
-import time
-from pathlib import Path
+import sys
 
 import pytest
 
-
-ROOT = Path(__file__).resolve().parents[1]
-APPLY_SCRIPT = ROOT / "integrations" / "openwrt" / "apply-ranking.sh"
-
-
-def _shell_path(path: Path) -> str:
-    resolved = path.resolve()
-    if os.name != "nt":
-        return resolved.as_posix()
-    drive = resolved.drive.rstrip(":").lower()
-    relative = resolved.relative_to(resolved.anchor).as_posix()
-    return f"/{drive}/{relative}"
+from node_health.port_mapping import mapping_digest
+from runtime_harness import CORE_SOURCE, Runtime, proxy
 
 
-def _node_path(path: Path) -> str:
-    return path.resolve().as_posix()
+@pytest.fixture(scope="module")
+def fake_core(tmp_path_factory):
+    if not sys.platform.startswith("linux") or not all(shutil.which(name) for name in ("cc", "node", "flock", "sh")):
+        pytest.skip("Linux, cc, Node, flock and sh are required for the runtime E2E")
+    directory=tmp_path_factory.mktemp("protocol-core")
+    source=directory / "core.c"
+    source.write_text(CORE_SOURCE)
+    binary=directory / "core"
+    subprocess.run(["cc", "-O2", str(source), "-o", str(binary)],check=True,capture_output=True)
+    return binary
 
 
-def _write(path: Path, content: str, executable: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8", newline="\n")
-    if executable:
-        path.chmod(0o755)
+@pytest.fixture
+def runtime(tmp_path, fake_core):
+    for port in (62000,62001,62002,62003,62004):
+        with socket.socket() as check:
+            check.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+            try:check.bind(("127.0.0.1",port))
+            except OSError:pytest.skip("fixed fixture ports are already in use")
+    instance=Runtime(tmp_path,fake_core)
+    try:yield instance
+    finally:instance.close()
 
 
-def _tool(name: str) -> str | None:
-    value = shutil.which(name)
-    return str(Path(value).resolve()) if value else None
-
-
-@pytest.mark.parametrize(
-    ("mode", "expected_success"),
-    [("listening", True), ("zero", True), ("missing", False), ("interrupted", False)],
-)
-def test_apply_ranking_validates_listeners_and_rolls_back(tmp_path, mode, expected_success):
-    bash = _tool("bash")
-    node = _tool("node")
-    if not bash or not node:
-        pytest.skip("bash and node are required for the OpenWrt apply E2E")
-
-    work = tmp_path / "work"
-    cache = work / "cache" / "node-health"
-    export = tmp_path / "exports"
-    work.mkdir(parents=True)
-    cache.mkdir(parents=True)
-    export.mkdir()
-    (export / "sentinel.txt").write_text("old-export\n", encoding="utf-8")
-
-    source = tmp_path / "inventory.yaml"
-    current = tmp_path / "current.json"
-    config = work / "config.yaml"
-    converter = tmp_path / "convert.mjs"
-    stable_converter = tmp_path / "stable.js"
-    yaml_module = tmp_path / "mock-yaml.cjs"
-    mihomo = tmp_path / "mihomo"
-    service = tmp_path / "local-socks"
-    server = tmp_path / "listener.mjs"
-    pid_file = tmp_path / "listener.pid"
-    env_file = tmp_path / "node-health.env"
-    with socket.socket() as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        listener_port = reservation.getsockname()[1]
-
-    source.write_text("proxies: []\n", encoding="utf-8")
-    current.write_text(
-        json.dumps({"schema_version": 2, "version": "e2e-v1", "regions": {}}),
-        encoding="utf-8",
-    )
-    config.write_text("old-config\n", encoding="utf-8")
-    stable_converter.write_text("module.exports = {};\n", encoding="utf-8")
-
-    _write(
-        yaml_module,
-        r"""
-        exports.load = function load(source) {
-          if (/listeners:\s*\[\s*\]/.test(source)) return { listeners: [] };
-          const listeners = [];
-          for (const match of source.matchAll(/^\s+port:\s*(\d+)\s*$/gm)) {
-            listeners.push({ port: Number(match[1]) });
-          }
-          return { listeners };
-        };
-        """,
-    )
-    _write(
-        converter,
-        r"""
-        import fs from 'node:fs';
-        import path from 'node:path';
-
-        const [, , outputPath, , , exportDirectory] = process.argv.slice(2);
-        const zero = process.env.MOCK_APPLY_MODE === 'zero';
-        const port = Number(process.env.MOCK_LISTENER_PORT);
-        const yaml = zero
-          ? 'listeners: []\nproxies: []\n'
-          : `listeners:\n  - name: listener-one\n    type: mixed\n    port: ${port}\nproxies: []\n`;
-        fs.writeFileSync(outputPath, yaml);
-        fs.mkdirSync(exportDirectory, { recursive: true });
-        fs.writeFileSync(
-          path.join(exportDirectory, 'united-states.txt'),
-          zero ? '' : `socks5://192.0.2.4:${port}{test}\n`,
-        );
-        fs.writeFileSync(
-          path.join(exportDirectory, 'all.txt'),
-          zero ? '' : `socks5://192.0.2.4:${port}{test}\n`,
-        );
-        fs.writeFileSync(
-          path.join(exportDirectory, 'all-plain.txt'),
-          zero ? '' : `socks5://192.0.2.4:${port}\n`,
-        );
-        fs.writeFileSync(path.join(exportDirectory, 'README.txt'), 'ranking e2e-v1\n');
-        """,
-    )
-    _write(
-        server,
-        """
-        import fs from 'node:fs';
-        import net from 'node:net';
-
-        const server = net.createServer((socket) => socket.end());
-        server.listen(Number(process.argv[2]), '127.0.0.1', () => {
-          fs.writeFileSync(process.argv[3], String(process.pid));
-        });
-        """,
-    )
-    _write(mihomo, "#!/bin/sh\nexit 0\n", executable=True)
-    _write(
-        service,
-        """
-        #!/bin/sh
-        case "$1" in
-          restart)
-            if [ "${MOCK_APPLY_MODE:-}" = 'interrupted' ] && [ ! -f "$MOCK_PID_FILE.interrupted" ]; then
-              touch "$MOCK_PID_FILE.interrupted"
-              kill -TERM "$PPID"
-              exit 0
-            fi
-            if [ -s "$MOCK_PID_FILE" ]; then
-              kill "$(cat "$MOCK_PID_FILE")" 2>/dev/null || true
-              rm -f "$MOCK_PID_FILE"
-            fi
-            if [ "${MOCK_APPLY_MODE:-}" = 'listening' ]; then
-              "$MOCK_NODE_BIN" "$MOCK_SERVER" "$MOCK_LISTENER_PORT" "$MOCK_PID_FILE" \
-                >"$MOCK_SERVER_LOG" 2>&1 &
-            fi
-            exit 0
-            ;;
-          status)
-            if [ "${MOCK_APPLY_MODE:-}" != 'listening' ]; then
-              exit 0
-            fi
-            [ -s "$MOCK_PID_FILE" ]
-            ;;
-          stop)
-            if [ -s "$MOCK_PID_FILE" ]; then
-              kill "$(cat "$MOCK_PID_FILE")" 2>/dev/null || true
-            fi
-            ;;
-          *) exit 2 ;;
-        esac
-        """,
-        executable=True,
-    )
-
-    if os.name == "nt":
-        ids = subprocess.run(
-            [bash, "-lc", "printf '%s:%s' \"$(id -u)\" \"$(id -g)\""],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+@pytest.mark.parametrize("mode", ["listening","zero","missing","interrupted"])
+def test_apply_ranking_validates_listeners_and_rolls_back(runtime,mode):
+    old_config=runtime.config.read_bytes()
+    changed=[proxy("Hong Kong A","bad.example" if mode=="missing" else "new.example")]
+    runtime.set_target(changed)
+    extra={"APPROVED_INITIAL_MAPPING_VERSION":runtime.mapping["mapping_version"]}
+    if mode=="interrupted":extra["TEST_INTERRUPT_NEW"]="1"
+    if mode=="zero":
+        runtime.mapping["entries"]=[]
+        for binding in runtime.mapping["bindings"]:binding.update(entry_id=None,node_key=None)
+        runtime.mapping["mapping_version"]=mapping_digest(runtime.mapping)
+        runtime.map_path.write_text(json.dumps(runtime.mapping))
+        runtime.source.write_text(json.dumps({"proxies":[]}))
+    result=runtime.run(**extra)
+    if mode=="listening":
+        assert result.returncode==0,result.stderr
+        assert runtime.receipt()["mapping_version"]==runtime.mapping["mapping_version"]
+        assert (runtime.export / "all-plain.txt").read_text()=="socks5://192.0.2.4:62000\n"
+        runtime.wait_socket(62000)
     else:
-        ids = f"{os.getuid()}:{os.getgid()}"
+        # D2 rejects an empty/unusable target rather than pretending it is an apply.
+        assert result.returncode!=0
+        assert runtime.config.read_bytes()==old_config
+        assert (runtime.export / "sentinel.txt").read_text()=="old-export\n"
+        runtime.wait_socket(62000)
+        assert not (runtime.cache / "pending.json").exists()
 
-    env_file.write_text(
-        "\n".join(
-            [
-                f"WORK_DIR='{_shell_path(work)}'",
-                f"CACHE_DIR='{_shell_path(cache)}'",
-                f"CONVERT_RUNNER='{_shell_path(converter)}'",
-                f"STABLE_CONVERTER='{_shell_path(stable_converter)}'",
-                f"NODE_BIN='{_shell_path(Path(node))}'",
-                "NODE_PATH=''",
-                f"JS_YAML_PATH='{_node_path(yaml_module)}'",
-                f"MIHOMO_BIN='{_shell_path(mihomo)}'",
-                f"SERVICE_SCRIPT='{_shell_path(service)}'",
-                f"CONFIG_PATH='{_shell_path(config)}'",
-                "START_PORT='62000'",
-                f"CONFIG_OWNER='{ids}'",
-                "CONFIG_MODE='0600'",
-                f"EXPORT_DIR='{_shell_path(export)}'",
-                "ADVERTISE_HOST='192.0.2.4'",
-                "READINESS_ATTEMPTS='3'",
-                # The mock listener is spawned in the background. Give it a
-                # deterministic scheduling window before readiness polling.
-                "READINESS_DELAY_SECONDS='0.05'",
-                "LISTENER_CONNECT_TIMEOUT_MS='250'",
-                "LISTENER_CHECK_CONCURRENCY='4'",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-        newline="\n",
-    )
 
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "NODE_HEALTH_ENV_FILE": _shell_path(env_file),
-            "MOCK_APPLY_MODE": mode,
-            "MOCK_NODE_BIN": _shell_path(Path(node)),
-            "MOCK_SERVER": _shell_path(server),
-            "MOCK_PID_FILE": _shell_path(pid_file),
-            "MOCK_SERVER_LOG": _shell_path(tmp_path / "listener.log"),
-            "MOCK_LISTENER_PORT": str(listener_port),
-        }
-    )
-    try:
-        result = subprocess.run(
-            [
-                bash,
-                _shell_path(APPLY_SCRIPT),
-                _shell_path(source),
-                _shell_path(current),
-                "e2e-v1",
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    finally:
-        subprocess.run(
-            [bash, _shell_path(service), "stop"],
-            env=environment,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-        if pid_file.exists():
-            try:
-                os.kill(int(pid_file.read_text(encoding="utf-8")), signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
+def test_noop_and_label_only_changes_do_not_restart(runtime):
+    assert runtime.run().returncode==0
+    pid=runtime.pid.read_text(); content=runtime.config.read_bytes()
+    assert runtime.run().returncode==0
+    assert runtime.pid.read_text()==pid
+    runtime.set_target([{**runtime.proxies[0],"name":"Hong Kong renamed"}])
+    assert runtime.run().returncode==0
+    assert runtime.pid.read_text()==pid
+    assert runtime.config.read_bytes()==content
+    assert "Hong Kong renamed" in (runtime.export / "all.txt").read_text()
 
-    assert (result.returncode == 0) is expected_success, result.stderr
-    if expected_success:
-        assert config.read_text(encoding="utf-8").startswith("listeners:")
-        assert (export / "README.txt").read_text(encoding="utf-8") == "ranking e2e-v1\n"
-        expected_all = "" if mode == "zero" else (
-            f"socks5://192.0.2.4:{listener_port}{{test}}\n"
-        )
-        assert (export / "all.txt").read_text(encoding="utf-8") == expected_all
-        expected_all_plain = "" if mode == "zero" else (
-            f"socks5://192.0.2.4:{listener_port}\n"
-        )
-        assert (export / "all-plain.txt").read_text(encoding="utf-8") == expected_all_plain
+
+def test_upstream_backoff_does_not_skip_local_runtime_recovery(runtime):
+    assert runtime.run().returncode==0
+    receipt=runtime.receipt()
+    runtime.close(); runtime.backoff()
+    result=runtime.run(apply=False)
+    assert result.returncode==0,result.stderr
+    runtime.wait_socket(62000)
+    assert runtime.receipt()==receipt
+    assert (runtime.cache / "backoff.json").exists()
+
+
+@pytest.mark.parametrize("phase", ["before-pending","after-pending","before-config","after-config",
+                                     "before-exports","after-exports","before-receipt","after-receipt"])
+def test_sigkill_recovers_the_committed_generation(runtime,phase):
+    old_config=runtime.config.read_bytes()
+    runtime.set_target([proxy("Hong Kong A","new.example")])
+    result=runtime.run(APPROVED_INITIAL_MAPPING_VERSION=runtime.mapping["mapping_version"],TEST_CRASH_PHASE=phase)
+    assert result.returncode!=0
+    runtime.backoff()
+    recovered=runtime.run(apply=False)
+    assert recovered.returncode==0,recovered.stderr
+    runtime.wait_socket(62000)
+    assert not (runtime.cache / "pending.json").exists()
+    if phase=="after-receipt":
+        assert runtime.receipt()["kind"]=="managed"
+        assert runtime.receipt()["mapping_version"]==runtime.mapping["mapping_version"]
     else:
-        assert config.read_text(encoding="utf-8") == "old-config\n"
-        assert (export / "sentinel.txt").read_text(encoding="utf-8") == "old-export\n"
-        if mode != "interrupted":
-            assert "previous config restored and ready" in result.stderr
+        assert runtime.receipt()["kind"]=="legacy-baseline"
+        assert runtime.config.read_bytes()==old_config
+        assert (runtime.export / "sentinel.txt").read_text()=="old-export\n"
 
 
-def test_upstream_backoff_does_not_skip_local_runtime_recovery(tmp_path):
-    if os.name == "nt" or not _tool("sh") or not _tool("sha256sum"):
-        pytest.skip("POSIX shell and sha256sum required")
-    work = tmp_path / "work"
-    cache = work / "cache"
-    export = tmp_path / "exports"
-    cache.mkdir(parents=True)
-    export.mkdir()
-    config = work / "config.yaml"
-    config.write_text("known-good-config\n")
-    (cache / "applied.sha256").write_text(hashlib.sha256(config.read_bytes()).hexdigest())
-    (cache / "applied.version").write_text("v1\n")
-    (cache / "backoff.state").write_text(f"{int(time.time())+21600} 6\n")
-    for region in "hong-kong taiwan japan singapore united-states south-korea united-kingdom germany france canada australia other all all-plain".split():
-        (export / f"{region}.txt").write_text("")
-    (export / "README.txt").write_text("ranking v1\n")
-    service = tmp_path / "service"
-    log = tmp_path / "calls"
-    _write(service, f'#!/bin/sh\nprintf "%s\\n" "$1" >>"{log}"\nexit 1\n', executable=True)
-    env_file = tmp_path / "env"
-    # A failing fake service confirms that recovery is attempted; no network
-    # request is reached, and no real service or configuration is touched.
-    env_file.write_text("\n".join([
-        "RANKING_URL=https://ranking.invalid/current.json", "SOURCE_URL=https://inventory.invalid/",
-        f"WORK_DIR='{work}'", f"CACHE_DIR='{cache}'", f"EXPORT_DIR='{export}'",
-        f"CONFIG_PATH='{config}'", f"SERVICE_SCRIPT='{service}'",
-    ]))
-    environment = dict(os.environ, NODE_HEALTH_ENV_FILE=str(env_file))
-    result = subprocess.run(["sh", str(ROOT / "integrations/openwrt/check-ranking.sh")], env=environment, capture_output=True, text=True, timeout=10)
-    assert result.returncode == 1
-    assert log.read_text().splitlines() == ["status", "restart"]
-    assert int((cache / "backoff.state").read_text().split()[0]) > time.time()
+def test_export_failure_does_not_prevent_runtime_rollback(runtime):
+    old=runtime.config.read_bytes()
+    runtime.set_target([proxy("Hong Kong A","new.example")])
+    result=runtime.run(APPROVED_INITIAL_MAPPING_VERSION=runtime.mapping["mapping_version"],TEST_EXPORT_FAILURE="1")
+    assert result.returncode!=0
+    assert runtime.config.read_bytes()==old
+    runtime.wait_socket(62000)
+    runtime.backoff()
+    assert runtime.run(apply=False).returncode==0
+    assert not (runtime.cache / "pending.json").exists()
+
+
+def test_successful_restart_command_must_replace_the_process(runtime):
+    old=runtime.config.read_bytes()
+    runtime.set_target([proxy("Hong Kong A","new.example")])
+    result=runtime.run(APPROVED_INITIAL_MAPPING_VERSION=runtime.mapping["mapping_version"],TEST_IGNORE_NEW_RESTART="1")
+    assert result.returncode!=0
+    assert runtime.config.read_bytes()==old
+    runtime.wait_socket(62000)
+
+
+def test_initial_binding_difference_requires_specific_approval(runtime):
+    old=runtime.config.read_bytes()
+    runtime.set_target([proxy("Hong Kong A","new.example")])
+    assert runtime.run().returncode!=0
+    assert runtime.config.read_bytes()==old
+    assert runtime.log.read_text()==""
+    assert runtime.receipt()["kind"]=="legacy-baseline"
+
+
+def test_lock_and_export_dependency_protection(runtime):
+    import fcntl
+    lock=runtime.cache / "apply.lock"
+    with lock.open("w") as stream:
+        fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        assert runtime.run().returncode==75
+        assert runtime.run(apply=False).returncode==75
+    dependency=runtime.export / "yaml.cjs"
+    shutil.copy2(runtime.yaml,dependency)
+    assert runtime.run(JS_YAML_PATH=str(dependency)).returncode!=0
+    assert dependency.is_file()
+    assert runtime.log.read_text()==""
+
+
+def test_candidate_validation_failure_does_not_restart(runtime):
+    old=runtime.config.read_bytes()
+    assert runtime.run(TEST_REJECT_CANDIDATE="1").returncode!=0
+    assert runtime.config.read_bytes()==old
+    assert runtime.log.read_text()==""
+
+
+def test_missing_flock_fails_before_runtime_or_cache_mutation(runtime):
+    before={path.name for path in runtime.cache.iterdir()}
+    config=runtime.config.read_bytes()
+    assert runtime.run(FLOCK_BIN="/missing/flock").returncode!=0
+    assert runtime.run(apply=False,FLOCK_BIN="/missing/flock").returncode!=0
+    assert {path.name for path in runtime.cache.iterdir()}==before
+    assert runtime.config.read_bytes()==config
+    assert runtime.log.read_text()==""
+
+
+def test_early_module_failure_does_not_echo_dependency_paths(runtime):
+    secret="synthetic-token-in-path"
+    result=runtime.run(STABLE_CONVERTER=str(runtime.directory/secret))
+    assert result.returncode!=0
+    assert "dependency_invalid" in result.stderr
+    assert secret not in result.stderr
+    assert runtime.log.read_text()==""

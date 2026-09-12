@@ -229,25 +229,220 @@ function logicalId(source, normalizedName) {
   return sha256Hex(`${source}\0${normalizedName}`);
 }
 
-const REGION_MATCHERS = [
-  ['hong-kong', /(?:🇭🇰|香港|hong\s*kong|(?:^|\W)hk(?:\W|$))/iu],
-  ['taiwan', /(?:🇹🇼|台湾|臺灣|台北|臺北|taiwan|taipei|hinet|(?:^|\W)tw(?:\W|$))/iu],
-  ['japan', /(?:🇯🇵|日本|东京|東京|大阪|japan|tokyo|osaka|(?:^|\W)jp(?:\W|$))/iu],
-  ['singapore', /(?:🇸🇬|新加坡|狮城|獅城|singapore|(?:^|\W)sg(?:\W|$))/iu],
-  ['united-states', /(?:🇺🇸|美国|美國|united\s*states|los\s*angeles|san\s*francisco|seattle|new\s*york|(?:^|\W)us(?:a)?(?:\W|$))/iu],
-  ['south-korea', /(?:🇰🇷|韩国|韓國|south\s*korea|korea|seoul|首尔|首爾|(?:^|\W)kr(?:\W|$))/iu],
-  ['united-kingdom', /(?:🇬🇧|英国|英國|united\s*kingdom|great\s*britain|britain|england|london|manchester|(?:^|\W)uk(?:\W|$))/iu],
-  ['germany', /(?:🇩🇪|德国|德國|germany|deutschland|frankfurt|berlin|(?:^|\W)de(?:\W|$))/iu],
-  ['france', /(?:🇫🇷|法国|法國|france|paris|巴黎|(?:^|\W)fr(?:\W|$))/iu],
-  ['canada', /(?:🇨🇦|加拿大|canada|toronto|vancouver|(?:^|\W)ca(?:\W|$))/iu],
-  ['australia', /(?:🇦🇺|澳大利亚|澳大利亞|澳洲|australia|sydney|melbourne|perth|brisbane|悉尼|(?:^|\W)au(?:\W|$))/iu],
+function aliasEntryId(connectionKey, source, original, name, duplicateOrdinal = 1) {
+  return sha256Hex(JSON.stringify([connectionKey, source, original, name, duplicateOrdinal]));
+}
+
+// BEGIN GENERATED REGION RULES
+const REGION_RULES = [
+  {
+    "region": "hong-kong",
+    "terms": [
+      "🇭🇰",
+      "香港",
+      "Hong Kong"
+    ],
+    "suffix_terms": [
+      "港"
+    ],
+    "codes": [
+      "HK"
+    ]
+  },
+  {
+    "region": "taiwan",
+    "terms": [
+      "🇹🇼",
+      "台湾",
+      "臺灣",
+      "台北",
+      "臺北",
+      "台中",
+      "臺中",
+      "台南",
+      "臺南",
+      "高雄",
+      "Taiwan",
+      "Taipei",
+      "Hinet"
+    ],
+    "codes": [
+      "TW"
+    ]
+  },
+  {
+    "region": "japan",
+    "terms": [
+      "🇯🇵",
+      "日本",
+      "Japan",
+      "Tokyo",
+      "Osaka",
+      "东京",
+      "東京",
+      "大阪"
+    ],
+    "codes": [
+      "JP"
+    ]
+  },
+  {
+    "region": "singapore",
+    "terms": [
+      "🇸🇬",
+      "新加坡",
+      "狮城",
+      "獅城",
+      "Singapore"
+    ],
+    "codes": [
+      "SG"
+    ]
+  },
+  {
+    "region": "united-states",
+    "terms": [
+      "🇺🇸",
+      "美国",
+      "美國",
+      "United States",
+      "Los Angeles",
+      "San Francisco",
+      "Seattle",
+      "New York",
+      "洛杉矶",
+      "洛杉磯",
+      "西雅图",
+      "西雅圖",
+      "纽约",
+      "紐約",
+      "夏威夷"
+    ],
+    "codes": [
+      "US",
+      "USA"
+    ]
+  },
+  {
+    "region": "south-korea",
+    "terms": [
+      "🇰🇷",
+      "韩国",
+      "韓國",
+      "South Korea",
+      "Korea",
+      "Seoul",
+      "首尔",
+      "首爾"
+    ],
+    "codes": [
+      "KR"
+    ]
+  },
+  {
+    "region": "united-kingdom",
+    "terms": [
+      "🇬🇧",
+      "英国",
+      "英國",
+      "United Kingdom",
+      "Great Britain",
+      "Britain",
+      "England",
+      "London",
+      "Manchester",
+      "伦敦",
+      "倫敦"
+    ],
+    "codes": [
+      "UK"
+    ]
+  },
+  {
+    "region": "germany",
+    "terms": [
+      "🇩🇪",
+      "德国",
+      "德國",
+      "Germany",
+      "Deutschland",
+      "Frankfurt",
+      "Berlin",
+      "法兰克福",
+      "法蘭克福"
+    ],
+    "codes": [
+      "DE"
+    ]
+  },
+  {
+    "region": "france",
+    "terms": [
+      "🇫🇷",
+      "法国",
+      "法國",
+      "France",
+      "Paris",
+      "巴黎"
+    ],
+    "codes": [
+      "FR"
+    ]
+  },
+  {
+    "region": "canada",
+    "terms": [
+      "🇨🇦",
+      "加拿大",
+      "Canada",
+      "Toronto",
+      "Vancouver",
+      "多伦多",
+      "多倫多"
+    ],
+    "codes": [
+      "CA"
+    ]
+  },
+  {
+    "region": "australia",
+    "terms": [
+      "🇦🇺",
+      "澳大利亚",
+      "澳大利亞",
+      "澳洲",
+      "Australia",
+      "Sydney",
+      "Melbourne",
+      "Perth",
+      "Brisbane",
+      "悉尼"
+    ],
+    "codes": [
+      "AU"
+    ]
+  }
 ];
+// END GENERATED REGION RULES
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const REGION_MATCHERS = REGION_RULES.map((rule) => [
+  rule.region,
+  new RegExp([
+    ...rule.terms.map((term) => term.split(/\s+/u).map(escapeRegExp).join('\\s*')),
+    ...(rule.suffix_terms || []).map((term) => `${escapeRegExp(term)}(?:[^A-Za-z]|$)`),
+  ].join('|'), 'iu'),
+  new RegExp(`(?:^|[^\\p{L}\\p{N}_])(?:${rule.codes.map(escapeRegExp).join('|')})(?=$|[^\\p{L}\\p{N}_])`, 'u'),
+]);
 
 function identityRegion(proxy, name) {
   const explicit = String((proxy && proxy._region) || '').trim();
   if (REGION_ORDER.includes(explicit)) return explicit;
-  for (const [region, matcher] of REGION_MATCHERS) {
-    if (matcher.test(name)) return region;
+  for (const [region, matcher, codeMatcher] of REGION_MATCHERS) {
+    if (matcher.test(name) || codeMatcher.test(name)) return region;
   }
   return 'other';
 }
@@ -442,6 +637,18 @@ function validateRankingState(state) {
     ) {
       throw new Error(`invalid identity index entry: ${key}`);
     }
+    if (identity.aliases !== undefined) {
+      if (!Array.isArray(identity.aliases) || identity.aliases.length === 0 || identity.aliases.some((alias) =>
+        !isRecord(alias) || !NODE_KEY_PATTERN.test(alias.entry_id) ||
+        ['name', 'source_id', 'original_name', 'normalized_name', 'logical_id', 'declared_region']
+          .some((field) => typeof alias[field] !== 'string') ||
+        !Number.isInteger(alias.duplicate_ordinal) || alias.duplicate_ordinal < 1
+      )) throw new Error('invalid identity aliases');
+      if (typeof identity.representative_alias_id !== 'string' ||
+          !identity.aliases.some((alias) => alias.entry_id === identity.representative_alias_id)) {
+        throw new Error('invalid representative alias');
+      }
+    }
   }
   for (const key of decided) {
     if (!Object.prototype.hasOwnProperty.call(state.identity_index, key)) {
@@ -456,27 +663,56 @@ function identityTuple(identity, fields) {
   return JSON.stringify(values);
 }
 
-function uniqueIdentityMatches(unmatchedOld, unmatchedNew, oldIdentities, selected, fields) {
+function stateIdentities(identity) {
+  if (!Array.isArray(identity.aliases) || !identity.aliases.length) return [identity];
+  return identity.aliases.map((alias) => ({ ...alias, region: alias.declared_region || identity.region }));
+}
+
+function uniqueIdentityMatches(unmatchedOld, unmatchedNew, oldIdentities, selected, fields, compatibleSource = false) {
   const oldBuckets = new Map();
   const newBuckets = new Map();
   for (const key of unmatchedOld) {
-    const group = identityTuple(oldIdentities[key], fields);
-    if (!group) continue;
-    if (!oldBuckets.has(group)) oldBuckets.set(group, []);
-    oldBuckets.get(group).push(key);
+    for (const identity of stateIdentities(oldIdentities[key])) {
+      const group = identityTuple(identity, fields);
+      if (!group) continue;
+      if (!oldBuckets.has(group)) oldBuckets.set(group, new Map());
+      const bucket = oldBuckets.get(group);
+      if (!bucket.has(key)) bucket.set(key, []);
+      bucket.get(key).push(identity);
+    }
   }
   for (const index of unmatchedNew) {
     const group = identityTuple(selected[index].identity, fields);
     if (!group) continue;
-    if (!newBuckets.has(group)) newBuckets.set(group, []);
-    newBuckets.get(group).push(index);
+    if (!newBuckets.has(group)) newBuckets.set(group, new Map());
+    const bucket = newBuckets.get(group);
+    const key = selected[index].key;
+    if (!bucket.has(key)) bucket.set(key, []);
+    bucket.get(key).push(index);
   }
-
+  const pairs = new Map();
+  const reverse = new Map();
+  for (const [group, oldBucket] of oldBuckets) {
+    const newBucket = newBuckets.get(group);
+    if (oldBucket.size !== 1 || !newBucket || newBucket.size !== 1) continue;
+    const [oldKey, identities] = [...oldBucket][0];
+    const [newKey, indexes] = [...newBucket][0];
+    if (compatibleSource && !identities.some((identity) => indexes.some((index) => {
+      const source = selected[index].identity.source_id;
+      return !identity.source_id || !source || identity.source_id === source;
+    }))) continue;
+    if (!pairs.has(oldKey)) pairs.set(oldKey, new Set());
+    if (!reverse.has(newKey)) reverse.set(newKey, new Set());
+    pairs.get(oldKey).add(newKey);
+    reverse.get(newKey).add(oldKey);
+  }
   const matches = [];
-  for (const [group, oldKeys] of oldBuckets) {
-    const newIndexes = newBuckets.get(group) || [];
-    if (oldKeys.length === 1 && newIndexes.length === 1) {
-      matches.push([oldKeys[0], newIndexes[0]]);
+  for (const [oldKey, targets] of pairs) {
+    if (targets.size !== 1) continue;
+    const newKey = [...targets][0];
+    if (reverse.get(newKey).size !== 1) continue;
+    for (const index of unmatchedNew) {
+      if (selected[index].key === newKey) matches.push([oldKey, index]);
     }
   }
   return matches;
@@ -512,13 +748,9 @@ function resolveIdentityKeys(state, selected) {
       oldIdentities,
       selected,
       fields,
+      stageIndex >= 2,
     );
     for (const [oldKey, newIndex] of matches) {
-      if (stageIndex >= 2) {
-        const oldSource = String(oldIdentities[oldKey].source_id || '');
-        const newSource = String(selected[newIndex].identity.source_id || '');
-        if (oldSource && newSource && oldSource !== newSource) continue;
-      }
       resolved.set(newIndex, oldKey);
       unmatchedOld.delete(oldKey);
       unmatchedNew.delete(newIndex);
@@ -533,6 +765,7 @@ function buildOrdering(state, availableKeys = null) {
   const rejected = new Set();
   const stableKeys = new Set();
   const order = new Map();
+  const extraAliasOrder = new Map();
   let position = 0;
 
   const requestedOrder = Array.isArray(state.region_order)
@@ -586,25 +819,9 @@ function buildOrdering(state, availableKeys = null) {
     }
 
     if (regionKey !== 'other') {
-      const usedSlotKeys = new Set();
       for (let slot = 1; slot <= STABLE_SLOT_COUNT; slot += 1) {
-        let key = slotKeys.get(slot);
-        if (!key) {
-          key = regionalTail.find(
-            (candidate) =>
-              (!availableKeys || availableKeys.has(candidate)) &&
-              !usedSlotKeys.has(candidate) &&
-              !reservedSlotKeys.has(candidate),
-          );
-        }
-        if (!key) {
-          key = regionalTail.find(
-            (candidate) =>
-              (!availableKeys || availableKeys.has(candidate)) && !usedSlotKeys.has(candidate),
-          );
-        }
-        if (!key || usedSlotKeys.has(key)) continue;
-        usedSlotKeys.add(key);
+        const key = slotKeys.get(slot);
+        if (!key || stableKeys.has(key)) continue;
         stableKeys.add(key);
         if (!order.has(key)) {
           order.set(key, position);
@@ -619,9 +836,28 @@ function buildOrdering(state, availableKeys = null) {
         position += 1;
       }
     }
+    for (const key of reservedSlotKeys) extraAliasOrder.set(key, position);
+    position += 1;
   }
 
-  return { order, rejected, stableKeys };
+  return { order, rejected, stableKeys, extraAliasOrder };
+}
+
+function compareAliases(left, right) {
+  for (const field of ['source_id', 'normalized_name', 'original_name']) {
+    const difference = compareCodePoints(left.identity[field], right.identity[field]);
+    if (difference) return difference;
+  }
+  return compareCodePoints(String(left.proxy.name).trim(), String(right.proxy.name).trim()) ||
+    left.duplicateOrdinal - right.duplicateOrdinal;
+}
+
+function chooseRepresentative(entries, identity) {
+  const explicit = entries.find((entry) => entry.entryId === identity.representative_alias_id);
+  if (explicit) return explicit;
+  const matching = entries.filter((entry) => entry.identity.original_name === identity.original_name &&
+    (!identity.source_id || !entry.identity.source_id || identity.source_id === entry.identity.source_id));
+  return [...(matching.length ? matching : entries)].sort(compareAliases)[0];
 }
 
 async function operator(proxies, targetPlatform, context) {
@@ -631,23 +867,43 @@ async function operator(proxies, targetPlatform, context) {
     const rankingUrl = String(options.rankingUrl || options.url || '').trim();
     if (!rankingUrl) throw new Error('rankingUrl argument is required');
 
+    const occurrences = new Map();
     const selected = proxies.map((proxy, originalIndex) => {
       const key = clashMetaNodeKey(proxy, context);
+      const identity = selectedIdentity(proxy);
+      const name = String(proxy.name || '').trim();
+      const signature = JSON.stringify([key, identity.source_id, identity.original_name, name]);
+      const duplicateOrdinal = (occurrences.get(signature) || 0) + 1;
+      occurrences.set(signature, duplicateOrdinal);
       return {
         proxy,
         key,
-        identity: selectedIdentity(proxy),
+        identity,
+        duplicateOrdinal,
+        entryId: aliasEntryId(key, identity.source_id, identity.original_name, name, duplicateOrdinal),
         originalIndex,
       };
     });
     const state = JSON.parse(await downloadRanking(rankingUrl, context));
     const resolved = resolveIdentityKeys(state, selected);
     const availableStateKeys = new Set(resolved.values());
-    const { order } = buildOrdering(state, availableStateKeys);
+    const { order, stableKeys, extraAliasOrder } = buildOrdering(state, availableStateKeys);
+    const groups = new Map();
+    selected.forEach((entry, index) => {
+      const key = resolved.get(index);
+      if (!stableKeys.has(key)) return;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(entry);
+    });
+    const representatives = new Map([...groups].map(([key, entries]) =>
+      [key, chooseRepresentative(entries, state.identity_index[key])]));
 
     selected.forEach((entry, index) => {
       const stateKey = resolved.get(index) || entry.key;
       entry.healthOrder = order.has(stateKey) ? order.get(stateKey) : Number.MAX_SAFE_INTEGER;
+      if (stableKeys.has(stateKey) && representatives.get(stateKey) !== entry) {
+        entry.healthOrder = extraAliasOrder.get(stateKey);
+      }
     });
     selected.sort(
       (left, right) =>
@@ -656,7 +912,7 @@ async function operator(proxies, targetPlatform, context) {
     return selected.map((entry) => entry.proxy);
   } catch (error) {
     if (typeof console !== 'undefined' && typeof console.error === 'function') {
-      console.error(`[node-health] ranking unavailable; preserving complete input order: ${error.message}`);
+      console.error('[node-health] ranking unavailable; preserving complete input order');
     }
     return proxies;
   }
@@ -667,6 +923,7 @@ if (typeof module === 'object' && module.exports) {
     NODE_HEALTH_SCHEMA_VERSION,
     REGION_ORDER,
     STABLE_SLOT_COUNT,
+    aliasEntryId,
     buildOrdering,
     canonicalJson,
     clashMetaNodeKey,

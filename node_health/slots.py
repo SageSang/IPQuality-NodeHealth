@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from .config import PolicyConfig
 from .models import NodeAssessment
-from .policy import GRADE_ORDER
+from .policy import EVIDENCE_POLICY_VERSION, GRADE_ORDER, sample_qualified
 
 
 _RESIDENTIAL_ORDER = {"unknown": 0, "probable": 1, "confirmed": 2}
@@ -332,6 +332,8 @@ def _history_by_day(item: NodeAssessment) -> dict[str, dict[str, object]]:
         str(entry.get("day")): entry
         for entry in item.daily_quality_history
         if isinstance(entry, dict) and entry.get("day") and entry.get("evidence_valid")
+        and type(entry.get("qualification_version")) is int
+        and entry.get("qualification_version") == EVIDENCE_POLICY_VERSION
     }
 
 
@@ -395,7 +397,10 @@ def _apply_promotions(
         if not incumbent_options:
             break
         _, weakest_slot, incumbent = min(incumbent_options, key=lambda value: value[0])
-        if not incumbent.evidence_valid or not incumbent.fresh_full_completed or not incumbent.fresh_full_usable:
+        if (not incumbent.evidence_valid or not incumbent.fresh_full_completed or not incumbent.fresh_full_usable
+                or incumbent.qualification_version != EVIDENCE_POLICY_VERSION
+                or type(incumbent.qualification_version) is not int
+                or not sample_qualified(incumbent.quick, policy)):
             break
         assigned = set(slots.values())
         candidates = sorted((
@@ -405,6 +410,9 @@ def _apply_promotions(
             and item.fresh_full_completed
             and item.fresh_full_usable
             and item.evidence_valid
+            and item.qualification_version == EVIDENCE_POLICY_VERSION
+            and type(item.qualification_version) is int
+            and sample_qualified(item.quick, policy)
             and item.healthy_streak_days >= policy.promotion_min_healthy_days
             and GRADE_ORDER.get(item.evaluation.overall_grade, 2) <= GRADE_ORDER.get(incumbent.evaluation.overall_grade, 2)
             and GRADE_ORDER.get(item.evaluation.ai_grade, 2) <= GRADE_ORDER.get(incumbent.evaluation.ai_grade, 2)

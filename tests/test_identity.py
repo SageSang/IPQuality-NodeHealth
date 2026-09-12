@@ -53,18 +53,16 @@ def test_port_hopping_identity_ignores_only_the_random_concrete_port():
     assert node_key(first) != node_key({**second, "ports": "30000-30100"})
 
 
-def test_inventory_fails_closed_on_same_connection_with_two_alias_names():
+def test_inventory_groups_same_connection_with_two_alias_names():
     payload = """
 proxies:
   - {name: alias-a, type: ss, server: one.example, port: 443, password: secret}
   - {name: alias-b, type: ss, server: one.example, port: 443, password: secret}
 """
-    try:
-        parse_clash_inventory(payload, {})
-    except ValueError as error:
-        assert "connection-identical proxies" in str(error)
-    else:
-        raise AssertionError("alias collision must fail before generating an invalid dialer graph")
+    parsed = parse_clash_inventory(payload, {})
+    assert len(parsed) == 1
+    assert [alias.name for alias in parsed[0].aliases] == ["alias-a", "alias-b"]
+    assert len({alias.entry_id for alias in parsed[0].aliases}) == 2
 
 
 def test_inventory_rejects_explicit_region_outside_fixed_port_contract():

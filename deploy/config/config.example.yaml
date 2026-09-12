@@ -32,6 +32,8 @@ probe:
   request_timeout_seconds: 15
   concurrency: 8
   full_concurrency: 3
+  provider_max_requests_per_scan: 1000
+  max_response_bytes: 1048576
   samples: 3
   ip_url: https://api.ipify.org?format=json
   geo_url_template: https://ipapi.co/{ip}/json/
@@ -131,6 +133,10 @@ audit:
   max_nodes: 500
 
 local_socks:
+  # A reviewed stable identity; an empty ID disables the runtime-map endpoint,
+  # while ordinary ranking remains available. Never generate it per restart.
+  namespace: "${NODE_HEALTH_NAMESPACE:-node-health-production}"
+  server_instance_id: "${NODE_HEALTH_SERVER_INSTANCE_ID:-}"
   stable_slots: 3
   dynamic_offset: 3
   # Address used by AdsPower and other LAN clients to reach OpenWrt SOCKS5
@@ -163,26 +169,6 @@ local_socks:
     australia: 64000
     other: 64200
 
-regions:
-  hong-kong:
-    - '🇭🇰|香港|港(?!口)|Hong\s*Kong|(?-i:\bHK\b)'
-  taiwan:
-    - '🇹🇼|台湾|臺灣|台北|臺北|台中|臺中|台南|臺南|高雄|Taiwan|Taipei|Hinet|(?-i:\bTW\b)'
-  japan:
-    - '🇯🇵|日本|Japan|Tokyo|Osaka|东京|大阪|(?-i:\bJP\b)'
-  singapore:
-    - '🇸🇬|新加坡|狮城|獅城|Singapore|(?-i:\bSG\b)'
-  united-states:
-    - '🇺🇸|美国|美國|United\s*States|Los\s*Angeles|San\s*Francisco|Seattle|New\s*York|洛杉矶|洛杉磯|西雅图|西雅圖|纽约|紐約|夏威夷|(?-i:\bUS\b)|(?-i:\bUSA\b)'
-  south-korea:
-    - '🇰🇷|韩国|韓國|South\s*Korea|Korea|Seoul|首尔|首爾|(?-i:\bKR\b)'
-  united-kingdom:
-    - '🇬🇧|英国|英國|United\s*Kingdom|Great\s*Britain|Britain|England|London|Manchester|伦敦|倫敦|(?-i:\bUK\b)'
-  germany:
-    - '🇩🇪|德国|德國|Germany|Deutschland|Frankfurt|Berlin|法兰克福|法蘭克福|(?-i:\bDE\b)'
-  france:
-    - '🇫🇷|法国|法國|France|Paris|巴黎|(?-i:\bFR\b)'
-  canada:
-    - '🇨🇦|加拿大|Canada|Toronto|Vancouver|多伦多|多倫多|(?-i:\bCA\b)'
-  australia:
-    - '🇦🇺|澳大利亚|澳大利亞|澳洲|Australia|Sydney|Melbourne|Perth|Brisbane|悉尼|(?-i:\bAU\b)'
+# Omit regions to use the shared node_health/region_rules.json defaults.
+# Custom regex overrides remain supported; effective regions are published in
+# identity_index and the explicit map, not re-guessed by the fixed consumer.

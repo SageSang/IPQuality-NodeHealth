@@ -16,6 +16,16 @@ fi
 : "${LOCAL_SOCKS_NOFILE:=65535 65535}"
 
 prepare_runtime_binary() {
+  # Ordinary restarts must use the already reviewed independent core. Initial
+  # installation and upgrades explicitly provision this file before applying.
+  if [ -x "$MIHOMO_BIN" ]; then
+    return 0
+  fi
+  logger -t local-socks 'provision the reviewed independent Mihomo core before starting'
+  return 1
+}
+
+install_runtime_binary() {
   [ -x "$MIHOMO_SOURCE" ] || {
     logger -t local-socks "Mihomo source is unavailable: $MIHOMO_SOURCE"
     return 1

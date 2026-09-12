@@ -1,7 +1,11 @@
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import yaml
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,25 +23,19 @@ def test_compose_has_no_probe_volume_and_rotates_container_logs():
         assert str(logging["options"]["max-file"]) == "3"
 
 
-def test_ipquality_script_has_explicit_success_exit_after_ip_checks():
-    lines = [
-        line.strip()
-        for line in (ROOT / "ip.sh").read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-
-    assert lines[-1] == "exit 0"
-    ipv4_check = next(
-        index
-        for index, line in enumerate(lines)
-        if line.endswith('&&check_IP "$IPV4" 4')
-    )
-    ipv6_check = next(
-        index
-        for index, line in enumerate(lines)
-        if line.endswith('&&check_IP "$IPV6" 6')
-    )
-    assert ipv4_check < ipv6_check < len(lines) - 1
+@pytest.mark.parametrize("fail4,fail6,check6,expected", [(0,0,1,0),(1,0,1,1),(0,1,1,1),(1,1,1,1),(0,1,0,0)])
+def test_ipquality_exit_code_reflects_enabled_checks(fail4,fail6,check6,expected):
+    if not shutil.which("bash"):
+        pytest.skip("bash required")
+    source=(ROOT / "ip.sh").read_text()
+    tail=source[source.rindex('\nresult_code=0\n'):]
+    setup='''check_IP(){ printf '%s\\n' "$2"; if [[ "$2" == 4 ]];then return "$FAIL4";else return "$FAIL6";fi; }
+IPV4work=1; IPV6work=1; IPV4check=1
+IPV4=8.8.8.8; IPV6=2606:4700::1111
+'''
+    result=subprocess.run(["bash","-c",setup+tail],env=dict(os.environ,FAIL4=str(fail4),FAIL6=str(fail6),IPV6check=str(check6)),capture_output=True,text=True)
+    assert result.returncode==expected
+    assert result.stdout.splitlines()==(["4","6"] if check6 else ["4"])
 
 
 def test_deployment_env_example_covers_required_compose_inputs():

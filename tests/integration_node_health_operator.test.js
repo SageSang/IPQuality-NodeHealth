@@ -600,290 +600,26 @@ async function testOperatorPreservesAll250InputsAndUnknownTailOrder() {
   assert.strictEqual(new Set(output).size, 250);
 }
 
-async function testStablePortGaps() {
-  const stableOne = proxy('US one', 'one.example');
-  const stableUnavailable = proxy('US unavailable', 'unavailable.example');
-  const dynamicOne = proxy('US candidate', 'candidate.example');
-  const other = proxy('Brazil node', 'brazil.example');
-  const unknown = proxy('US untested', 'untested.example');
-  const ghostKey = 'e'.repeat(64);
-  const keys = {
-    stableOne: converter.nodeKey(stableOne),
-    stableUnavailable: converter.nodeKey(stableUnavailable),
-    dynamicOne: converter.nodeKey(dynamicOne),
-    other: converter.nodeKey(other),
-  };
-  const state = {
-    schema_version: 2,
-    version: 'test-v2',
-    regions: {
-      'united-states': {
-        stable_slots: {
-          1: keys.stableOne,
-          2: ghostKey,
-          3: keys.stableUnavailable,
-        },
-        ranked: [keys.dynamicOne],
-        rejected: { [keys.stableUnavailable]: 'quick_unavailable' },
-      },
-      other: { stable_slots: {}, ranked: [keys.other], rejected: {} },
+function testFixedConsumerRejectsLegacyRankingAndMissingApprovals() {
+  const input = { proxies: [proxy('Hong Kong A', 'a.example')] };
+  assert.throws(() => converter.convertConfig(input, {schema_version: 2, version: 'legacy', regions: {}}), /unsupported/);
+  assert.throws(() => converter.convertConfig(input, {
+    schema_version: 1, consumer_contract: 'local-socks-explicit-v1',
+    purpose: 'production', application_status: 'target-only',
+  }), /unapproved/);
+}
+
+function testOperatorDoesNotInventStableSlots() {
+  const keys = ['a', 'b', 'c'].map(letter => letter.repeat(64));
+  const state = addIdentityIndex({
+    schema_version: 2, version: 'sparse', regions: {
+      'hong-kong': {stable_slots: {2: keys[0], 3: keys[1]}, ranked: [keys[2]], rejected: {}},
     },
-    nodes: {
-      [keys.stableOne]: { region: 'united-states' },
-      [keys.stableUnavailable]: { region: 'united-states' },
-      [keys.dynamicOne]: { region: 'united-states' },
-      [keys.other]: { region: 'other' },
-    },
-  };
-  addIdentityIndex(state);
-  const ordering = operatorModule.buildOrdering(
-    state,
-    new Set([keys.stableOne, keys.stableUnavailable, keys.dynamicOne, keys.other]),
-  ).order;
-  assert.strictEqual(ordering.get(keys.stableOne), 0);
-  assert.strictEqual(ordering.get(keys.dynamicOne), 1);
-  assert.strictEqual(ordering.get(keys.stableUnavailable), 2);
-  const output = converter.convertConfig(
-    { proxies: [dynamicOne, unknown, other, stableUnavailable, stableOne] },
-    state,
-    62000,
-  );
-  const ports = Object.fromEntries(output.listeners.map((listener) => [listener.proxy, listener.port]));
-  assert.strictEqual(ports['US one'], 62800);
-  assert.strictEqual(ports['US unavailable'], 62802);
-  assert.strictEqual(ports['US candidate'], 62801);
-  assert.strictEqual(ports['Brazil node'], 64200);
-  assert.strictEqual(ports['US untested'], 62803);
-  const exported = output.listeners.map(
-    (listener) => `socks5://192.0.2.4:${listener.port}{${listener.proxy}}`,
-  );
-  assert.ok(exported.includes('socks5://192.0.2.4:62800{US one}'));
-  assert.ok(exported.includes('socks5://192.0.2.4:62801{US candidate}'));
-  assert.ok(!exported.some((line) => line.includes('{unresolved}') || line.includes('{dynamic-')));
-  assert.deepStrictEqual(output.dns, {
-    enable: true,
-    listen: '127.0.0.1:11553',
-    'enhanced-mode': 'fake-ip',
-    'fake-ip-range': '198.18.0.1/16',
-    'default-nameserver': ['223.5.5.5', '1.12.12.12'],
-    nameserver: [
-      'https://223.5.5.5/dns-query',
-      'https://1.12.12.12/dns-query',
-    ],
-    'proxy-server-nameserver': [
-      'https://223.5.5.5/dns-query',
-      'https://1.12.12.12/dns-query',
-    ],
   });
-  assert.strictEqual(operatorModule.STABLE_SLOT_COUNT, 3);
-  assert.strictEqual(converter.STABLE_SLOT_COUNT, 3);
-}
-
-function testDuplicateNodeAliasesAreAllPreserved() {
-  const aliases = [1, 2, 3, 4].map((number) =>
-    proxy(`US shared endpoint ${number}`, 'shared.example'),
-  );
-  const sharedKey = converter.nodeKey(aliases[0]);
-  for (const alias of aliases) {
-    assert.strictEqual(converter.nodeKey(alias), sharedKey);
-  }
-  const state = {
-    schema_version: 2,
-    version: 'duplicate-aliases',
-    regions: {
-      'united-states': {
-        stable_slots: { 1: sharedKey },
-        ranked: [sharedKey],
-        rejected: {},
-      },
-    },
-    nodes: { [sharedKey]: { region: 'united-states' } },
-  };
-  addIdentityIndex(state);
-
-  const output = converter.convertConfig({ proxies: aliases }, state, 62000);
-  assert.strictEqual(output.listeners.length, aliases.length);
-  assert.strictEqual(output.proxies.length, aliases.length);
-  assert.deepStrictEqual(
-    output.listeners.map((listener) => listener.proxy),
-    aliases.map((alias) => alias.name),
-  );
-  assert.deepStrictEqual(
-    output.listeners.map((listener) => listener.port),
-    [62800, 62801, 62802, 62803],
-  );
-}
-
-function testStableConverterKeepsSlotAcrossConnectionRotation() {
-  const oldStable = proxy('Hong Kong 01', 'old-hk.example', {
-    _nh_source_id: 'E-IX',
-    _nh_original_name: 'Hong Kong 01',
-  });
-  const rotatedStable = proxy('Hong Kong 01', 'new-hk.example', {
-    _nh_source_id: 'E-IX',
-    _nh_original_name: 'Hong Kong 01',
-  });
-  const candidate = proxy('Hong Kong 02', 'candidate-hk.example', {
-    _nh_source_id: 'E-IX',
-    _nh_original_name: 'Hong Kong 02',
-  });
-  const oldKey = converter.nodeKey(oldStable);
-  const candidateKey = converter.nodeKey(candidate);
-  assert.notStrictEqual(converter.nodeKey(rotatedStable), oldKey);
-
-  const state = {
-    schema_version: 2,
-    version: 'converter-identity-rotation-v2',
-    region_order: ['hong-kong'],
-    regions: {
-      'hong-kong': {
-        stable_slots: { 1: oldKey },
-        ranked: [candidateKey],
-        rejected: {},
-      },
-    },
-    identity_index: {
-      [oldKey]: converter.selectedIdentity(oldStable),
-      [candidateKey]: converter.selectedIdentity(candidate),
-    },
-  };
-
-  const output = converter.convertConfig(
-    { proxies: [candidate, rotatedStable] },
-    state,
-    62000,
-  );
-  const ports = Object.fromEntries(output.listeners.map((listener) => [listener.proxy, listener.port]));
-  assert.strictEqual(ports['Hong Kong 01'], 62000);
-  assert.strictEqual(ports['Hong Kong 02'], 62001);
-
-  const wrongSource = {
-    ...rotatedStable,
-    _nh_source_id: 'airport-b',
-  };
-  const guarded = converter.convertConfig(
-    { proxies: [wrongSource, candidate] },
-    state,
-    62000,
-  );
-  const guardedPorts = Object.fromEntries(
-    guarded.listeners.map((listener) => [listener.proxy, listener.port]),
-  );
-  assert.strictEqual(guardedPorts['Hong Kong 02'], 62000);
-  assert.strictEqual(guardedPorts['Hong Kong 01'], 62001);
-}
-
-function testStableConverterRejectsIncompleteRankingState() {
-  const input = { proxies: [proxy('Keep existing', 'keep-existing.example')] };
-  const invalidStates = [
-    { schema_version: 2, version: 'empty-regions', regions: {} },
-    {
-      schema_version: 2,
-      version: 'empty-shell',
-      regions: { other: { stable_slots: {}, ranked: [], rejected: {} } },
-    },
-    {
-      schema_version: 2,
-      version: 'bad-key',
-      regions: {
-        other: { stable_slots: {}, ranked: ['not-a-node-key'], rejected: {} },
-      },
-    },
-    {
-      schema_version: 2,
-      version: 'legacy-slot-four',
-      regions: {
-        'united-states': {
-          stable_slots: { 4: converter.nodeKey(input.proxies[0]) },
-          ranked: [],
-          rejected: {},
-        },
-      },
-    },
-  ];
-  for (const state of invalidStates) {
-    assert.throws(() => converter.convertConfig(input, state, 62000));
-  }
-}
-
-function testPollerCacheIsolationContract() {
-  const source = fs.readFileSync(path.join(
-    __dirname,
-    '..',
-    'integrations',
-    'openwrt',
-    'check-ranking.sh',
-  ), 'utf8');
-  assert.ok(source.includes("--header 'Cache-Control: no-cache'"));
-  assert.ok(source.includes("--header 'Pragma: no-cache'"));
-  assert.ok(source.includes('_node_health_version=${encoded_version}'));
-  const firstRanking = source.indexOf('download "$RANKING_URL" "$RANKING_FIRST"');
-  const inventory = source.indexOf('download "$SOURCE_VERSION_URL" "$SOURCE_YAML"');
-  const finalRanking = source.indexOf('download "$RANKING_URL" "$RANKING_FINAL"');
-  assert.ok(firstRanking >= 0 && firstRanking < inventory && inventory < finalRanking);
-  assert.ok(source.includes("LOCK_DIR='/tmp/node-health-check-ranking.lock.d'"));
-  assert.ok(source.includes('APPLIED_CHECKSUM_FILE='));
-  assert.ok(source.includes('exports_match_version()'));
-  assert.ok(source.includes("jsonfilter -e '@.*.instances.*.running'"));
-  assert.ok(source.includes('local-socks runtime self-heal failed'));
-  assert.ok(source.includes('local-socks runtime recovered from local version'));
-  assert.ok(source.includes('runtime_ready; then'));
-  assert.ok(source.includes("trap 'exit 1' HUP INT TERM"));
-}
-
-function testRollbackRestoresRuntimePermissions() {
-  const source = fs.readFileSync(path.join(
-    __dirname,
-    '..',
-    'integrations',
-    'openwrt',
-    'apply-ranking.sh',
-  ), 'utf8');
-  const copy = source.indexOf('cp -p "$BACKUP" "$restore"');
-  const mode = source.indexOf('chmod "$CONFIG_MODE" "$restore"');
-  const owner = source.indexOf('chown "$CONFIG_OWNER" "$restore"');
-  const replace = source.indexOf('mv -f "$restore" "$CONFIG_PATH"');
-  assert.ok(copy >= 0 && copy < mode && mode < owner && owner < replace);
-  assert.ok(source.includes('[ -n "$CONFIG_OWNER" ] && ! chown'));
-  assert.ok(source.includes('rm -f -- "$restore"'));
-  assert.ok(source.includes("START_PORT must be exactly 62000"));
-  assert.ok(source.includes("trap 'exit 1' HUP INT TERM"));
-  assert.ok(source.includes("jsonfilter -e '@.*.instances.*.running'"));
-  assert.ok(source.includes('listeners_ready()'));
-  assert.ok(source.includes("net.createConnection({ host: '127.0.0.1', port })"));
-  assert.ok(source.includes("fail_after_rollback 'one or more configured listeners are not reachable'"));
-  const readinessCall = source.lastIndexOf('if ! service_ready; then');
-  const listenerCall = source.lastIndexOf('if ! listeners_ready; then');
-  const exportCall = source.lastIndexOf('if ! publish_exports; then');
-  assert.ok(readinessCall < listenerCall && listenerCall < exportCall);
-
-  const runner = fs.readFileSync(path.join(
-    __dirname,
-    '..',
-    'integrations',
-    'openwrt',
-    'convert-ranking.mjs',
-  ), 'utf8');
-  assert.ok(runner.includes('inventory has zero matches'));
-  assert.ok(runner.includes("path.join(exportDirectory, 'all.txt')"));
-  assert.ok(runner.includes("path.join(exportDirectory, 'all-plain.txt')"));
-  assert.ok(runner.includes("dns.listen !== '127.0.0.1:11553'"));
-  assert.ok(runner.includes("dns['enhanced-mode'] !== 'fake-ip'"));
-  assert.ok(runner.includes("const bootstrapResolvers = ['223.5.5.5', '1.12.12.12']"));
-  assert.ok(runner.includes("dns['proxy-server-nameserver']"));
-  assert.ok(runner.includes('converter output must preserve the bootstrap-safe independent fake-IP DNS configuration'));
-
-  const service = fs.readFileSync(path.join(
-    __dirname,
-    '..',
-    'integrations',
-    'openwrt',
-    'service-lib.sh',
-  ), 'utf8');
-  assert.ok(service.includes('prepare_runtime_binary()'));
-  assert.ok(service.includes('cmp -s "$MIHOMO_SOURCE" "$MIHOMO_BIN"'));
-  assert.ok(service.includes('procd_set_param limits nofile="$LOCAL_SOCKS_NOFILE"'));
-  assert.ok(service.includes('bin/mihomo-local-socks'));
+  const ordering = operatorModule.buildOrdering(state, new Set(keys)).order;
+  assert.strictEqual(ordering.get(keys[0]), 0);
+  assert.strictEqual(ordering.get(keys[1]), 1);
+  assert.strictEqual(ordering.get(keys[2]), 2);
 }
 
 (async () => {
@@ -898,12 +634,8 @@ function testRollbackRestoresRuntimePermissions() {
   testNormalizedUniqueNameFallbackAndAmbiguityGuard();
   testExactConnectionIdentityPrecedesLogicalSourceMismatch();
   await testOperatorPreservesAll250InputsAndUnknownTailOrder();
-  await testStablePortGaps();
-  testDuplicateNodeAliasesAreAllPreserved();
-  testStableConverterKeepsSlotAcrossConnectionRotation();
-  testStableConverterRejectsIncompleteRankingState();
-  testPollerCacheIsolationContract();
-  testRollbackRestoresRuntimePermissions();
+  testFixedConsumerRejectsLegacyRankingAndMissingApprovals();
+  testOperatorDoesNotInventStableSlots();
   process.stdout.write('integration_node_health_operator: ok\n');
 })().catch((error) => {
   console.error(error);

@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
+from .errors import safe_error_text, sanitize_error_fields
+from .evidence_migration import ensure_supported_evidence
+from .identity import node_aliases
 from .models import NodeAssessment
 from .audit import audit_day_parts, validate_audit_id
 from .reconcile import SCHEMA_VERSION
@@ -84,7 +87,9 @@ def read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, An
     for attempt in range(5):
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else (default or {})
+            if not isinstance(value, dict):
+                raise ValueError("JSON record must be an object")
+            return value
         except FileNotFoundError:
             return default or {}
         except PermissionError:
@@ -161,6 +166,12 @@ def write_text_exclusive(path: Path, content: str) -> None:
         raise
 
 
+def _require_known_layout(value: dict[str, Any]) -> None:
+    version = value.get("schema_version")
+    if version is not None and (type(version) is not int or version not in {1, SCHEMA_VERSION}):
+        raise ValueError("unsupported state layout")
+
+
 class StateStore:
     def __init__(self, config: AppConfig):
         self.config = config
@@ -171,6 +182,7 @@ class StateStore:
         self.scheduled_reports_dir = config.reports_dir / "scheduled"
         self.audit_reports_dir = config.reports_dir / "audits"
         self.local_socks_reports_dir = config.reports_dir / "local-socks"
+        ensure_supported_evidence(self.load_state())
         self._recover_interrupted_audits()
         self._recover_committed_alerts()
 
@@ -277,7 +289,7 @@ class StateStore:
             LOGGER.warning(
                 "committed %s but report/export/alert finalization is pending: %s",
                 selected.get("state_revision") or selected.get("version"),
-                error,
+                safe_error_text(error, "publishing"),
             )
             if required:
                 raise
@@ -290,6 +302,7 @@ class StateStore:
         return self.audit_reports_dir / year / month / day / audit_id
 
     def create_audit_status(self, status: dict[str, Any]) -> None:
+        status = sanitize_error_fields(status)
         audit_id = validate_audit_id(str(status.get("id") or ""))
         path = self.audit_status_path(audit_id)
         if path.exists():
@@ -300,7 +313,7 @@ class StateStore:
         )
 
     def load_audit_status(self, audit_id: str) -> dict[str, Any]:
-        return read_json(self.audit_status_path(audit_id), {})
+        return sanitize_error_fields(read_json(self.audit_status_path(audit_id), {}))
 
     def update_audit_status(self, audit_id: str, **changes: Any) -> dict[str, Any]:
         path = self.audit_status_path(audit_id)
@@ -308,6 +321,7 @@ class StateStore:
         if not status:
             raise FileNotFoundError(f"audit not found: {audit_id}")
         status.update(changes)
+        status = sanitize_error_fields(status)
         atomic_write_json(path, status)
         return status
 
@@ -327,6 +341,7 @@ class StateStore:
             "nodes": {},
         }
         current = read_json(self.current_path, {})
+        _require_known_layout(current)
         if current and current.get("schema_version") != SCHEMA_VERSION:
             current = {}
         current_version = str(current.get("version") or "")
@@ -337,6 +352,7 @@ class StateStore:
                 snapshot = read_json(snapshot_path, {})
             except ValueError:
                 snapshot = {}
+            _require_known_layout(snapshot)
             if (
                 snapshot.get("schema_version") == SCHEMA_VERSION
                 and snapshot.get("version") == current_version
@@ -347,6 +363,7 @@ class StateStore:
             ):
                 return _seed_frozen_order(snapshot, current)
         state = read_json(self.state_path, empty)
+        _require_known_layout(state)
         if state.get("schema_version") != SCHEMA_VERSION:
             state = empty
         if current_revision:
@@ -372,6 +389,8 @@ class StateStore:
         slot_changes: list[dict[str, str]],
         generated_at: datetime,
     ) -> None:
+        current.update(sanitize_error_fields(current))
+        state.update(sanitize_error_fields(state))
         # Finish any alert left between the previous current.json commit and
         # its best-effort alert publication before preparing a newer scan.
         self._recover_committed_alerts(required=True)
@@ -427,7 +446,7 @@ class StateStore:
         if self.config.report.markdown:
             atomic_write_text(archive_dir / "report.md", report_markdown)
         self._write_local_socks_exports(
-            archive_dir / "local-socks", local_socks_exports, str(current["version"])
+            archive_dir / "local-socks", local_socks_exports, str(current["version"]), current.get("port_mapping")
         )
         # Alert consumers watch reports/alerts directly. Stage the content in
         # this revision's archive so a failed current.json commit cannot emit
@@ -470,7 +489,7 @@ class StateStore:
             # current.json is already the durable commit point. Retention is
             # best-effort and must not turn a published version into a failed
             # scan that the scheduler retries.
-            LOGGER.warning("published %s but retention cleanup failed: %s", current["version"], error)
+            LOGGER.warning("published %s but retention cleanup failed: %s", current["version"], safe_error_text(error, "publishing"))
 
     def publish_audit(
         self,
@@ -479,6 +498,7 @@ class StateStore:
         assessments: list[NodeAssessment],
         generated_at: datetime,
     ) -> dict[str, str]:
+        current.update(sanitize_error_fields(current))
         report_json = build_report_json(
             current,
             assessments,
@@ -513,12 +533,12 @@ class StateStore:
         atomic_write_text(markdown_path, report_markdown)
         local_socks_path = directory / "local-socks"
         self._write_local_socks_exports(
-            local_socks_path, local_socks_exports, str(current["version"])
+            local_socks_path, local_socks_exports, str(current["version"]), current.get("port_mapping")
         )
         try:
             self._prune_report_archives(generated_at)
         except OSError as error:
-            LOGGER.warning("audit %s published but retention cleanup failed: %s", audit_id, error)
+            LOGGER.warning("audit %s published but retention cleanup failed: %s", audit_id, safe_error_text(error, "publishing"))
         return {
             "json": json_path.relative_to(self.config.reports_dir).as_posix(),
             "markdown": markdown_path.relative_to(self.config.reports_dir).as_posix(),
@@ -528,13 +548,16 @@ class StateStore:
         }
 
     def _write_local_socks_exports(
-        self, directory: Path, exports: dict[str, str], version: str
+        self, directory: Path, exports: dict[str, str], version: str, mapping: dict[str, Any] | None = None
     ) -> None:
         for region, content in exports.items():
             atomic_write_text(directory / f"{region}.txt", content)
         atomic_write_text(
             directory / "README.txt",
             f"Generated by node-health ranking {version}\n"
+            f"Target mapping: {(mapping or {}).get('mapping_version', 'unavailable')}\n"
+            f"Purpose: {(mapping or {}).get('purpose', 'unavailable')}\n"
+            "Application on the router is unverified; these are target exports.\n"
             "Each SOCKS5 URL contains the real source node name.\n"
             "all.txt concatenates every regional listener in region order.\n"
             "all-plain.txt contains the same endpoints without display names.\n",
@@ -544,6 +567,25 @@ class StateStore:
         if extension not in {"json", "md"}:
             raise ValueError("unsupported audit report extension")
         return self.audit_report_dir(audit_id) / f"report.{extension}"
+
+    def read_safe_audit_report(self, audit_id: str, extension: str) -> bytes:
+        path = self.audit_report_path(audit_id, "json")
+        report = read_json(path, {})
+        if not report:
+            raise FileNotFoundError("audit report is unavailable")
+        safe = sanitize_error_fields(report)
+        if extension == "json":
+            return (json.dumps(safe, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        if extension != "md":
+            raise ValueError("unsupported audit report extension")
+        if report.get("error_schema_version") == 1:
+            return self.audit_report_path(audit_id, "md").read_bytes()
+        lines = ["# Historical audit report", "", "## Summary", "", *_json_fence(safe.get("summary", {})), ""]
+        for node in safe.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            lines.extend([f"## {_markdown_escape(node.get('name', 'Node'))}", "", *_json_fence(node), ""])
+        return ("\n".join(lines).rstrip() + "\n").encode("utf-8")
 
     def _prune_state_snapshots(self, keep: int) -> None:
         snapshots = sorted(
@@ -625,10 +667,13 @@ def _assessment_detail(
         full = _redact_exit_ips(full)
         fresh_full_attempt = _redact_exit_ips(fresh_full_attempt)
         evaluation = _redact_exit_ips(evaluation)
-    return {
+    return sanitize_error_fields({
         "node_key": assessment.node.key,
         "name": assessment.node.name,
         "region": assessment.node.region,
+        "aliases": [alias.to_dict() for alias in node_aliases(assessment.node)],
+        "representative_alias_id": assessment.node.representative_alias_id,
+        "region_conflict": assessment.node.region_conflict,
         "connection": _connection_detail(assessment),
         "geo": _geo_detail(assessment, include_exit_ip),
         "quick": quick,
@@ -655,7 +700,7 @@ def _assessment_detail(
         "evidence_valid": assessment.evidence_valid,
         "fresh_full_completed": assessment.fresh_full_completed,
         "fresh_full_usable": assessment.fresh_full_usable,
-    }
+    })
 
 
 _IPV4_LITERAL = re.compile(
@@ -816,27 +861,30 @@ def _local_socks_detail(
         "port": port,
         "protocol": "socks5",
         "name": name,
-        "url": f"socks5://{advertise_host}:{port}{{{name}}}",
+        "url": f"{_socks_endpoint(advertise_host, port)}{{{name}}}",
     }
+
+
+def _socks_endpoint(host: str, port: int) -> str:
+    address = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"socks5://{address}:{port}"
 
 
 def _report_order(
     current: dict[str, Any], port_bases: dict[str, int], slot_count: int
 ) -> dict[str, tuple[int, int | None, str]]:
     order: dict[str, tuple[int, int | None, str]] = {}
-    for region, payload in current.get("regions", {}).items():
-        base = port_bases.get(region)
-        for slot, key in payload.get("stable_slots", {}).items():
-            index = int(slot) - 1
-            order[str(key)] = (index, _listener_port(region, base, index), f"{int(slot):03d}")
-        dynamic_start = 0 if region == "other" else slot_count
-        for index, key in enumerate(payload.get("ranked", [])):
-            absolute = dynamic_start + index
-            order[str(key)] = (
-                absolute,
-                _listener_port(region, base, absolute),
-                f"dynamic-{index + 1:03d}",
-            )
+    mapping = current.get("port_mapping")
+    if not isinstance(mapping, dict):
+        return order
+    bases = {region["id"]: region["base"] for region in mapping.get("regions", [])}
+    for binding in mapping.get("bindings", []):
+        key = binding.get("node_key")
+        if not key or not binding.get("entry_id") or key in order:
+            continue
+        label = (f"{int(binding['slot']):03d}" if binding["role"] == "stable"
+                 else f"dynamic-{int(binding['dynamic_index']):03d}")
+        order[key] = (binding["port"] - bases[binding["region"]], binding["port"], label)
     return order
 
 
@@ -853,20 +901,21 @@ def build_local_socks_exports(
     ``all.txt`` keeps that named format; ``all-plain.txt`` contains only the
     SOCKS5 endpoint and is useful for clients that reject display labels.
     """
-    order = _report_order(current, port_bases, slot_count)
+    mapping = current.get("port_mapping")
     entries: dict[str, list[tuple[int, str, str]]] = {
         region: [] for region in current.get("region_order", port_bases)
     }
-    for item in assessments:
-        position = order.get(item.node.key)
-        if position is None or position[1] is None:
+    by_id = {entry["entry_id"]: entry for entry in mapping.get("entries", [])} if isinstance(mapping, dict) else {}
+    for binding in mapping.get("bindings", []) if isinstance(mapping, dict) else []:
+        entry = by_id.get(binding.get("entry_id"))
+        if entry is None:
             continue
-        name = re.sub(r"[\r\n]+", " ", item.node.name).strip()
+        name = re.sub(r"[\r\n]+", " ", entry["name"]).strip()
         if not name:
             continue
-        plain_line = f"socks5://{advertise_host}:{position[1]}"
-        entries.setdefault(item.node.region, []).append(
-            (position[0], plain_line, f"{plain_line}{{{name}}}")
+        plain_line = _socks_endpoint(advertise_host, binding["port"])
+        entries.setdefault(binding["region"], []).append(
+            (binding["port"], plain_line, f"{plain_line}{{{name}}}")
         )
     rendered = {
         region: "".join(f"{named}\n" for _, _, named in sorted(lines))
@@ -898,6 +947,8 @@ def _report_summary(assessments: list[NodeAssessment]) -> dict[str, Any]:
     }
     return {
         "nodes": len(assessments),
+        "connection_count": len(assessments),
+        "input_count": sum(len(node_aliases(item.node)) for item in assessments),
         "available": sum(1 for item in assessments if item.quick.available),
         "unavailable": sum(1 for item in assessments if not item.quick.available),
         "full_completed": sum(
@@ -930,8 +981,14 @@ def build_report_json(
     advertise_host: str,
 ) -> dict[str, Any]:
     order = _report_order(current, port_bases, slot_count)
-    return {
+    return sanitize_error_fields({
         "schema_version": 1,
+        "error_schema_version": 1,
+        "probe_scope": "site-region",
+        "runtime_target_status": current.get("runtime_target_status", "unverified"),
+        "port_mapping": current.get("port_mapping"),
+        "evidence_policy_version": current.get("evidence_policy_version"),
+        "evidence_migration": current.get("evidence_migration"),
         "report_kind": current.get("report_kind", "scheduled"),
         "version": current["version"],
         "state_revision": current.get("state_revision"),
@@ -972,7 +1029,7 @@ def build_report_json(
             }
             for item in sorted(assessments, key=_report_sort_key)
         ],
-    }
+    })
 
 
 def _report_sort_key(assessment: NodeAssessment) -> tuple[object, ...]:
@@ -1117,6 +1174,8 @@ _REASON_ZH = {
     "chatgpt-service-outage": "ChatGPT 本轮触发服务级异常保护，沿用历史 AI 结果",
     "claude-service-outage": "Claude 本轮触发服务级异常保护，沿用历史 AI 结果",
     "claude-risk-incomplete": "Claude 专用出口风险数据不完整，沿用可信缓存并暂停累计",
+    "chatgpt-intelligence-country-conflict": "ChatGPT 同一服务出口的国家与独立地理来源冲突，暂停累计",
+    "fresh-ai-unconfirmed": "本轮 AI 站点/地区证据不确定，暂停累计",
 }
 
 _REASON_PREFIX_ZH = {
@@ -1191,6 +1250,8 @@ def build_report_markdown(
     include_raw_details: bool,
     advertise_host: str,
 ) -> str:
+    current = sanitize_error_fields(current)
+    slot_changes = sanitize_error_fields(slot_changes)
     if not include_exit_ip:
         slot_changes = _redact_exit_ips(slot_changes)
     lookup = _slot_lookup(current)
@@ -1208,12 +1269,14 @@ def build_report_markdown(
         f"- 报告类型：`{'临时订阅审计' if report_kind == 'subscription-audit' else '正式定时检测'}`",
         f"- 运行模式：`{_MODE_ZH.get(current['mode'], current['mode'])}`",
         f"- 版本：`{current['version']}`",
+        "- AI 指标范围：站点/地区探测，不代表账号登录或对话验证。",
+        f"- 端口映射：目标配置（设备应用状态未验证）；状态 `{current.get('runtime_target_status', 'unverified')}`。",
         *(
             [f"- 状态修订：`{current['state_revision']}`"]
             if current.get("state_revision")
             else []
         ),
-        f"- 订阅节点总数：{current['source']['node_count']}",
+        f"- 检测连接数：{current['source']['node_count']}；完整订阅条目数：{current['source'].get('input_count', current['source']['node_count'])}",
         f"- 快速检测可达：{summary['available']}；不可达：{summary['unavailable']}",
         f"- 深度检测完成：{summary['full_completed']}；未完成：{summary['full_incomplete']}",
         f"- 综合等级：A={summary['quality_grades']['A']}；B={summary['quality_grades']['B']}；C={summary['quality_grades']['C']}",
@@ -1303,9 +1366,10 @@ def build_report_markdown(
             status = payload.get("stable_status", {}).get(slot, {})
             name = str(status.get("name") or current.get("nodes", {}).get(key, {}).get("name") or "unknown")
             reasons = _zh_reasons(status.get("reasons", []))
-            port = base + int(slot) - 1 if base is not None else "-"
+            position = order.get(str(key))
+            port = position[1] if position is not None else "-"
             socks5 = (
-                f"socks5://{advertise_host}:{port}{{{name}}}" if port != "-" else "-"
+                f"{_socks_endpoint(advertise_host, port)}{{{name}}}" if port != "-" else "-"
             )
             escaped_name = name.replace("|", "\\|")
             escaped_reasons = reasons.replace("|", "\\|")
@@ -1367,7 +1431,7 @@ def build_report_markdown(
             else "-"
         )
         socks5 = (
-            f"socks5://{advertise_host}:{port}{{{item.node.name}}}" if port != "-" else "-"
+            f"{_socks_endpoint(advertise_host, port)}{{{item.node.name}}}" if port != "-" else "-"
         )
         latency = "-" if item.quick.latency_ms is None else f"{item.quick.latency_ms:.1f} ms"
         reason = _zh_reasons(item.evaluation.reasons)

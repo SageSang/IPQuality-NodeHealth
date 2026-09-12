@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from node_health.config import AppConfig, InventoryConfig, PolicyConfig, ProbeConfig
-from node_health.models import ClaudeResult, FullResult, Node, QuickResult
+from node_health.models import ClaudeResult, FullResult, Node, QuickResult, SiteProbeResult
 from node_health.policy import (
     chatgpt_explicitly_allowed,
     evaluate_node,
@@ -16,6 +17,8 @@ from node_health.policy import (
     residential_profile,
     score_node,
     select_full_audit_nodes,
+    attach_quick_ai_evidence,
+    sample_qualified,
 )
 from node_health.probe import (
     BUNDLED_DNSBL_FILE,
@@ -25,10 +28,45 @@ from node_health.probe import (
     generate_mihomo_probe_config,
     normalize_ipquality,
     preserve_sidecar_controller,
+    HTTPResult,
+    _retry_after_seconds,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+REAL_HTTP_GET = CurlQuickProbe._http_get
+
+
+@pytest.fixture(autouse=True)
+def prohibit_live_probe_http(monkeypatch):
+    def blocked(*args, **kwargs):
+        raise AssertionError("live probe HTTP is forbidden in unit tests")
+    monkeypatch.setattr(CurlQuickProbe, "_http_get", blocked)
+
+
+def site(host="chatgpt.com", ip="8.8.8.8", country="US", result="available"):
+    return SiteProbeResult(attempted=True, result_class=result, probe_contract_version=1,
+                           observation_id=f"fixture-{host}-{ip}-{country}-{result}",
+                           exit_ip=ip, country=country, host=host, http_status=200,
+                           checked_at="2026-07-24T00:00:00+00:00")
+
+
+def full_result(*args, **kwargs):
+    kwargs.setdefault("risk_evidence_version", 1)
+    return FullResult(*args, **kwargs)
+
+
+def mock_http(probe, get):
+    def response(port, url, timeout=None):
+        try:
+            body, elapsed = get(port, url, timeout)
+        except Exception:
+            return HTTPResult(1, 0, 1.0)
+        host = urllib.parse.urlsplit(url).hostname or ""
+        if body.startswith("ip=") and "\nh=" not in body:
+            body += f"h={host}\n"
+        return HTTPResult(0, 200, elapsed, body, host)
+    probe._http_get = response
 
 
 def test_json_output_preserves_escapes_and_rejects_an_internal_head():
@@ -116,7 +154,7 @@ def test_provider_cache_is_target_specific_and_fresh_for_each_scan():
     def get(port, url, timeout=None):
         calls.append(url)
         return '{"country_code":"US"}', 1.0
-    probe._get = get
+    mock_http(probe, get)
     probe._provider_get(20000, "https://geo.invalid/8.8.8.8")
     probe._provider_get(20001, "https://geo.invalid/8.8.8.8")
     probe._provider_get(20001, "https://geo.invalid/1.1.1.1")
@@ -134,8 +172,8 @@ def test_provider_quota_backoff_is_bounded_and_does_not_expose_credentials(monke
     calls = []
     def fail(port, url, timeout=None):
         calls.append(url)
-        raise RuntimeError("HTTP 429 secret-token")
-    probe._get = fail
+        return HTTPResult(0, 429, 1.0, "secret-token")
+    probe._http_get = fail
     for url in ["https://geo.invalid/8.8.8.8", "https://geo.invalid/1.1.1.1"]:
         with pytest.raises(RuntimeError) as error:
             probe._provider_get(20000, url)
@@ -180,6 +218,9 @@ def quick(**overrides) -> QuickResult:
         "country": "US",
         "latency_ms": 100,
         "success_rate": 1,
+        "success_count": 3,
+        "sample_count": 3,
+        "chatgpt": site(),
         "exit_ip_stable": True,
         "google_ok": True,
         "chatgpt_ok": True,
@@ -195,6 +236,13 @@ def quick(**overrides) -> QuickResult:
         "checked_at": "2026-07-24T00:00:00+00:00",
     }
     values.update(overrides)
+    if "success_rate" in overrides and "success_count" not in overrides:
+        values["success_count"] = round(float(overrides["success_rate"]) * 3)
+    claude = values["claude"]
+    claude.risk_evidence_version = 1
+    if claude.status in {"available", "restricted"}:
+        claude.site_probe = site("claude.ai", claude.exit_ip or values["exit_ip"], claude.country or "US", "restricted" if claude.status == "restricted" else "available")
+        claude.anthropic_probe = site("www.anthropic.com", claude.exit_ip or values["exit_ip"])
     return QuickResult(**values)
 
 
@@ -228,7 +276,7 @@ def test_claude_split_route_collects_two_source_risk_intelligence():
         ),
     }
 
-    probe._get = lambda _port, url, _timeout=None: (responses[url], 1.0)
+    mock_http(probe, lambda _port, url, _timeout=None: (responses[url], 1.0))
     result = probe._check_claude(20000, "8.8.8.8")
 
     assert result.status == "available"
@@ -259,7 +307,7 @@ def test_claude_trace_country_is_not_overwritten_by_risk_provider_country():
             {"cc": "CN", "is_proxy": False, "is_vpn": False}
         ),
     }
-    probe._get = lambda _port, url, _timeout=None: (responses[url], 1.0)
+    mock_http(probe, lambda _port, url, _timeout=None: (responses[url], 1.0))
 
     result = probe._check_claude(20000, "8.8.8.8")
 
@@ -294,7 +342,7 @@ def test_claude_ipapi_anonymous_response_shape_is_usable_without_an_api_key():
             1.0,
         )
 
-    probe._get = fake_get
+    mock_http(probe, fake_get)
     result = probe._claude_risk_intelligence(20000, "82.66.115.249")
 
     assert result["complete"] is False
@@ -313,7 +361,7 @@ def test_claude_provider_response_without_risk_fields_does_not_invent_low_risk()
             return json.dumps({"asn": "AS12322", "as_name": "Free SAS", "country_code": "FR"}), 1.0
         return json.dumps({"company": {"name": "Free SAS"}, "asn": {"asn": "AS12322"}, "cc": "FR"}), 1.0
 
-    probe._get = fake_get
+    mock_http(probe, fake_get)
     result = probe._claude_risk_intelligence(20000, "82.66.115.249")
 
     assert result["complete"] is False
@@ -334,7 +382,7 @@ def test_claude_risk_provider_credentials_are_appended_without_entering_template
             return json.dumps({"is_anonymous": False, "is_hosting": False}), 1.0
         return json.dumps({"is_proxy": False}), 1.0
 
-    probe._get = fake_get
+    mock_http(probe, fake_get)
     probe._claude_risk_intelligence(20000, "8.8.8.8")
 
     assert any("token=info+secret" in url for url in urls)
@@ -346,7 +394,7 @@ def test_claude_risk_provider_credentials_are_appended_without_entering_template
     [
         ("ip=8.8.8.8\nloc=CN\n", None, "restricted"),
         ("ip=8.8.8.8\nloc=US\n", RuntimeError("connection refused"), "degraded"),
-        (RuntimeError("connection refused"), RuntimeError("connection refused"), "unreachable"),
+        (RuntimeError("connection refused"), RuntimeError("connection refused"), "unknown"),
         (RuntimeError("curl exited 28"), RuntimeError("curl exited 28"), "unknown"),
         (RuntimeError("HTTP 503"), RuntimeError("HTTP 503"), "unknown"),
         (RuntimeError("HTTP 429"), RuntimeError("HTTP 429"), "unknown"),
@@ -367,7 +415,7 @@ def test_claude_status_classification(claude_body, anthropic_error, expected):
             return "ok=1\n", 1.0
         raise AssertionError(f"unexpected URL: {url}")
 
-    probe._get = fake_get
+    mock_http(probe, fake_get)
     assert probe._check_claude(20000, "8.8.8.8").status == expected
 
 
@@ -391,15 +439,15 @@ def test_probe_config_preserves_names_and_dialer_references():
     assert ports == {"a": 20000, "b": 20001}
 
 
-def test_probe_config_fails_closed_on_duplicate_names():
+def test_probe_config_disambiguates_names_but_rejects_ambiguous_dependencies():
     first = node("a", "duplicate")
     second = Node("b", "duplicate", "united-states", {"name": "duplicate", "type": "ss"})
-    try:
-        generate_mihomo_probe_config([first, second])
-    except ValueError as error:
-        assert "duplicate proxy names" in str(error)
-    else:
-        raise AssertionError("duplicate names must fail before mihomo reload")
+    config, ports = generate_mihomo_probe_config([first, second])
+    assert len(config["proxies"]) == len(ports) == 2
+    assert len({item["name"] for item in config["proxies"]}) == 2
+    chained = Node("c", "chain", "united-states", {"name":"chain", "dialer-proxy":"duplicate"})
+    with pytest.raises(ValueError, match="ambiguous proxy dependency"):
+        generate_mihomo_probe_config([first, second, chained])
 
 
 def test_sidecar_reload_keeps_controller_available_for_next_day():
@@ -453,19 +501,20 @@ def test_full_auditor_uses_bundled_dnsbl_file():
     assert BUNDLED_DNSBL_FILE == "/app/ref/dnsbl.list"
 
 
-def test_quick_http_get_rejects_http_error_responses():
+def test_quick_http_get_rejects_http_error_responses(monkeypatch):
     config = AppConfig(inventory=InventoryConfig("http://inventory.invalid"))
     failed = subprocess.CompletedProcess(
         args=[], returncode=22, stdout="error page", stderr="curl: (22) HTTP 503"
     )
+    monkeypatch.setattr(CurlQuickProbe, "_http_get", REAL_HTTP_GET)
     with patch("node_health.probe.subprocess.run", return_value=failed) as run:
-        with pytest.raises(RuntimeError, match="503"):
+        with pytest.raises(RuntimeError, match="probe_failed"):
             CurlQuickProbe(config)._get(20000, "https://claude.ai/cdn-cgi/trace")
 
-    assert "--fail-with-body" in run.call_args.args[0]
+    assert "--max-filesize" in run.call_args.args[0]
 
 
-def test_full_auditor_accepts_valid_json_on_exit_one_and_binds_audited_ip():
+def test_full_auditor_keeps_valid_json_as_partial_on_exit_one():
     config = AppConfig(
         inventory=InventoryConfig("http://inventory.invalid"),
         probe=ProbeConfig(proxy_host="mihomo-probe"),
@@ -484,7 +533,7 @@ def test_full_auditor_accepts_valid_json_on_exit_one_and_binds_audited_ip():
     with patch("node_health.probe.subprocess.run", return_value=completed) as run:
         result = IPQualityAuditor(config).check(node("a"), 20000)
 
-    assert result.completed
+    assert not result.completed
     assert result.audited_exit_ip == "8.8.8.8"
     assert "-E" in run.call_args.args[0]
 
@@ -570,12 +619,12 @@ def test_dnsbl_requires_multiple_listings_for_a_confirmed_redline():
         "risk_sources": {"one": "low", "two": "low", "three": "low"},
         "details": {"Media": {"ChatGPT": {"Status": "Yes"}}},
     }
-    single = FullResult(
+    single = full_result(
         **common,
         dnsbl_blacklisted=True,
         dnsbl_listed_count=1,
     )
-    confirmed = FullResult(
+    confirmed = full_result(
         **common,
         dnsbl_blacklisted=True,
         dnsbl_listed_count=3,
@@ -603,7 +652,7 @@ def test_dnsbl_requires_multiple_listings_for_a_confirmed_redline():
 
 def test_legacy_dnsbl_boolean_is_treated_as_one_listing():
     policy = PolicyConfig(expected_country={"united-states": "US"})
-    full = FullResult(
+    full = full_result(
         completed=True,
         dnsbl_blacklisted=True,
         risk_sources={"one": "low", "two": "low", "three": "low"},
@@ -623,7 +672,7 @@ def test_numeric_risk_scores_apply_a_continuous_penalty():
         return score_node(
             node("a"),
             quick(),
-            FullResult(
+            full_result(
                 completed=True,
                 risk_sources={"one": str(risk), "two": f"{risk}%", "three": str(risk)},
             ),
@@ -660,7 +709,7 @@ def test_numeric_risk_scores_apply_a_continuous_penalty():
 )
 def test_residential_evidence_levels(type_data, expected_grade, expected_points):
     grade, points, _ = residential_profile(
-        FullResult(completed=True, details={"Type": type_data})
+        full_result(completed=True, details={"Type": type_data})
     )
     assert grade == expected_grade
     assert points == expected_points
@@ -671,7 +720,7 @@ def test_geo_multi_source_country_consensus_receives_consistency_point():
     evaluation = evaluate_node(
         node("a"),
         quick(),
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={
@@ -691,11 +740,11 @@ def test_geo_multi_source_country_consensus_receives_consistency_point():
     assert evaluation.components["geo"] == 10
 
 
-def test_chatgpt_region_points_compare_with_observed_exit_not_node_group():
+def test_chatgpt_split_route_needs_independent_same_exit_geography():
     evaluation = evaluate_node(
         node("a"),
-        quick(country="US"),
-        FullResult(
+        quick(country="US", chatgpt=site(ip="1.1.1.1", country="JP")),
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={
@@ -716,7 +765,7 @@ def test_crawler_only_is_a_small_penalty_but_not_a_risk_downgrade():
     evaluation = evaluate_node(
         node("a"),
         quick(),
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "0", "two": "0", "three": "0"},
             details={
@@ -733,7 +782,7 @@ def test_crawler_only_is_a_small_penalty_but_not_a_risk_downgrade():
 
 def test_three_source_proxy_consensus_is_risk_c():
     policy = PolicyConfig(expected_country={"united-states": "US"})
-    full = FullResult(
+    full = full_result(
         completed=True,
         risk_sources={"one": "low", "two": "low", "three": "low"},
         details={
@@ -763,7 +812,7 @@ def test_claude_route_evidence_does_not_fill_generic_risk_coverage():
     evaluation = evaluate_node(
         node("a"),
         split,
-        FullResult(completed=True, risk_sources={"generic-one": "low"}),
+        full_result(completed=True, risk_sources={"generic-one": "low"}),
         PolicyConfig(expected_country={"united-states": "US"}),
         2,
     )
@@ -790,7 +839,7 @@ def test_clean_generic_and_claude_routes_are_independently_risk_a():
     evaluation = evaluate_node(
         node("a"),
         split,
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"generic-one": "low", "generic-two": "low", "generic-three": "low"},
         ),
@@ -818,7 +867,7 @@ def test_high_risk_and_factor_consensus_do_not_cross_egress_routes():
     evaluation = evaluate_node(
         node("a"),
         split,
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"generic-high": "high", "generic-low": "low", "generic-low-2": "low"},
             details={"Factor": {"Proxy": {"generic": True}}},
@@ -849,7 +898,7 @@ def test_two_high_risk_sources_on_claude_route_are_risk_c():
     evaluation = evaluate_node(
         node("a"),
         split,
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
         ),
@@ -867,7 +916,7 @@ def test_two_high_risk_sources_on_claude_route_are_risk_c():
 
 def test_danger_policy_and_stable_ip_change():
     policy = PolicyConfig(expected_country={"united-states": "US"})
-    full = FullResult(
+    full = full_result(
         completed=True,
         risk_sources={"one": "85%", "two": "high"},
         checked_at="2026-07-24T00:00:00+00:00",
@@ -879,7 +928,7 @@ def test_danger_policy_and_stable_ip_change():
     changed = evaluate_node(
         node("a"),
         quick(exit_ip="1.1.1.1"),
-        FullResult(completed=True),
+        full_result(completed=True),
         policy,
         2,
         previous_exit_ip="8.8.8.8",
@@ -898,7 +947,7 @@ def test_real_ipquality_high_risk_labels_are_redlines():
         evaluation = evaluate_node(
             node("a"),
             quick(),
-            FullResult(completed=True, risk_sources=values),
+            full_result(completed=True, risk_sources=values),
             policy,
             2,
         )
@@ -908,8 +957,10 @@ def test_real_ipquality_high_risk_labels_are_redlines():
 
 def test_chatgpt_explicit_block_is_ai_b_when_claude_is_available():
     policy = PolicyConfig(expected_country={"united-states": "US"})
-    blocked = FullResult(
+    blocked = full_result(
         completed=True,
+        chatgpt=site(result="restricted", country="CN"),
+        chatgpt_evidence_version=1,
         details={"Media": {"ChatGPT": {"Status": "Block"}}},
     )
     evaluation = evaluate_node(node("a"), quick(), blocked, policy, 2)
@@ -917,7 +968,7 @@ def test_chatgpt_explicit_block_is_ai_b_when_claude_is_available():
     assert evaluation.ai_grade == "B"
     assert "chatgpt-unavailable" in evaluation.reasons
 
-    unknown = FullResult(
+    unknown = full_result(
         completed=True,
         details={"Media": {"ChatGPT": {"Status": "Unknown"}}},
     )
@@ -926,11 +977,13 @@ def test_chatgpt_explicit_block_is_ai_b_when_claude_is_available():
 
 
 @pytest.mark.parametrize("status", ["Yes", "解锁"])
-def test_chatgpt_explicit_allow_statuses_are_usable(status):
-    full = FullResult(
+def test_legacy_chatgpt_allow_strings_do_not_grant_evidence(status):
+    full = full_result(
         completed=True,
         details={"Media": {"ChatGPT": {"Status": status}}},
     )
+    assert not chatgpt_explicitly_allowed(full)
+    attach_quick_ai_evidence(full, quick())
     assert chatgpt_explicitly_allowed(full)
 
 
@@ -938,11 +991,11 @@ def test_chatgpt_explicit_allow_statuses_are_usable(status):
     "status",
     ["Block", "屏蔽", "WebOnly", "APPOnly", "仅网页", "仅APP"],
 )
-def test_chatgpt_explicit_restrictions_are_ai_b_when_claude_works(status):
+def test_legacy_chatgpt_strings_do_not_override_current_site_evidence(status):
     evaluation = evaluate_node(
         node("a"),
         quick(),
-        FullResult(
+        full_result(
             completed=True,
             details={"Media": {"ChatGPT": {"Status": status}}},
         ),
@@ -950,16 +1003,16 @@ def test_chatgpt_explicit_restrictions_are_ai_b_when_claude_works(status):
         2,
     )
     assert evaluation.eligible
-    assert evaluation.ai_grade == "B"
-    assert "chatgpt-unavailable" in evaluation.reasons
+    assert evaluation.ai_grade == "A"
+    assert "chatgpt-unavailable" not in evaluation.reasons
 
 
 @pytest.mark.parametrize("status", ["Failed", "失败"])
 def test_chatgpt_transient_probe_failures_are_degraded_not_redlines(status):
     evaluation = evaluate_node(
         node("a"),
-        quick(),
-        FullResult(
+        quick(chatgpt=SiteProbeResult(attempted=True)),
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": status}}},
@@ -974,7 +1027,7 @@ def test_chatgpt_transient_probe_failures_are_degraded_not_redlines(status):
 
 def test_chatgpt_negated_available_words_are_never_allowed():
     for status in ("Not Available", "Not Supported", "Not Working", "Region Restricted"):
-        full = FullResult(
+        full = full_result(
             completed=True,
             details={"Media": {"ChatGPT": {"Status": status}}},
         )
@@ -987,23 +1040,25 @@ def test_chatgpt_negated_available_words_are_never_allowed():
             2,
         )
         assert evaluation.eligible
-        assert evaluation.ai_grade == "B"
+        assert evaluation.ai_grade == "A"
 
 
-def test_both_ai_services_confirmed_unavailable_are_grade_c():
+def test_both_ai_sites_confirmed_restricted_are_grade_c():
     unavailable = quick(
         chatgpt_ok=False,
+        chatgpt=site(result="restricted", country="CN"),
         claude=ClaudeResult(
-            status="unreachable",
-            trace_ok=False,
-            anthropic_ok=False,
-            supported=True,
+            status="restricted",
+            trace_ok=True,
+            anthropic_ok=True,
+            country="CN",
+            supported=False,
         ),
     )
     evaluation = evaluate_node(
         node("a"),
         unavailable,
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Block"}}},
@@ -1018,12 +1073,12 @@ def test_both_ai_services_confirmed_unavailable_are_grade_c():
 
 def test_unknown_risk_values_do_not_count_as_coverage_or_full_score():
     policy = PolicyConfig(expected_country={"united-states": "US"})
-    unknown = FullResult(
+    unknown = full_result(
         completed=True,
         risk_sources={"one": "null", "two": "none", "three": "unknown"},
         details={"Media": {"ChatGPT": {"Status": "Yes"}}},
     )
-    clean = FullResult(
+    clean = full_result(
         completed=True,
         risk_sources={"one": "low", "two": "low", "three": "low"},
         details={"Media": {"ChatGPT": {"Status": "Yes"}}},
@@ -1042,7 +1097,7 @@ def test_two_of_three_quick_successes_meet_the_default_candidate_threshold():
     evaluation = evaluate_node(
         node("a"),
         quick(success_rate=0.6667),
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Yes"}}},
@@ -1062,7 +1117,7 @@ def test_missing_country_is_eligible_but_low_confidence():
     evaluation = evaluate_node(
         node("a"),
         quick(country=""),
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Yes"}}},
@@ -1077,7 +1132,7 @@ def test_missing_country_is_eligible_but_low_confidence():
 
 def test_full_country_majority_overrides_a_lone_quick_geo_result():
     policy = PolicyConfig(expected_country={"united-states": "US"})
-    full = FullResult(
+    full = full_result(
         completed=True,
         details={
             "Factor": {"CountryCode": {"one": "JP", "two": "JP", "three": "US"}},
@@ -1087,7 +1142,7 @@ def test_full_country_majority_overrides_a_lone_quick_geo_result():
     mismatch = evaluate_node(node("a"), quick(country=""), full, policy, 2)
     assert "country-mismatch:JP!=US" in mismatch.reasons
 
-    quick_disagrees = FullResult(
+    quick_disagrees = full_result(
         completed=True,
         risk_sources={"one": "low", "two": "low", "three": "low"},
         details={
@@ -1104,7 +1159,7 @@ def test_full_country_majority_overrides_a_lone_quick_geo_result():
     lone_quick = evaluate_node(
         node("a"),
         quick(country="JP"),
-        FullResult(
+        full_result(
             completed=True,
             risk_sources={"one": "low", "two": "low", "three": "low"},
             details={"Media": {"ChatGPT": {"Status": "Yes"}}},
@@ -1116,7 +1171,7 @@ def test_full_country_majority_overrides_a_lone_quick_geo_result():
     assert lone_quick.overall_grade == "C"
     assert "quick-country-mismatch:JP!=US" in lone_quick.reasons
 
-    conflict = FullResult(
+    conflict = full_result(
         completed=True,
         details={"Factor": {"CountryCode": {"one": "JP", "two": "US"}}},
     )

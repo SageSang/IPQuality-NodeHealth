@@ -1,0 +1,16 @@
+{
+  "calibration_kind": "real",
+  "reviewed": true,
+  "original_result_class": "available",
+  "environment_class": "Existing ImmortalWrt local-socks mixed listener, real subscription node, LAN HTTP proxy; no runtime changes",
+  "captured_at": "2026-09-12T15:38:44.808804+00:00",
+  "probe_contract_version": 1,
+  "site": "claude",
+  "review_notes": "Original trace validated with current _check_site before sanitization: HTTP 200, transport 0, matching host, global egress IP and supported country CA. IP replaced with 8.8.8.8; identifying trace fields removed. Site-region only, not account or conversation validation.",
+  "response": {
+    "transport_code": 0,
+    "http_status": 200,
+    "host": "claude.ai",
+    "sanitized_body": "h=claude.ai\nip=8.8.8.8\nvisit_scheme=https\nhttp=http/2\nloc=CA\ntls=TLSv1.3\n"
+  }
+}

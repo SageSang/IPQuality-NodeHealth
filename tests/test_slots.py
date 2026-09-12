@@ -50,7 +50,8 @@ def assessment(
     )
     return NodeAssessment(
         node=Node(key, key, region, {"name": key}),
-        quick=QuickResult(available, exit_ip="8.8.8.8", latency_ms=score),
+        quick=QuickResult(available, exit_ip="8.8.8.8", latency_ms=score, success_rate=1,
+                          success_count=3 if available else 0, sample_count=3),
         full=full,
         evaluation=Evaluation(
             decision,
@@ -69,12 +70,12 @@ def assessment(
         healthy_streak_days=healthy_days,
         consecutive_unavailable_valid_days=unavailable_days,
         unavailable_grace_active=grace_active,
-        daily_quality_history=(
-            history if history is not None else [
+        daily_quality_history=[
+            {"qualification_version": 1, **entry} for entry in (history if history is not None else [
                 {"day": f"2026-07-{day}", "score": score, "evidence_valid": True}
                 for day in ("21", "22", "23")
-            ]
-        ),
+            ])
+        ],
         evidence_valid=available and completed and fresh_full_usable,
     )
 
@@ -176,6 +177,7 @@ def test_fresh_challenger_replaces_the_riskiest_c_incumbent_first():
     tor = assessment("tor-c", 90, decision="rejected")
     tor.full = FullResult(
         completed=True,
+        risk_evidence_version=1,
         tor=True,
         risk_sources={"one": "low", "two": "low", "three": "low"},
         details={"Media": {"ChatGPT": {"Status": "Yes"}}},
@@ -186,6 +188,7 @@ def test_fresh_challenger_replaces_the_riskiest_c_incumbent_first():
     severe_risk = assessment("high-risk-c", 90, decision="rejected")
     severe_risk.full = FullResult(
         completed=True,
+        risk_evidence_version=1,
         risk_sources={"one": "high", "two": "high", "three": "low"},
         details={"Media": {"ChatGPT": {"Status": "Yes"}}},
     )

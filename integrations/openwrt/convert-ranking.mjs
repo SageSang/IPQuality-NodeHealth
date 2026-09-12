@@ -1,207 +1,64 @@
 #!/usr/bin/env node
-
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const [
-  sourcePath,
-  rankingPath,
-  outputPath,
-  rawStartPort,
-  rawConverterPath,
-  exportDirectory,
-  advertiseHost,
-] = process.argv.slice(2);
+const [sourcePath, mappingPath, outputPath, startPort, converterPath, exportDirectory, advertiseHost] = process.argv.slice(2);
 
-if (!sourcePath || !rankingPath || !outputPath || !rawConverterPath) {
-  process.stderr.write(
-    'usage: convert-ranking.mjs SOURCE_YAML CURRENT_JSON OUTPUT_YAML START_PORT CONVERTER_JS [EXPORT_DIR ADVERTISE_HOST]\n',
-  );
-  process.exit(2);
+function realPath(value) {
+  const resolved = path.resolve(value);
+  return fs.existsSync(resolved) ? fs.realpathSync(resolved) : path.join(realPath(path.dirname(resolved)), path.basename(resolved));
 }
-
-const startPort = Number(rawStartPort || 62000);
-if (startPort !== 62000) {
-  throw new Error('START_PORT must be exactly 62000 for the fixed regional port plan');
-}
-
-const converterPath = path.resolve(rawConverterPath);
-if (exportDirectory) {
-  const exportPath = path.resolve(exportDirectory);
-  const dependencies = [
-    ['converter', converterPath],
-    ['candidate output', path.resolve(outputPath)],
-    ...(process.env.CONFIG_PATH
-      ? [['CONFIG_PATH', path.resolve(process.env.CONFIG_PATH)]]
-      : []),
-    ...(process.env.WORK_DIR ? [['WORK_DIR', path.resolve(process.env.WORK_DIR)]] : []),
-    ...(process.env.CACHE_DIR ? [['CACHE_DIR', path.resolve(process.env.CACHE_DIR)]] : []),
-    ...(process.env.JS_YAML_PATH
-      ? [['JS_YAML_PATH', path.resolve(process.env.JS_YAML_PATH)]]
-      : []),
-    ...String(process.env.NODE_PATH || '')
-      .split(path.delimiter)
-      .filter(Boolean)
-      .map((entry) => ['NODE_PATH', path.resolve(entry)]),
-  ];
-  const overlaps = (left, right) =>
-    left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
-  for (const [label, dependencyPath] of dependencies) {
-    if (overlaps(exportPath, dependencyPath)) {
-      throw new Error(`${label} must not overlap EXPORT_DIR: ${dependencyPath}`);
+try {
+  if (!sourcePath || !mappingPath || !outputPath || !converterPath || Number(startPort) !== 62000) throw new Error('invalid arguments');
+  const finalExport = process.env.EXPORT_DIR;
+  if (exportDirectory && !finalExport) throw new Error('final EXPORT_DIR required');
+  if (finalExport) {
+    const target = realPath(finalExport);
+    if (target === path.parse(target).root) throw new Error('dedicated export directory required');
+    const dependencies = [sourcePath, mappingPath, outputPath, converterPath, process.argv[1], process.execPath,
+      process.env.CONFIG_PATH, process.env.WORK_DIR, process.env.CACHE_DIR,
+      process.env.RUNTIME_PROFILE_PATH, process.env.JS_YAML_PATH, ...String(process.env.NODE_PATH || '').split(path.delimiter)].filter(Boolean);
+    for (const item of dependencies) {
+      const value = realPath(item);
+      if (target === value || target.startsWith(value + path.sep) || value.startsWith(target + path.sep)) throw new Error('export dependency overlap');
     }
   }
-}
-
-const converter = require(converterPath);
-const yaml = process.env.JS_YAML_PATH
-  ? require(path.resolve(process.env.JS_YAML_PATH))
-  : require('js-yaml');
-const source = fs.readFileSync(sourcePath, 'utf8');
-const current = JSON.parse(fs.readFileSync(rankingPath, 'utf8'));
-const sourceConfig = yaml.load(source);
-
-function keyFromEntry(value) {
-  if (typeof value === 'string') return value;
-  if (!value || typeof value !== 'object') return '';
-  return String(value.node_key || value.nodeKey || value.key || '');
-}
-
-function stableSlotEntries(state) {
-  const entries = [];
-  for (const [regionKey, region] of Object.entries(state.regions || {})) {
-    const slots = region && (region.stable_slots || region.stableSlots);
-    if (!slots || typeof slots !== 'object' || Array.isArray(slots)) continue;
-    for (const [slot, entry] of Object.entries(slots)) {
-      const key = keyFromEntry(entry);
-      if (key) entries.push({ region: regionKey, slot, key });
+  const converter = require(path.resolve(converterPath));
+  if (converter.CONSUMER_CONTRACT !== 'local-socks-explicit-v1') throw new Error('incompatible converter');
+  const yaml = require(process.env.JS_YAML_PATH ? path.resolve(process.env.JS_YAML_PATH) : 'js-yaml');
+  const map = JSON.parse(fs.readFileSync(mappingPath, 'utf8'));
+  const profile = yaml.load(fs.readFileSync(process.env.RUNTIME_PROFILE_PATH, 'utf8'));
+  const previous = process.env.CONFIG_PATH && fs.existsSync(process.env.CONFIG_PATH)
+    ? yaml.load(fs.readFileSync(process.env.CONFIG_PATH, 'utf8')) : undefined;
+  const result = converter.convertConfig(yaml.load(fs.readFileSync(sourcePath, 'utf8')), map, {
+    namespace: process.env.APPROVED_NAMESPACE, serverInstanceId: process.env.APPROVED_SERVER_INSTANCE_ID,
+    portPlanVersion: process.env.APPROVED_PORT_PLAN_VERSION, maxAgeSeconds: Number(process.env.MAP_MAX_AGE_SECONDS || 129600),
+    runtimeProfile: profile, runtimeProfileHash: process.env.APPROVED_RUNTIME_PROFILE_HASH, previousConfig: previous,
+  });
+  fs.writeFileSync(outputPath, yaml.dump(result.config, { noRefs: true, lineWidth: -1 }), { mode: 0o600 });
+  fs.writeFileSync(outputPath + '.manifest.json', JSON.stringify({
+    consumer_contract: map.consumer_contract, mapping_version: map.mapping_version,
+    runtime_config_hash: result.runtime_config_hash, manifest_hash: result.manifest_hash,
+    entries: result.manifest,
+  }), { mode: 0o600 });
+  if (exportDirectory) {
+    if (!advertiseHost || /[\s/{}]/u.test(advertiseHost)) throw new Error('advertise host required');
+    const host = advertiseHost.includes(':') && !advertiseHost.startsWith('[') ? '[' + advertiseHost + ']' : advertiseHost;
+    fs.mkdirSync(exportDirectory, { recursive: true, mode: 0o700 });
+    const all = [], plain = [];
+    for (const region of map.regions) {
+      const entries = result.manifest.filter(entry => entry.region === region.id).sort((a,b) => a.port - b.port);
+      const lines = entries.map(entry => 'socks5://' + host + ':' + entry.port + '{' + entry.name.replace(/[\r\n]+/g, ' ').trim() + '}');
+      fs.writeFileSync(path.join(exportDirectory, region.id + '.txt'), lines.length ? lines.join('\n') + '\n' : '', { mode: 0o600 });
+      all.push(...lines); plain.push(...entries.map(entry => 'socks5://' + host + ':' + entry.port));
     }
+    fs.writeFileSync(path.join(exportDirectory, 'all.txt'), all.length ? all.join('\n') + '\n' : '', { mode: 0o600 });
+    fs.writeFileSync(path.join(exportDirectory, 'all-plain.txt'), plain.length ? plain.join('\n') + '\n' : '', { mode: 0o600 });
+    fs.writeFileSync(path.join(exportDirectory, 'README.txt'), 'Target mapping ' + map.mapping_version + '\nNot yet applied.\n', { mode: 0o600 });
   }
-  return entries;
-}
-
-const outputConfig = converter.convertConfig(sourceConfig, current, startPort);
-const dns = outputConfig && outputConfig.dns;
-const sameStringArray = (actual, expected) =>
-  Array.isArray(actual) &&
-  actual.length === expected.length &&
-  actual.every((value, index) => value === expected[index]);
-const bootstrapResolvers = ['223.5.5.5', '1.12.12.12'];
-const encryptedResolvers = [
-  'https://223.5.5.5/dns-query',
-  'https://1.12.12.12/dns-query',
-];
-if (
-  !dns ||
-  dns.enable !== true ||
-  dns.listen !== '127.0.0.1:11553' ||
-  dns['enhanced-mode'] !== 'fake-ip' ||
-  dns['fake-ip-range'] !== '198.18.0.1/16' ||
-  !sameStringArray(dns['default-nameserver'], bootstrapResolvers) ||
-  !sameStringArray(dns.nameserver, encryptedResolvers) ||
-  !sameStringArray(dns['proxy-server-nameserver'], encryptedResolvers)
-) {
-  throw new Error('converter output must preserve the bootstrap-safe independent fake-IP DNS configuration');
-}
-const allowedKeys = new Set();
-for (const region of Object.values(current.regions || {})) {
-  for (const entry of Object.values(region && region.stable_slots || {})) {
-    const key = typeof entry === 'string' ? entry : entry && (entry.node_key || entry.nodeKey || entry.key);
-    if (key) allowedKeys.add(String(key));
-  }
-  for (const entry of region && Array.isArray(region.ranked) ? region.ranked : []) {
-    const key = typeof entry === 'string' ? entry : entry && (entry.node_key || entry.nodeKey || entry.key);
-    if (key) allowedKeys.add(String(key));
-  }
-}
-if (allowedKeys.size > 0 && (!Array.isArray(outputConfig.listeners) || outputConfig.listeners.length === 0)) {
-  throw new Error(`inventory has zero matches for ${allowedKeys.size} allowed node(s)`);
-}
-const sourceProxyCount = Array.isArray(sourceConfig && sourceConfig.proxies)
-  ? sourceConfig.proxies.length
-  : 0;
-if ((outputConfig.listeners || []).length !== sourceProxyCount) {
-  throw new Error(
-    `converter retained ${(outputConfig.listeners || []).length} of ${sourceProxyCount} inventory nodes`,
-  );
-}
-
-const listenerPorts = new Set(
-  (outputConfig.listeners || []).map((listener) => Number(listener && listener.port)),
-);
-const missingStableSlots = [];
-for (const entry of stableSlotEntries(current)) {
-  const regionIndex = converter.REGION_PORT_BLOCKS.findIndex(
-    (region) => region.key === entry.region,
-  );
-  const region = converter.REGION_PORT_BLOCKS[regionIndex];
-  if (!region || region.unlimited) continue;
-  const slot = Number(entry.slot);
-  const expectedPort = startPort + regionIndex * converter.REGION_PORT_BLOCK_SIZE + slot - 1;
-  if (!listenerPorts.has(expectedPort)) {
-    missingStableSlots.push(`${entry.region}/${entry.slot}:${expectedPort}`);
-  }
-}
-if (missingStableSlots.length > 0) {
-  throw new Error(
-    `stable slot listeners are missing: ${missingStableSlots.join(', ')}`,
-  );
-}
-const output = yaml.dump(outputConfig);
-
-fs.writeFileSync(outputPath, output, { encoding: 'utf8', mode: 0o600 });
-
-if (exportDirectory) {
-  if (!advertiseHost) throw new Error('ADVERTISE_HOST is required with EXPORT_DIR');
-  fs.mkdirSync(exportDirectory, { recursive: true, mode: 0o700 });
-
-  const linesByRegion = new Map(
-    converter.REGION_PORT_BLOCKS.map((region) => [region.key, []]),
-  );
-  const plainLinesByRegion = new Map(
-    converter.REGION_PORT_BLOCKS.map((region) => [region.key, []]),
-  );
-  for (const listener of outputConfig.listeners || []) {
-    const region = converter.REGION_PORT_BLOCKS.find((candidate) =>
-      String(listener.name).startsWith(`mixed-${candidate.key}-`),
-    );
-    if (!region) continue;
-    const name = String(listener.proxy).replace(/[\r\n]+/g, ' ').trim();
-    const plainLine = `socks5://${advertiseHost}:${listener.port}`;
-    linesByRegion
-      .get(region.key)
-      .push(`${plainLine}{${name}}`);
-    plainLinesByRegion.get(region.key).push(plainLine);
-  }
-
-  for (const [region, lines] of linesByRegion) {
-    const content = lines.length > 0 ? `${lines.join('\n')}\n` : '';
-    fs.writeFileSync(path.join(exportDirectory, `${region}.txt`), content, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-  }
-  const allLines = [];
-  const allPlainLines = [];
-  for (const region of converter.REGION_PORT_BLOCKS) {
-    allLines.push(...linesByRegion.get(region.key));
-    allPlainLines.push(...plainLinesByRegion.get(region.key));
-  }
-  fs.writeFileSync(
-    path.join(exportDirectory, 'all.txt'),
-    allLines.length > 0 ? `${allLines.join('\n')}\n` : '',
-    { encoding: 'utf8', mode: 0o600 },
-  );
-  fs.writeFileSync(
-    path.join(exportDirectory, 'all-plain.txt'),
-    allPlainLines.length > 0 ? `${allPlainLines.join('\n')}\n` : '',
-    { encoding: 'utf8', mode: 0o600 },
-  );
-  fs.writeFileSync(
-    path.join(exportDirectory, 'README.txt'),
-    `Generated by node-health ranking ${current.version}\nStable slots keep fixed ports; dynamic nodes follow them.\n`,
-    { encoding: 'utf8', mode: 0o600 },
-  );
+} catch {
+  process.stderr.write('convert-ranking: invalid or unapproved mapping, inventory, runtime profile or export path\n');
+  process.exitCode = 1;
 }

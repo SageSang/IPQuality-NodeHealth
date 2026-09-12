@@ -43,11 +43,19 @@ jobs:
 
       - name: Test publication candidate
         run: |
+          command -v cc
+          command -v flock
           python -m pip install -r requirements.txt pytest
+          python tools/generate_region_rules.py --check
           python -m pytest -q
           node --test tests/integration_node_health_operator.test.js
           bash -n ip.sh
           for script in integrations/openwrt/*.sh; do sh -n "$script"; done
+
+      - name: Require reviewed real positive site calibration
+        run: |
+          python tools/check_release_gate.py --file deploy/calibration/site-region.json
+          python tools/check_release_gate.py --file deploy/calibration/claude-site-region.json
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

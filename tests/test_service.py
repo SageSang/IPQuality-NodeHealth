@@ -11,7 +11,7 @@ import pytest
 from node_health.app import DailyScheduler, create_server
 from node_health.config import AppConfig, HttpConfig, InventoryConfig, PolicyConfig, ProbeConfig, ScheduleConfig
 from node_health.identity import node_key
-from node_health.models import ClaudeResult, FullResult, Node, QuickResult
+from node_health.models import ClaudeResult, FullResult, Node, QuickResult, SiteProbeResult
 from node_health.service import (
     NodeHealthService,
     NoPublishSafetyAbort,
@@ -61,6 +61,26 @@ class FakeEnvironment:
         yield {node.key: 20000 + index for index, node in enumerate(nodes)}
 
 
+def site_evidence(exit_ip, host="chatgpt.com", country="US", result_class="available"):
+    return SiteProbeResult(
+        attempted=True, result_class=result_class, probe_contract_version=1,
+        observation_id=f"synthetic-{host}-{exit_ip}", exit_ip=exit_ip,
+        country=country, host=host, http_status=200 if result_class != "unknown" else 503,
+        checked_at="2026-07-24T00:00:00+00:00",
+    )
+
+
+def mark_attempted_routes(results):
+    """These guard fixtures model observed service egresses, not skipped probes."""
+    for result in results.values():
+        result.chatgpt = site_evidence(result.exit_ip, country=result.country,
+                                      result_class="available" if result.chatgpt_ok else "unknown")
+        result.claude.site_probe = site_evidence(
+            result.claude.exit_ip, "claude.ai", result.claude.country,
+            "available" if result.claude.trace_ok or result.claude.status == "available" else "unknown",
+        )
+
+
 class FakeQuick:
     def __init__(self):
         self.unavailable = set()
@@ -85,13 +105,15 @@ class FakeQuick:
     def check(self, node, port):
         available = node.key not in self.unavailable and node.name not in self.unavailable_names
         index = int(node.name.rsplit(" ", 1)[-1]) + 1
-        return QuickResult(
+        result = QuickResult(
             available=available,
             exit_ip=self.exit_ips.get(node.key, f"8.8.8.{index}"),
             country="US",
             asn="AS15169",
             latency_ms=self.latencies.get(node.key, float(index) * 20),
             success_rate=1.0 if available else 0,
+            success_count=3 if available else 0,
+            sample_count=3,
             exit_ip_stable=node.key not in self.unstable,
             google_ok=True,
             chatgpt_ok=node.key not in self.chatgpt_fail,
@@ -118,6 +140,18 @@ class FakeQuick:
             checked_at="2026-07-24T00:00:00+00:00",
             error="" if available else "timeout",
         )
+        result.chatgpt = site_evidence(result.exit_ip, result_class="unknown" if node.key in self.chatgpt_fail else "available")
+        claude = result.claude
+        if claude.status in {"available", "restricted"}:
+            claude.site_probe = site_evidence(claude.exit_ip, "claude.ai", claude.country, claude.status)
+            claude.anthropic_probe = site_evidence(claude.exit_ip, "www.anthropic.com", claude.country)
+        elif node.key in self.claude_unreachable:
+            claude.exit_ip, claude.country = result.exit_ip, "US"
+            claude.site_probe = site_evidence(result.exit_ip, "claude.ai", result_class="unknown")
+            claude.anthropic_probe = site_evidence(result.exit_ip, "www.anthropic.com", result_class="unknown")
+        if claude.intelligence_complete:
+            claude.risk_evidence_version = 1
+        return result
 
 
 class FakeFull:
@@ -142,6 +176,7 @@ class FakeFull:
         status = self.statuses.get(node.key, "Yes")
         return FullResult(
             completed=completed,
+            risk_evidence_version=1 if completed else 0,
             audited_exit_ip=self.exit_ips.get(node.key, f"8.8.8.{index}"),
             risk_sources=self.risk_sources.get(
                 node.key,
@@ -191,6 +226,7 @@ def make_config(tmp_path):
         ),
         schedule=ScheduleConfig(enabled=False),
         http=HttpConfig(host="127.0.0.1", port=0, api_token="test-token"),
+        local_socks_server_instance_id="synthetic-instance",
     )
 
 
@@ -413,12 +449,12 @@ def test_other_order_is_frozen_during_maintenance_and_rebuilt_on_demand(tmp_path
     assert first["regions"]["other"]["stable_slots"] == {}
 
     redline_key = frozen[0]
-    full.statuses[redline_key] = "Block"
+    full.risk_sources[redline_key] = {"source-a": "high", "source-b": "high", "source-c": "high"}
     service.config.policy.full_audit_daily_fraction = 1.0
     maintained = service.run_once("maintenance")
     assert maintained["regions"]["other"]["ranked"] == frozen
-    assert maintained["nodes"][redline_key]["ai_grade"] == "B"
-    assert redline_key not in maintained["regions"]["other"]["rejected"]
+    assert maintained["nodes"][redline_key]["risk_grade"] == "C"
+    assert redline_key in maintained["regions"]["other"]["rejected"]
     state = json.loads(
         (tmp_path / "data" / "state.json").read_text(encoding="utf-8")
     )
@@ -940,6 +976,7 @@ def test_chatgpt_outage_denominator_excludes_unsupported_exit_countries(tmp_path
     results = {
         node.key: QuickResult(
             available=True,
+            exit_ip=f"8.8.8.{index + 1}",
             country="CN" if index < 4 else "US",
             chatgpt_ok=False if index < 4 else True,
             claude=ClaudeResult(status="available", supported=True),
@@ -947,9 +984,11 @@ def test_chatgpt_outage_denominator_excludes_unsupported_exit_countries(tmp_path
         for index, node in enumerate(nodes)
     }
 
+    mark_attempted_routes(results)
     status = service._apply_ai_service_outage_guard(nodes, results)
 
     assert "chatgpt" not in status
+    assert service._ai_guard_samples["chatgpt"]["sample_size"] == 1
     assert not any(result.chatgpt_service_outage for result in results.values())
 
 
@@ -964,11 +1003,14 @@ def test_ai_service_outage_guard_requires_minimum_sample(tmp_path):
         claude=ClaudeResult(status="unreachable", supported=True),
     )
 
+    result.claude.exit_ip = result.exit_ip
+    mark_attempted_routes({node.key: result})
     status = service._apply_ai_service_outage_guard([node], {node.key: result})
 
     assert status == {}
     assert result.chatgpt_service_outage is False
     assert result.claude.service_outage is False
+    assert service._ai_guard_samples["chatgpt"]["sample_size"] == 1
 
 
 def test_ai_service_outage_guard_deduplicates_shared_service_egresses(tmp_path):
@@ -993,11 +1035,14 @@ def test_ai_service_outage_guard_deduplicates_shared_service_egresses(tmp_path):
         for node in nodes
     }
 
+    mark_attempted_routes(results)
     status = service._apply_ai_service_outage_guard(nodes, results)
 
     assert status == {}
     assert not any(result.chatgpt_service_outage for result in results.values())
     assert not any(result.claude.service_outage for result in results.values())
+    assert service._ai_guard_samples["chatgpt"]["sample_size"] == 1
+    assert service._ai_guard_samples["claude"]["sample_size"] == 1
 
 
 def test_ai_outage_country_fallback_requires_same_exit_ip(tmp_path):
@@ -1026,6 +1071,7 @@ def test_ai_outage_country_fallback_requires_same_exit_ip(tmp_path):
         }
     }
 
+    mark_attempted_routes(results)
     status = service._apply_ai_service_outage_guard(nodes, results, previous)
 
     assert status["chatgpt"]["sample_size"] == 5
@@ -1056,6 +1102,7 @@ def test_outage_guard_uses_only_same_exit_full_country_majority(tmp_path):
         "last_full": FullResult(True, audited_exit_ip=results[node.key].exit_ip,
             details={"Factor": {"CountryCode": {"one": "US", "two": "US"}}}).to_dict(),
     } for node in nodes}}
+    mark_attempted_routes(results)
     assert service._apply_ai_service_outage_guard(nodes, results, previous)["chatgpt"]["sample_size"] == 5
     previous["nodes"][nodes[0].key]["last_full"]["audited_exit_ip"] = "1.1.1.1"
     assert "chatgpt" not in service._apply_ai_service_outage_guard(nodes, results, previous)
@@ -1085,6 +1132,7 @@ def test_claude_degraded_fleet_triggers_service_outage_guard(tmp_path):
         for node in nodes
     }
 
+    mark_attempted_routes(results)
     status = service._apply_ai_service_outage_guard(nodes, results)
 
     assert status["claude"]["failure_ratio"] == 1
@@ -1114,6 +1162,7 @@ def test_claude_outage_country_fallback_is_scoped_to_claude_egress(tmp_path):
         for index, node in enumerate(nodes)
     }
 
+    mark_attempted_routes(results)
     assert "claude" not in service._apply_ai_service_outage_guard(nodes, results)
 
     previous = {
@@ -1224,6 +1273,7 @@ def test_incomplete_claude_split_route_risk_uses_cache_but_pauses_streak(tmp_pat
         factors={},
         residential="probable",
         intelligence_complete=True,
+        risk_evidence_version=1,
     ).to_dict()
     original_load_state = service.store.load_state
     service.store.load_state = lambda: previous
@@ -1417,17 +1467,18 @@ def test_changed_exit_ip_never_reuses_old_full_after_repeated_failures(tmp_path)
 
 
 def test_transient_chatgpt_failure_pauses_history_and_preserves_trusted_full(tmp_path):
-    service, _, full, _ = make_service(tmp_path, count=1)
+    service, quick, full, _ = make_service(tmp_path, count=1)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["stable_slots"]["1"]
     full.statuses[key] = "Failed"
+    quick.chatgpt_fail.add(key)
 
     current = service.run_once("maintenance")
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
 
     assert current["nodes"][key]["decision"] == "eligible"
     assert current["nodes"][key]["confidence"] == "high"
-    assert "fresh-ai-unconfirmed:Failed" in current["nodes"][key]["reasons"]
+    assert "fresh-ai-unconfirmed" in current["nodes"][key]["reasons"]
     assert state["nodes"][key]["consecutive_full_passes"] == 0
     assert (
         state["nodes"][key]["last_full"]["details"]["Media"]["ChatGPT"]["Status"]
@@ -1483,13 +1534,14 @@ def test_risk_redline_remains_latched_until_a_fresh_clean_full(tmp_path):
 
 
 def test_ambiguous_fresh_full_cannot_clear_a_latched_redline(tmp_path):
-    service, _, full, _ = make_service(tmp_path)
+    service, quick, full, _ = make_service(tmp_path)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["stable_slots"]["1"]
     full.risk_sources[key] = {"source-a": "high", "source-b": "high", "source-c": "high"}
     service.run_once("maintenance")
 
     full.statuses[key] = "Failed"
+    quick.chatgpt_fail.add(key)
     full.risk_sources[key] = {"source-a": "low", "source-b": "low", "source-c": "low"}
     ambiguous = service.run_once("maintenance")
     state = json.loads((tmp_path / "data" / "state.json").read_text(encoding="utf-8"))
@@ -1504,7 +1556,7 @@ def test_ambiguous_fresh_full_cannot_clear_a_latched_redline(tmp_path):
 
 
 def test_absent_dynamic_redline_is_remembered_when_node_returns(tmp_path):
-    service, _, full, source = make_service(tmp_path)
+    service, quick, full, source = make_service(tmp_path)
     first = service.run_once("rebuild")
     key = first["regions"]["united-states"]["ranked"][0]
     proxy = next(item for item in source.proxies if node_key(item) == key)
@@ -1521,6 +1573,7 @@ def test_absent_dynamic_redline_is_remembered_when_node_returns(tmp_path):
 
     source.proxies.append(proxy)
     full.statuses[key] = "Failed"
+    quick.chatgpt_fail.add(key)
     full.risk_sources[key] = {"source-a": "low", "source-b": "low", "source-c": "low"}
     returned = service.run_once("maintenance")
 
@@ -1657,6 +1710,8 @@ def test_healthz_reports_live_scheduled_scan_progress(tmp_path):
             "total_nodes": 1,
             "remaining_nodes": 1,
             "percent": 0.0,
+            "phase_percent": 0.0,
+            "percent_scope": "phase",
         }
 
         full.release_event.set()
@@ -1707,14 +1762,15 @@ def test_trigger_start_failure_releases_lock_and_returns_http_503(tmp_path, monk
         raise RuntimeError("thread unavailable")
 
     monkeypatch.setattr(threading.Thread, "start", raise_on_start)
-    with pytest.raises(ScanStartError, match="thread unavailable"):
+    with pytest.raises(ScanStartError, match="worker_start_failed"):
         service.trigger("maintenance")
 
     status = service.status()
     assert status["status"] == "degraded"
     assert status["running"] is False
     assert status["running_mode"] is None
-    assert "thread unavailable" in status["last_error"]
+    assert status["last_error_detail"]["code"] == "worker_start_failed"
+    assert "thread unavailable" not in status["last_error"]
 
     monkeypatch.setattr(threading.Thread, "start", original_start)
     assert service.run_once("rebuild")["mode"] == "rebuild"
@@ -1786,6 +1842,8 @@ def test_subscription_audit_checks_all_nodes_without_changing_ranking_state(tmp_
         "total_nodes": 4,
         "remaining_nodes": 0,
         "percent": 100.0,
+        "phase_percent": 100.0,
+        "percent_scope": "phase",
     }
     assert status["summary"]["nodes"] == 4
     assert status["summary"]["available"] == 3
@@ -1989,7 +2047,7 @@ def test_subscription_audit_worker_start_failure_releases_shared_lock(tmp_path, 
         lambda _thread: (_ for _ in ()).throw(RuntimeError("thread unavailable")),
     )
 
-    with pytest.raises(ScanStartError, match="thread unavailable"):
+    with pytest.raises(ScanStartError, match="worker_start_failed"):
         service.trigger_subscription_audit("https://inventory.invalid/audit", "Airport")
 
     monkeypatch.setattr(threading.Thread, "start", real_start)

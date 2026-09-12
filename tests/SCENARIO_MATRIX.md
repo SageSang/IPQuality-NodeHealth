@@ -5,6 +5,38 @@ existing `rule_conf` pre-filter is outside this boundary: its output is the
 authoritative inventory consumed by node-health. From that point onward,
 health processing may reorder nodes but may not remove them.
 
+## D2 integration gates
+
+The layout stays schema 2; evidence policy and the explicit fixed-port map use independent version 1 contracts. Test counts below are not additive; the final full-suite receipt owns the overall count. Runtime fixtures are isolated Linux processes, not a verification of the deployed NAS/router.
+
+| ID | Required behavior | Automated coverage |
+|---|---|---|
+| D2-A01 | Synthetic credentials never enter health/status/logs; legacy audit views are safe without rewriting originals | `tests/test_safe_errors.py` |
+| D2-B01 | HTTP status, transport, host and trace structure all gate site/region evidence; unknown flags never become low risk | `tests/test_d2_probe_contracts.py`, `tests/test_probe_policy.py` |
+| D2-B02 | Real save_json preserves quotes/backslashes/newlines/Unicode/IPv6; failed candidates keep previous JSON | `test_real_save_json_preserves_external_strings_and_failed_candidate`, `test_ipquality_exit_code_reflects_enabled_checks` |
+| D2-B03 | Future evidence stops before fetch/startup recovery writes; legacy risk is reinterpreted without new timestamps or inferred AI success | `tests/test_evidence_migration.py`, `test_future_evidence_stops_before_inventory_and_preserves_files`, `test_future_evidence_refuses_startup_recovery_writes` |
+| D2-B04 | M1 grants once to the original slot/key, same-day reruns do not multiply it, the absolute deadline wins and recovery cannot regrant | `test_migration_publishes_version_and_m1_once_without_rebuild`, `test_m1_hard_deadline_overrides_same_day_grace`, `test_m1_recovery_does_not_grant_a_second_exception` |
+| D2-B05 | Failed publication does not start the migration deadline; pending legacy refresh stays inside rotation | `test_failed_commit_does_not_start_migration_deadline`, `test_migration_refresh_uses_rotation_not_a_new_full_pool` |
+| D2-B06 | 1/3 success does not grow qualification; comparisons accept only current-version qualified days | `test_one_of_three_never_builds_six_day_qualification`, `tests/test_slots.py` |
+| D2-C01 | All alias occurrences survive, one connection is probed once and at most one representative occupies stable slots | `tests/test_identity_aliases.py`, `test_map_api_report_and_txt_share_complete_alias_projection` |
+| D2-C02 | Exact-key rename and regional outage use the same effective region; source-less unique fallback remains supported | `test_exact_key_rename_and_outage_share_effective_region`, `tests/test_reconcile.py` |
+| D2-C03 | Shared default region generation is current; duplicate display names do not collide in probing, ambiguous dependencies reject | `tools/generate_region_rules.py --check`, `test_probe_config_disambiguates_names_but_rejects_ambiguous_dependencies` |
+| D2-D01 | Explicit holes never compact, aliases never steal slots, capacity/instance/schema/purpose/host approval failures reject | `tests/test_port_mapping.py` |
+| D2-D02 | API, report and target TXT share the map; runner emits real newlines and a non-credential manifest | `test_map_api_report_and_txt_share_complete_alias_projection`, `test_standalone_runner_exports_real_newlines_and_nonsecret_manifest` |
+| D2-D03 | Valid apply verifies actual SOCKS readiness; missing listeners and TERM restore the old config/exports | `test_apply_ranking_validates_listeners_and_rolls_back` |
+| D2-D04 | KILL at pending/config/exports/receipt boundaries selects the committed generation and releases the kernel lock | `test_sigkill_recovers_the_committed_generation` |
+| D2-D05 | Same runtime/labels-only changes do not restart; stopped runtime recovers before upstream backoff | `test_noop_and_label_only_changes_do_not_restart`, `test_upstream_backoff_does_not_skip_local_runtime_recovery` |
+| D2-D06 | Success exit from restart without a changed process fails; exports failure cannot block config/service restoration | `test_successful_restart_command_must_replace_the_process`, `test_export_failure_does_not_prevent_runtime_rollback` |
+| D2-D07 | Initial differences require exact approval; both entry points lock; missing flock and early dependency failure are safe | `test_initial_binding_difference_requires_specific_approval`, `test_lock_and_export_dependency_protection`, `test_missing_flock_fails_before_runtime_or_cache_mutation`, `test_early_module_failure_does_not_echo_dependency_paths` |
+| D2-E01 | Provider cooldown is scoped, Retry-After is not shortened, resource/half-open budgets bound requests | `tests/test_d2_probe_contracts.py` |
+| D2-E02 | Scheduled and temporary audits report waiting/rechecking, pending count and next_retry_at with phase percentages | `test_retry_wait_reports_real_pending_scope_and_time` |
+| D2-F01 | Copy-only migration preserves placement and inputs, repeat/reentry agree; restored backups cannot regrant unknown M1 | `tests/test_migration_tools.py`, `tools/rehearse_migration.py` |
+| D2-F02 | Missing/synthetic/unreviewed/negative calibration blocks image publication | `tools/check_release_gate.py`, `tests/test_migration_tools.py` |
+
+The old runtime E2E's success, missing-listener rollback, interruption and upstream-backoff self-healing behaviors are retained in the new protocol-aware fixture. The old empty/unversioned target success is intentionally replaced by rejection, because D2 never applies an untrusted empty inventory/map. The fixture now performs actual SOCKS greetings and process/core/config checks rather than merely testing TCP acceptance or a stub returning status 0.
+
+Real same-environment positive calibration, actual runtime profile/core/port-diff approval, maintenance window and deployed listener/egress verification remain deployment gates. Offline/synthetic test success does not satisfy them.
+
 ## Identity and connection rotation
 
 | ID | Scenario | Required result | Automated coverage |

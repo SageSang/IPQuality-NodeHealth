@@ -2,6 +2,10 @@
 .github
 .agents
 .codex
+.pytest_cache
+artifacts/
+**/__pycache__/
+**/*.py[cod]
 __pycache__/
 *.py[cod]
 *.log

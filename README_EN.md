@@ -215,3 +215,9 @@ docker run --rm --net=host -it xykt/ipquality -E & docker rmi xykt/ipquality > N
 **Daily Runs History:**
 
 ![daily_runs_history](https://hits.xykt.de/history/ip.svg?days=46&chartType=bar&title=Daily%20Runs%20of%20IP%20Quality%20Script&width=1024&height=400&color=green)
+
+## Maintainer context
+
+The node-health service now contains the D2 implementation (`0.4.0-dev`). Ordinary `healthy` subscriptions remain complete and order-only; fixed ports consume explicit inventory/map pairs and retain the last verified configuration on failure. AI scores describe site/region probes, not login or conversation success. Evidence migration re-establishes health qualifications without rebuilding stable slots or frozen `other` order. See the [D2 deployment gates](deploy/DEPLOY_D2.md) before updating a running installation; real positive calibration, reviewed port/profile differences and a maintenance/rollback plan remain required.
+
+Personal maintenance history, decisions, verification status, and open context are maintained in [Sidney Vault](obsidian://open?vault=sidney-vault&file=20-Areas%2F%E8%BD%AF%E4%BB%B6%E9%A1%B9%E7%9B%AE%E7%BB%B4%E6%8A%A4%2F%E5%AE%9E%E4%BD%93%2FIPQuality-NodeHealth%2F%E6%96%87%E6%A1%A3%2F%E8%83%8C%E6%99%AF%E5%AE%9E%E7%8E%B0%E4%B8%8E%E5%8E%86%E5%8F%B2). This repository retains source code, usage documentation, and developer contracts. The Vault is not required to build or use the project.

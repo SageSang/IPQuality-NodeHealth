@@ -1,689 +1,239 @@
-/**
- * Stable-slot local-socks converter.
- *
- * This is a standalone reference implementation. It deliberately requires a
- * validated node-health state instead of silently reverting to sequential
- * ports.
- */
-(function attachConverter(root, factory) {
-  if (typeof module === 'object' && module.exports) {
-    module.exports = factory();
-  } else {
-    root.StableLocalSocksConverter = factory();
+'use strict';
+// Node-only renderer for Python's explicit mapping. It never allocates ports.
+const crypto = require('node:crypto');
+const CONSUMER_CONTRACT = 'local-socks-explicit-v1';
+const REGION_KEYS = ['hong-kong', 'taiwan', 'japan', 'singapore', 'united-states',
+  'south-korea', 'united-kingdom', 'germany', 'france', 'canada', 'australia', 'other'];
+const REGION_PORT_BLOCKS = REGION_KEYS.map(key => ({ key, unlimited: key === 'other' }));
+const HEX = /^[0-9a-f]{64}$/;
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const clone = value => JSON.parse(JSON.stringify(value));
+function compareCodePoints(a, b) {
+  const left = Array.from(a), right = Array.from(b);
+  for (let i = 0; i < Math.min(left.length, right.length); i += 1) {
+    const delta = left[i].codePointAt(0) - right[i].codePointAt(0);
+    if (delta) return delta;
   }
-})(typeof globalThis !== 'undefined' ? globalThis : this, function createConverter() {
-  const DEFAULT_START_PORT = 62000;
-  const MAX_PORT = 65535;
-  const REGION_PORT_BLOCK_SIZE = 200;
-  const STABLE_SLOT_COUNT = 3;
-  const NODE_HEALTH_SCHEMA_VERSION = 2;
-  const NODE_KEY_PATTERN = /^[0-9a-f]{64}$/;
-
-  const REGION_PORT_BLOCKS = [
-    { key: 'hong-kong', matcher: /🇭🇰|\u9999\u6e2f|hong\s*kong/i, codeMatcher: /\bHK\b/ },
-    { key: 'taiwan', matcher: /🇹🇼|\u53f0\u6e7e|\u53f0\u7063|taiwan|taipei|hinet/i, codeMatcher: /\bTW\b/ },
-    { key: 'japan', matcher: /🇯🇵|\u65e5\u672c|japan|tokyo|osaka/i, codeMatcher: /\bJP\b/ },
-    { key: 'singapore', matcher: /🇸🇬|\u65b0\u52a0\u5761|singapore/i, codeMatcher: /\bSG\b/ },
-    { key: 'united-states', matcher: /🇺🇸|\u7f8e\u56fd|\u7f8e\u570b|united\s*states|los\s*angeles|san\s*francisco|seattle|new\s*york/i, codeMatcher: /\bUS\b/ },
-    { key: 'south-korea', matcher: /🇰🇷|\u97e9\u56fd|\u97d3\u570b|south\s*korea|korea|seoul/i, codeMatcher: /\bKR\b/ },
-    { key: 'united-kingdom', matcher: /🇬🇧|\u82f1\u56fd|\u82f1\u570b|united\s*kingdom|great\s*britain|britain|england|london|manchester/i, codeMatcher: /\bUK\b/ },
-    { key: 'germany', matcher: /🇩🇪|\u5fb7\u56fd|\u5fb7\u570b|germany|deutschland|frankfurt|berlin/i, codeMatcher: /\bDE\b/ },
-    { key: 'france', matcher: /🇫🇷|\u6cd5\u56fd|\u6cd5\u570b|france|paris/i, codeMatcher: /\bFR\b/ },
-    { key: 'canada', matcher: /🇨🇦|\u52a0\u62ff\u5927|canada|toronto|vancouver/i, codeMatcher: /\bCA\b/ },
-    { key: 'australia', matcher: /🇦🇺|\u6fb3\u5927\u5229\u4e9a|\u6fb3\u5927\u5229\u4e9e|\u6fb3\u6d32|australia|sydney|melbourne|perth|brisbane/i, codeMatcher: /\bAU\b/ },
-    { key: 'other', matcher: null, unlimited: true },
-  ];
-
-  function compareCodePoints(left, right) {
-    const a = Array.from(left);
-    const b = Array.from(right);
-    const length = Math.min(a.length, b.length);
-    for (let index = 0; index < length; index += 1) {
-      const difference = a[index].codePointAt(0) - b[index].codePointAt(0);
-      if (difference !== 0) return difference;
-    }
-    return a.length - b.length;
+  return left.length - right.length;
+}
+function canonicalJson(value, topLevel = false) {
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`;
+  if (record(value)) {
+    const keys = Object.keys(value).filter(key => value[key] !== undefined &&
+      !(topLevel && (key === 'name' || key.startsWith('_') || (key === 'port' && value.ports))));
+    return `{${keys.sort(compareCodePoints).map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
+  return JSON.stringify(value) ?? 'null';
+}
+const sha256Hex = value => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+const digest = value => `sha256:${sha256Hex(canonicalJson(value))}`;
+function nodeKey(proxy) {
+  if (!record(proxy)) throw new Error('proxy must be an object');
+  return sha256Hex(canonicalJson(proxy, true));
+}
+const normalizeIdentityText = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+const originalName = proxy => String(proxy._nh_original_name || proxy._original_name || proxy.name || '').trim().replace(/\s+/gu, ' ');
+const sourceId = proxy => normalizeIdentityText(proxy._nh_source_id || proxy._source_id);
+const aliasEntryId = (key, source, original, name, ordinal = 1) => sha256Hex(JSON.stringify([key, source, original, name, ordinal]));
 
-  function canonicalJson(value, topLevel = false) {
-    if (value === null) return 'null';
-    if (Array.isArray(value)) {
-      return `[${value
-        .map((item) =>
-          item === undefined || typeof item === 'function' || typeof item === 'symbol'
-            ? 'null'
-            : canonicalJson(item, false),
-        )
-        .join(',')}]`;
-    }
-    if (typeof value === 'object') {
-      const keys = Object.keys(value)
-        .filter((key) => {
-        if (
-          topLevel &&
-          (key === 'name' ||
-            key.startsWith('_') ||
-            (key === 'port' && value.ports))
-        ) return false;
-          const item = value[key];
-          return item !== undefined && typeof item !== 'function' && typeof item !== 'symbol';
-        })
-        .sort(compareCodePoints);
-      return `{${keys
-        .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key], false)}`)
-        .join(',')}}`;
-    }
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? 'null' : serialized;
-  }
-
-  function utf8Bytes(value) {
-    if (typeof TextEncoder !== 'undefined') return Array.from(new TextEncoder().encode(value));
-    const bytes = [];
-    for (const character of value) {
-      const point = character.codePointAt(0);
-      if (point <= 0x7f) bytes.push(point);
-      else if (point <= 0x7ff) bytes.push(0xc0 | (point >>> 6), 0x80 | (point & 0x3f));
-      else if (point <= 0xffff) {
-        bytes.push(0xe0 | (point >>> 12), 0x80 | ((point >>> 6) & 0x3f), 0x80 | (point & 0x3f));
-      } else {
-        bytes.push(
-          0xf0 | (point >>> 18),
-          0x80 | ((point >>> 12) & 0x3f),
-          0x80 | ((point >>> 6) & 0x3f),
-          0x80 | (point & 0x3f),
-        );
-      }
-    }
-    return bytes;
-  }
-
-  function rotateRight(value, bits) {
-    return (value >>> bits) | (value << (32 - bits));
-  }
-
-  function sha256Hex(value) {
-    const constants = [
-      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
-      0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-      0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-      0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-      0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-      0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-      0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-      0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-      0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-    const hash = [
-      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
-    const input = utf8Bytes(value);
-    const originalLength = input.length;
-    const paddedLength = Math.ceil((originalLength + 9) / 64) * 64;
-    const bytes = new Array(paddedLength).fill(0);
-    for (let index = 0; index < originalLength; index += 1) bytes[index] = input[index];
-    bytes[originalLength] = 0x80;
-    const bitLengthHigh = Math.floor(originalLength / 0x20000000);
-    const bitLengthLow = (originalLength << 3) >>> 0;
-    for (let index = 0; index < 4; index += 1) {
-      bytes[paddedLength - 8 + index] = (bitLengthHigh >>> (24 - index * 8)) & 0xff;
-      bytes[paddedLength - 4 + index] = (bitLengthLow >>> (24 - index * 8)) & 0xff;
-    }
-    const words = new Array(64);
-    for (let offset = 0; offset < paddedLength; offset += 64) {
-      for (let index = 0; index < 16; index += 1) {
-        const cursor = offset + index * 4;
-        words[index] =
-          ((bytes[cursor] << 24) |
-            (bytes[cursor + 1] << 16) |
-            (bytes[cursor + 2] << 8) |
-            bytes[cursor + 3]) >>>
-          0;
-      }
-      for (let index = 16; index < 64; index += 1) {
-        const s0 = rotateRight(words[index - 15], 7) ^ rotateRight(words[index - 15], 18) ^ (words[index - 15] >>> 3);
-        const s1 = rotateRight(words[index - 2], 17) ^ rotateRight(words[index - 2], 19) ^ (words[index - 2] >>> 10);
-        words[index] = (words[index - 16] + s0 + words[index - 7] + s1) >>> 0;
-      }
-      let [a, b, c, d, e, f, g, h] = hash;
-      for (let index = 0; index < 64; index += 1) {
-        const sigma1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
-        const choice = (e & f) ^ (~e & g);
-        const temp1 = (h + sigma1 + choice + constants[index] + words[index]) >>> 0;
-        const sigma0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
-        const majority = (a & b) ^ (a & c) ^ (b & c);
-        const temp2 = (sigma0 + majority) >>> 0;
-        h = g;
-        g = f;
-        f = e;
-        e = (d + temp1) >>> 0;
-        d = c;
-        c = b;
-        b = a;
-        a = (temp1 + temp2) >>> 0;
-      }
-      hash[0] = (hash[0] + a) >>> 0;
-      hash[1] = (hash[1] + b) >>> 0;
-      hash[2] = (hash[2] + c) >>> 0;
-      hash[3] = (hash[3] + d) >>> 0;
-      hash[4] = (hash[4] + e) >>> 0;
-      hash[5] = (hash[5] + f) >>> 0;
-      hash[6] = (hash[6] + g) >>> 0;
-      hash[7] = (hash[7] + h) >>> 0;
-    }
-    return hash.map((word) => word.toString(16).padStart(8, '0')).join('');
-  }
-
-  function nodeKey(proxy) {
-    if (!proxy || typeof proxy !== 'object' || Array.isArray(proxy)) {
-      throw new TypeError('proxy must be an object');
-    }
-    return sha256Hex(canonicalJson(proxy, true));
-  }
-
-  function isRecord(value) {
-    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-  }
-
-  function normalizeIdentityText(value) {
-    return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
-  }
-
-  function normalizeOriginalName(value) {
-    return String(value || '').trim().replace(/\s+/gu, ' ');
-  }
-
-  function sourceId(proxy) {
-    if (!isRecord(proxy)) return '';
-    for (const field of ['_nh_source_id', '_source_id']) {
-      const value = normalizeIdentityText(proxy[field]);
-      if (value) return value;
-    }
-    return '';
-  }
-
-  function originalName(proxy) {
-    if (!isRecord(proxy)) return '';
-    for (const field of ['_nh_original_name', '_original_name']) {
-      const value = normalizeOriginalName(proxy[field]);
-      if (value) return value;
-    }
-    return normalizeOriginalName(proxy.name);
-  }
-
-  function logicalId(source, normalizedName) {
-    if (!source || !normalizedName) return '';
-    return sha256Hex(`${source}\0${normalizedName}`);
-  }
-
-  function selectedIdentity(proxy) {
-    const source = sourceId(proxy);
-    const original = originalName(proxy);
-    const normalized = normalizeIdentityText(original);
-    const explicitRegion = String((proxy && proxy._region) || '').trim();
-    const region = REGION_PORT_BLOCKS.some((entry) => entry.key === explicitRegion)
-      ? explicitRegion
-      : fallbackRegion(original);
-    return {
-      source_id: source,
-      original_name: original,
-      normalized_name: normalized,
-      logical_id: logicalId(source, normalized),
-      region,
-    };
-  }
-
-  function identityTuple(identity, fields) {
-    const values = fields.map((field) => String((identity && identity[field]) || ''));
-    if (values.some((value) => !value)) return '';
-    return JSON.stringify(values);
-  }
-
-  function uniqueIdentityMatches(unmatchedOld, unmatchedNew, oldIdentities, selected, fields) {
-    const oldBuckets = new Map();
-    const newBuckets = new Map();
-    for (const key of unmatchedOld) {
-      const group = identityTuple(oldIdentities[key], fields);
-      if (!group) continue;
-      if (!oldBuckets.has(group)) oldBuckets.set(group, []);
-      oldBuckets.get(group).push(key);
-    }
-    for (const index of unmatchedNew) {
-      const group = identityTuple(selected[index].identity, fields);
-      if (!group) continue;
-      if (!newBuckets.has(group)) newBuckets.set(group, []);
-      newBuckets.get(group).push(index);
-    }
-
-    const matches = [];
-    for (const [group, oldKeys] of oldBuckets) {
-      const newIndexes = newBuckets.get(group) || [];
-      if (oldKeys.length === 1 && newIndexes.length === 1) {
-        matches.push([oldKeys[0], newIndexes[0]]);
-      }
-    }
-    return matches;
-  }
-
-  function resolveIdentityKeys(state, selected) {
-    validateState(state);
-    const oldIdentities = state.identity_index;
-    const resolved = new Map();
-    const unmatchedOld = new Set(Object.keys(oldIdentities));
-    const unmatchedNew = new Set(selected.map((_, index) => index));
-
-    selected.forEach((entry, index) => {
-      if (Object.prototype.hasOwnProperty.call(oldIdentities, entry.connectionKey)) {
-        resolved.set(index, entry.connectionKey);
-        unmatchedOld.delete(entry.connectionKey);
-        unmatchedNew.delete(index);
-      }
-    });
-
-    const stages = [
-      ['source_id', 'logical_id'],
-      ['source_id', 'region', 'original_name'],
-      ['region', 'original_name'],
-      ['region', 'normalized_name'],
-    ];
-    stages.forEach((fields, stageIndex) => {
-      const matches = uniqueIdentityMatches(
-        unmatchedOld,
-        unmatchedNew,
-        oldIdentities,
-        selected,
-        fields,
-      );
-      for (const [oldKey, newIndex] of matches) {
-        if (stageIndex >= 2) {
-          const oldSource = String(oldIdentities[oldKey].source_id || '');
-          const newSource = String(selected[newIndex].identity.source_id || '');
-          if (oldSource && newSource && oldSource !== newSource) continue;
-        }
-        resolved.set(newIndex, oldKey);
-        unmatchedOld.delete(oldKey);
-        unmatchedNew.delete(newIndex);
-      }
-    });
-    return resolved;
-  }
-
-  function validateState(state) {
-    if (
-      !state ||
-      state.schema_version !== NODE_HEALTH_SCHEMA_VERSION ||
-      typeof state.version !== 'string' ||
-      !state.version ||
-      !isRecord(state.regions) ||
-      !isRecord(state.identity_index)
-    ) {
-      throw new Error('a valid node-health current.json is required');
-    }
-
-    const regions = Object.entries(state.regions);
-    if (regions.length === 0) throw new Error('ranking regions are empty');
-
-    let decisionKeys = 0;
-    const decided = new Set();
-    for (const [regionKey, region] of regions) {
-      if (!regionKey || !isRecord(region)) {
-        throw new Error(`invalid ranking region: ${regionKey || '<empty>'}`);
-      }
-      const slots = region.stable_slots || region.stableSlots;
-      if (
-        !isRecord(slots) ||
-        !Array.isArray(region.ranked) ||
-        !isRecord(region.rejected)
-      ) {
-        throw new Error(`incomplete ranking region: ${regionKey}`);
-      }
-      for (const [slot, entry] of Object.entries(slots)) {
-        const slotNumber = Number(slot);
-        if (
-          !Number.isInteger(slotNumber) ||
-          String(slotNumber) !== slot ||
-          slotNumber < 1 ||
-          slotNumber > STABLE_SLOT_COUNT ||
-          !NODE_KEY_PATTERN.test(keyFromEntry(entry))
-        ) {
-          throw new Error(`invalid stable slot in ranking region: ${regionKey}`);
-        }
-        decisionKeys += 1;
-        decided.add(keyFromEntry(entry));
-      }
-      for (const entry of region.ranked) {
-        if (!NODE_KEY_PATTERN.test(keyFromEntry(entry))) {
-          throw new Error(`invalid ranked key in ranking region: ${regionKey}`);
-        }
-        decisionKeys += 1;
-        decided.add(keyFromEntry(entry));
-      }
-      for (const key of Object.keys(region.rejected)) {
-        if (!NODE_KEY_PATTERN.test(key)) {
-          throw new Error(`invalid rejected key in ranking region: ${regionKey}`);
-        }
-        decisionKeys += 1;
-        decided.add(key);
-      }
-    }
-    if (decisionKeys === 0) throw new Error('ranking contains no node decisions');
-
-    for (const [key, identity] of Object.entries(state.identity_index)) {
-      if (
-        !NODE_KEY_PATTERN.test(key) ||
-        !isRecord(identity) ||
-        typeof identity.source_id !== 'string' ||
-        typeof identity.original_name !== 'string' ||
-        typeof identity.normalized_name !== 'string' ||
-        typeof identity.logical_id !== 'string' ||
-        (identity.logical_id && !NODE_KEY_PATTERN.test(identity.logical_id)) ||
-        typeof identity.region !== 'string' ||
-        !identity.region
-      ) {
-        throw new Error(`invalid identity index entry: ${key}`);
-      }
-    }
-    for (const key of decided) {
-      if (!Object.prototype.hasOwnProperty.call(state.identity_index, key)) {
-        throw new Error(`ranking decision is missing identity metadata: ${key}`);
-      }
-    }
-  }
-
-  function normalizeStartPort(startPort) {
-    const port = Number(startPort);
-    if (!Number.isInteger(port) || port < 1 || port > MAX_PORT) {
-      throw new Error(`start port must be an integer from 1 to ${MAX_PORT}`);
-    }
-    return port;
-  }
-
-  function validateProxies(proxies) {
-    if (!Array.isArray(proxies) || proxies.length === 0) {
-      throw new Error('source config has no proxies');
-    }
-    const names = new Set();
-    proxies.forEach((proxy, index) => {
-      if (!proxy || typeof proxy.name !== 'string' || !proxy.name.trim()) {
-        throw new Error(`proxy ${index + 1} has no valid name`);
-      }
-      const original = proxy.name;
-      let unique = original;
-      let suffix = 2;
-      while (names.has(unique)) {
-        unique = `${original} #${suffix}`;
-        suffix += 1;
-      }
-      proxy.name = unique;
-      names.add(unique);
-    });
-  }
-
-  function keyFromEntry(value) {
-    if (typeof value === 'string') return value;
-    if (!value || typeof value !== 'object') return '';
-    return String(value.node_key || value.nodeKey || value.key || '');
-  }
-
-  function stateIndex(state) {
-    const keyRegion = new Map();
-    const stable = new Map();
-    const ranked = new Map();
-
-    for (const [regionKey, region] of Object.entries(state.regions)) {
-      const rejectedEntries = region && region.rejected;
-      const rejectedKeys = Array.isArray(rejectedEntries)
-        ? rejectedEntries.map(keyFromEntry)
-        : rejectedEntries && typeof rejectedEntries === 'object'
-          ? Object.keys(rejectedEntries)
-          : [];
-      for (const key of rejectedKeys.filter(Boolean)) {
-        keyRegion.set(key, regionKey);
-      }
-
-      const slotMap = new Map();
-      const slots = region && (region.stable_slots || region.stableSlots);
-      for (let slot = 1; slot <= STABLE_SLOT_COUNT; slot += 1) {
-        const key = keyFromEntry(slots && slots[String(slot)]);
-        if (key) {
-          slotMap.set(slot, key);
-          keyRegion.set(key, regionKey);
-        }
-      }
-      stable.set(regionKey, slotMap);
-
-      const ordered = [];
-      if (region && Array.isArray(region.ranked)) {
-        for (const entry of region.ranked) {
-          const key = keyFromEntry(entry);
-          if (key && !ordered.includes(key)) {
-            ordered.push(key);
-            keyRegion.set(key, regionKey);
-          }
-        }
-      }
-      // Compatibility with older ranking documents that kept rejected nodes
-      // only in the metadata object. They remain usable entries at the tail.
-      for (const key of rejectedKeys.filter(Boolean)) {
-        if (!ordered.includes(key)) ordered.push(key);
-      }
-      ranked.set(regionKey, ordered);
-    }
-
-    const nodes = state.nodes && typeof state.nodes === 'object' ? state.nodes : {};
-    for (const [key, node] of Object.entries(nodes)) {
-      if (node && typeof node.region === 'string') keyRegion.set(key, node.region);
-    }
-    return { keyRegion, ranked, stable };
-  }
-
-  function fallbackRegion(name) {
-    const index = REGION_PORT_BLOCKS.findIndex(
-      (region) =>
-        (region.matcher && region.matcher.test(name)) ||
-        (region.codeMatcher && region.codeMatcher.test(name)),
-    );
-    return index === -1 ? 'other' : REGION_PORT_BLOCKS[index].key;
-  }
-
-  function buildRegionPortConfig(proxies, state, firstPort) {
-    const index = stateIndex(state);
-    const entriesByRegion = new Map(REGION_PORT_BLOCKS.map((region) => [region.key, []]));
-
-    const selected = proxies.map((proxy, originalIndex) => ({
-      proxy,
-      originalIndex,
-      connectionKey: nodeKey(proxy),
-      identity: selectedIdentity(proxy),
-    }));
-    const resolved = resolveIdentityKeys(state, selected);
-    selected.forEach((entry, originalIndex) => {
-      const key = resolved.get(originalIndex) || entry.connectionKey;
-      const indexedRegion = index.keyRegion.get(key);
-      const regionKey = entriesByRegion.has(indexedRegion)
-        ? indexedRegion
-        : fallbackRegion(entry.proxy.name);
-      entriesByRegion.get(regionKey).push({ key, ...entry });
-    });
-
-    const listeners = [];
-    const selectedProxies = [];
-    const selectedNames = new Set();
-
-    REGION_PORT_BLOCKS.forEach((region, regionIndex) => {
-      const blockStart = firstPort + regionIndex * REGION_PORT_BLOCK_SIZE;
-      const regionStableSlotCount = region.unlimited ? 0 : STABLE_SLOT_COUNT;
-      const blockCapacity = region.unlimited
-        ? MAX_PORT - blockStart + 1
-        : REGION_PORT_BLOCK_SIZE;
-      if (blockStart > MAX_PORT || blockCapacity < regionStableSlotCount) {
-        throw new Error(`${region.key} port block exceeds ${MAX_PORT}`);
-      }
-
-      const available = entriesByRegion.get(region.key);
-      if (available.length > blockCapacity) {
-        throw new Error(
-          `${region.key} has ${available.length} nodes but its port block only holds ${blockCapacity}`,
-        );
-      }
-      // Node-health deliberately ignores the display name when calculating a
-      // node key. Sub-Store may therefore expose multiple subscription entries
-      // (aliases) for the same endpoint. Track the exact inventory occurrence
-      // selected for a stable slot so those aliases remain available for their
-      // own dynamic listeners instead of being discarded by a key-wide filter.
-      const stableEntryIndexes = new Set();
-      const stableNodeKeys = new Set();
-      const slotMap = index.stable.get(region.key) || new Map();
-      const reservedStableKeys = new Set(
-        [...slotMap.values()].filter((key) => available.some((entry) => entry.key === key)),
-      );
-      const rankPosition = new Map(
-        (index.ranked.get(region.key) || []).map((key, position) => [key, position]),
-      );
-      const orderedAvailable = [...available].sort((left, right) => {
-        const leftRank = rankPosition.has(left.key) ? rankPosition.get(left.key) : Number.MAX_SAFE_INTEGER;
-        const rightRank = rankPosition.has(right.key) ? rankPosition.get(right.key) : Number.MAX_SAFE_INTEGER;
-        return leftRank - rightRank || left.originalIndex - right.originalIndex;
-      });
-
-      for (let slot = 1; slot <= regionStableSlotCount; slot += 1) {
-        const requestedKey = slotMap.get(slot);
-        let entry = requestedKey
-          ? available.find(
-              (candidate) =>
-                candidate.key === requestedKey &&
-                !stableEntryIndexes.has(candidate.originalIndex) &&
-                !stableNodeKeys.has(candidate.key),
-            )
-          : undefined;
-        if (!entry) {
-          entry = orderedAvailable.find(
-            (candidate) =>
-              !stableEntryIndexes.has(candidate.originalIndex) &&
-              !stableNodeKeys.has(candidate.key) &&
-              !reservedStableKeys.has(candidate.key),
-          );
-        }
-        if (!entry) {
-          entry = orderedAvailable.find(
-            (candidate) =>
-              !stableEntryIndexes.has(candidate.originalIndex) &&
-              !stableNodeKeys.has(candidate.key),
-          );
-        }
-        // If the complete inventory has fewer than three distinct endpoints,
-        // aliases may still occupy the remaining fixed slots. The highest
-        // priority invariant is that every possible fixed slot has a node.
-        if (!entry) {
-          entry = orderedAvailable.find(
-            (candidate) => !stableEntryIndexes.has(candidate.originalIndex),
-          );
-        }
-        if (!entry) continue;
-        stableEntryIndexes.add(entry.originalIndex);
-        stableNodeKeys.add(entry.key);
-        if (!selectedNames.has(entry.proxy.name)) {
-          selectedProxies.push(entry.proxy);
-          selectedNames.add(entry.proxy.name);
-        }
-        listeners.push({
-          name: `mixed-${region.key}-${slot}`,
-          type: 'mixed',
-          port: blockStart + slot - 1,
-          proxy: entry.proxy.name,
-        });
-      }
-
-      const dynamic = orderedAvailable
-        .filter((entry) => !stableEntryIndexes.has(entry.originalIndex))
-        .slice(0, blockCapacity - regionStableSlotCount);
-
-      dynamic.forEach((entry, dynamicIndex) => {
-        if (!selectedNames.has(entry.proxy.name)) {
-          selectedProxies.push(entry.proxy);
-          selectedNames.add(entry.proxy.name);
-        }
-        listeners.push({
-          name: `mixed-${region.key}-${regionStableSlotCount + dynamicIndex + 1}`,
-          type: 'mixed',
-          port: blockStart + regionStableSlotCount + dynamicIndex,
-          proxy: entry.proxy.name,
-        });
-      });
-    });
-
-    if (listeners.length !== proxies.length) {
-      throw new Error(
-        `converter retained ${listeners.length} of ${proxies.length} inventory nodes`,
-      );
-    }
-    return { listeners, proxies: selectedProxies };
-  }
-
-  function convertConfig(sourceConfig, currentState, startPort = DEFAULT_START_PORT) {
-    validateState(currentState);
-    const proxies = (sourceConfig && sourceConfig.proxies || []).map((proxy) => ({ ...proxy }));
-    validateProxies(proxies);
-    const firstPort = normalizeStartPort(startPort);
-    const output = buildRegionPortConfig(proxies, currentState, firstPort);
-
-    return {
-      'global-client-fingerprint': 'chrome',
-      'global-ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-      'allow-lan': true,
-      'bind-address': '*',
-      mode: 'global',
-      // Use literal-IP DoH endpoints so this independent Mihomo instance does
-      // not need the router/OpenClash DNS path to bootstrap its own resolvers.
-      dns: {
-        enable: true,
-        listen: '127.0.0.1:11553',
-        'enhanced-mode': 'fake-ip',
-        'fake-ip-range': '198.18.0.1/16',
-        'default-nameserver': ['223.5.5.5', '1.12.12.12'],
-        nameserver: [
-          'https://223.5.5.5/dns-query',
-          'https://1.12.12.12/dns-query',
-        ],
-        'proxy-server-nameserver': [
-          'https://223.5.5.5/dns-query',
-          'https://1.12.12.12/dns-query',
-        ],
-      },
-      listeners: output.listeners,
-      proxies: output.proxies,
-    };
-  }
-
-  function convertYaml(inputYaml, currentState, startPort = DEFAULT_START_PORT, yaml) {
-    const codec = yaml || (typeof globalThis !== 'undefined' && globalThis.jsyaml);
-    if (!codec || typeof codec.load !== 'function' || typeof codec.dump !== 'function') {
-      throw new Error('js-yaml codec is required');
-    }
-    const state = typeof currentState === 'string' ? JSON.parse(currentState) : currentState;
-    return codec.dump(convertConfig(codec.load(inputYaml), state, startPort));
-  }
-
-  return Object.freeze({
-    DEFAULT_START_PORT,
-    NODE_HEALTH_SCHEMA_VERSION,
-    REGION_PORT_BLOCKS,
-    REGION_PORT_BLOCK_SIZE,
-    STABLE_SLOT_COUNT,
-    canonicalJson,
-    convertConfig,
-    convertYaml,
-    logicalId,
-    nodeKey,
-    normalizeIdentityText,
-    originalName,
-    resolveIdentityKeys,
-    selectedIdentity,
-    sha256Hex,
-    sourceId,
-    validateState,
+function inventoryEntries(proxies) {
+  if (!Array.isArray(proxies) || !proxies.length) throw new Error('inventory has no proxies');
+  const counts = new Map();
+  return proxies.map(proxy => {
+    if (!record(proxy) || typeof proxy.name !== 'string' || !proxy.name.trim()) throw new Error('invalid inventory proxy');
+    const key = nodeKey(proxy), source = sourceId(proxy), original = originalName(proxy), name = proxy.name.trim();
+    const tuple = JSON.stringify([key, source, original, name]);
+    const ordinal = (counts.get(tuple) || 0) + 1;
+    counts.set(tuple, ordinal);
+    return { entry_id: aliasEntryId(key, source, original, name, ordinal), node_key: key,
+      source_id: source, original_name: original, name, duplicate_ordinal: ordinal, proxy };
   });
-});
+}
+function inventoryFingerprint(entries) {
+  return digest(entries.map(entry => Object.fromEntries(
+    ['entry_id', 'node_key', 'name', 'source_id', 'original_name', 'duplicate_ordinal'].map(key => [key, entry[key]]),
+  )).sort((a, b) => compareCodePoints(a.entry_id, b.entry_id)));
+}
+function mappingDigest(map) {
+  return digest(Object.fromEntries(Object.entries(map).filter(([key]) =>
+    !['mapping_version', 'generated_at', 'ranking_version', 'application_status'].includes(key))));
+}
+const defaultRegions = () => REGION_KEYS.map((id, i) => ({ id, base: 62000 + i * 200,
+  capacity: id === 'other' ? 1336 : 200, stable_count: id === 'other' ? 0 : 3 }));
+
+function validateMapping(map, approvals = {}) {
+  if (!record(map) || map.schema_version !== 1 || map.consumer_contract !== CONSUMER_CONTRACT ||
+      map.purpose !== 'production' || map.application_status !== 'target-only') throw new Error('unsupported mapping contract or purpose');
+  for (const [field, expected] of [['namespace', approvals.namespace], ['server_instance_id', approvals.serverInstanceId],
+    ['port_plan_version', approvals.portPlanVersion]]) {
+    if (typeof expected !== 'string' || !expected || map[field] !== expected) throw new Error(`unapproved mapping ${field}`);
+  }
+  if (!Array.isArray(map.regions) || canonicalJson(map.regions) !== canonicalJson(defaultRegions()) ||
+      digest(map.regions) !== map.port_plan_version) throw new Error('invalid port plan');
+  if (mappingDigest(map) !== map.mapping_version) throw new Error('mapping digest mismatch');
+  if (typeof map.ranking_version !== 'string' || !map.ranking_version) throw new Error('ranking version required');
+  const age = (Number(approvals.nowMs ?? Date.now()) - Date.parse(map.generated_at)) / 1000;
+  const maximumAge = Number(approvals.maxAgeSeconds ?? 36 * 3600);
+  if (!Number.isFinite(age) || age < -300 || !Number.isFinite(maximumAge) || maximumAge <= 0 || age > maximumAge) throw new Error('mapping timestamp is stale or invalid');
+  if (!Array.isArray(map.entries) || !map.entries.length || !Array.isArray(map.bindings)) throw new Error('mapping entries required');
+  const entries = new Map();
+  for (const entry of map.entries) {
+    if (!record(entry) || !HEX.test(entry.entry_id) || !HEX.test(entry.node_key) || entries.has(entry.entry_id) ||
+        !REGION_KEYS.includes(entry.region) || typeof entry.name !== 'string' || !entry.name.trim() ||
+        typeof entry.source_id !== 'string' || typeof entry.original_name !== 'string' ||
+        !Number.isInteger(entry.duplicate_ordinal) || entry.duplicate_ordinal < 1 ||
+        aliasEntryId(entry.node_key, entry.source_id, entry.original_name, entry.name, entry.duplicate_ordinal) !== entry.entry_id) throw new Error('invalid or repeated mapping entry');
+    entries.set(entry.entry_id, entry);
+  }
+  if (inventoryFingerprint(map.entries) !== map.inventory_fingerprint) throw new Error('inventory fingerprint mismatch');
+  const ports = new Set(), used = new Set(), stableKeys = new Set(), slots = new Set();
+  const dynamicIndexes = new Map(REGION_KEYS.map(key => [key, []]));
+  for (const binding of map.bindings) {
+    const region = map.regions.find(value => value.id === binding.region);
+    if (!region || !Number.isInteger(binding.port) || binding.port < region.base ||
+        binding.port >= region.base + region.capacity || ports.has(binding.port)) throw new Error('invalid or conflicting port');
+    ports.add(binding.port);
+    if (binding.role === 'stable') {
+      if (!Number.isInteger(binding.slot) || binding.slot < 1 || binding.slot > region.stable_count ||
+          binding.port !== region.base + binding.slot - 1) throw new Error('invalid stable port');
+      slots.add(`${region.id}/${binding.slot}`);
+      if (binding.entry_id === null && binding.node_key === null) continue;
+      if (stableKeys.has(binding.node_key)) throw new Error('one connection occupies multiple stable slots');
+      stableKeys.add(binding.node_key);
+    } else if (binding.role === 'dynamic') {
+      if (!Number.isInteger(binding.dynamic_index) || binding.dynamic_index < 1 ||
+          binding.port !== region.base + region.stable_count + binding.dynamic_index - 1) throw new Error('invalid dynamic port');
+      dynamicIndexes.get(region.id).push(binding.dynamic_index);
+    } else throw new Error('invalid binding role');
+    const entry = entries.get(binding.entry_id);
+    if (!entry || entry.node_key !== binding.node_key || entry.region !== binding.region || used.has(entry.entry_id)) throw new Error('incomplete or mismatched instance binding');
+    used.add(entry.entry_id);
+  }
+  for (const region of map.regions) {
+    for (let slot = 1; slot <= region.stable_count; slot += 1) {
+      if (!slots.has(`${region.id}/${slot}`)) throw new Error('explicit empty slot required');
+    }
+    const indexes = dynamicIndexes.get(region.id).sort((a, b) => a - b);
+    if (indexes.some((index, i) => index !== i + 1)) throw new Error('noncontiguous dynamic mapping');
+  }
+  if (used.size !== entries.size) throw new Error('mapping omits inventory instances');
+  return map;
+}
+
+function runtimeShell(profile) {
+  if (!record(profile)) throw new Error('approved runtime profile required');
+  const shell = clone(profile);
+  delete shell.proxies; delete shell.listeners;
+  return shell;
+}
+function listenerOptions(listener) {
+  const value = clone(listener);
+  delete value.name; delete value.port; delete value.proxy;
+  if (value.type !== 'mixed') throw new Error('approved listeners must be mixed');
+  return value;
+}
+const runtimeProfileHash = profile => digest({ shell: runtimeShell(profile),
+  listeners: (profile.listeners || []).map(listener => ({ port: listener.port, options: listenerOptions(listener) })) });
+function optionsForPort(profile, port) {
+  const listeners = profile.listeners || [];
+  const existing = listeners.find(listener => listener.port === port);
+  if (existing) return listenerOptions(existing);
+  const options = listeners.map(listenerOptions);
+  if (options.some(value => canonicalJson(value) !== canonicalJson(options[0]))) throw new Error('new listener needs an explicitly reviewed profile');
+  return options[0] || { type: 'mixed' };
+}
+function inPortRange(port, ranges) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  return String(ranges).split(',').some(part => {
+    const match = part.trim().match(/^(\d+)(?:[-:](\d+))?$/);
+    return match && port >= Number(match[1]) && port <= Number(match[2] || match[1]);
+  });
+}
+function proxyForRuntime(proxy, previous) {
+  const value = clone(proxy);
+  for (const key of Object.keys(value)) if (key.startsWith('_')) delete value[key];
+  if (value['dialer-proxy']) throw new Error('proxy dependency requires an explicit reviewed adapter');
+  if (value.ports) {
+    if (value.type !== 'hysteria2') throw new Error('unsupported port-hopping protocol');
+    if (previous && inPortRange(previous.port, value.ports)) value.port = previous.port;
+    else if (!inPortRange(value.port, value.ports)) {
+      const first = Number(String(value.ports).split(/[,:-]/)[0]);
+      if (!inPortRange(first, value.ports)) throw new Error('invalid port-hopping range');
+      value.port = first;
+    }
+  }
+  value.name = `nh-${nodeKey(proxy)}`;
+  return value;
+}
+function remapShellReferences(profile, shell, proxies) {
+  const names = new Set(proxies.map(proxy => proxy.name));
+  const oldNames = new Map((profile.proxies || []).map(proxy => [proxy.name, `nh-${nodeKey(proxy)}`]));
+  const groups = new Set((shell['proxy-groups'] || []).map(group => group.name));
+  const builtins = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL']);
+  function target(name) {
+    const next = oldNames.get(name) || name;
+    if (!names.has(next) && !groups.has(next) && !builtins.has(next)) throw new Error('runtime profile contains an unresolved proxy reference');
+    return next;
+  }
+  for (const group of shell['proxy-groups'] || []) {
+    if (names.has(group.name)) throw new Error('runtime group name collision');
+    if (group.proxies) group.proxies = group.proxies.map(target);
+  }
+  if (shell['sub-rules']) throw new Error('sub-rule references require a reviewed runtime profile');
+  if (shell.rules) shell.rules = shell.rules.map(rule => {
+    if (typeof rule !== 'string') throw new Error('unsupported runtime rule');
+    const parts = rule.split(',');
+    const index = parts.at(-1) === 'no-resolve' ? parts.length - 2 : parts.length - 1;
+    parts[index] = target(parts[index]);
+    return parts.join(',');
+  });
+}
+function runtimeProjection(config) {
+  if (!record(config) || !Array.isArray(config.proxies) || !Array.isArray(config.listeners)) throw new Error('runtime config is incomplete');
+  const proxies = new Map();
+  for (const proxy of config.proxies) {
+    if (proxies.has(proxy.name)) throw new Error('duplicate runtime proxy name');
+    proxies.set(proxy.name, proxy);
+  }
+  const seen = new Set();
+  return config.listeners.map(listener => {
+    const proxy = proxies.get(listener.proxy);
+    if (!proxy || !Number.isInteger(listener.port) || seen.has(listener.port)) throw new Error('unresolved runtime listener');
+    seen.add(listener.port);
+    return { port: listener.port, node_key: nodeKey(proxy), type: listener.type };
+  }).sort((a, b) => a.port - b.port);
+}
+function verifyRuntimeBindings(config, map) {
+  const expected = map.bindings.filter(binding => binding.entry_id !== null)
+    .map(binding => ({ port: binding.port, node_key: binding.node_key, type: 'mixed' })).sort((a, b) => a.port - b.port);
+  if (canonicalJson(runtimeProjection(config)) !== canonicalJson(expected)) throw new Error('runtime port-to-connection bindings differ from target');
+}
+function convertConfig(sourceConfig, map, options = {}) {
+  validateMapping(map, options);
+  const profile = options.runtimeProfile;
+  if (!options.runtimeProfileHash || runtimeProfileHash(profile) !== options.runtimeProfileHash) throw new Error('unapproved runtime profile');
+  const entries = inventoryEntries(sourceConfig && sourceConfig.proxies);
+  if (inventoryFingerprint(entries) !== map.inventory_fingerprint) throw new Error('inventory differs from target mapping');
+  const byId = new Map(entries.map(entry => [entry.entry_id, entry]));
+  const previousByKey = new Map(((options.previousConfig || {}).proxies || []).map(proxy => [nodeKey(proxy), proxy]));
+  const selected = new Map(), listeners = [], manifest = [];
+  for (const binding of [...map.bindings].sort((a, b) => a.port - b.port)) {
+    if (binding.entry_id === null) continue;
+    const entry = byId.get(binding.entry_id);
+    if (!entry || entry.node_key !== binding.node_key) throw new Error('inventory instance binding mismatch');
+    if (!selected.has(entry.node_key)) selected.set(entry.node_key, proxyForRuntime(entry.proxy, previousByKey.get(entry.node_key)));
+    listeners.push({ ...optionsForPort(profile, binding.port), name: `nh-listener-${binding.port}`,
+      port: binding.port, proxy: selected.get(entry.node_key).name });
+    manifest.push({ ...binding, name: entry.name });
+  }
+  const proxies = [...selected.values()].sort((a, b) => compareCodePoints(a.name, b.name));
+  const shell = runtimeShell(profile);
+  remapShellReferences(profile, shell, proxies);
+  const config = { ...shell, proxies, listeners };
+  verifyRuntimeBindings(config, map);
+  return { config, manifest, runtime_config_hash: digest(config), manifest_hash: digest(manifest) };
+}
+module.exports = { CONSUMER_CONTRACT, REGION_PORT_BLOCKS, REGION_PORT_BLOCK_SIZE: 200, STABLE_SLOT_COUNT: 3,
+  canonicalJson, sha256Hex, digest, nodeKey, normalizeIdentityText, originalName, sourceId, aliasEntryId,
+  inventoryEntries, inventoryFingerprint, mappingDigest, defaultRegions, validateMapping, runtimeShell,
+  runtimeProfileHash, inPortRange, runtimeProjection, verifyRuntimeBindings, convertConfig };

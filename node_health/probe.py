@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -13,19 +15,56 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 import yaml
 
 from .config import AppConfig
-from .models import ClaudeResult, FullResult, Node, QuickResult
+from .errors import safe_error_text
+from .models import ClaudeResult, FullResult, Node, QuickResult, SiteProbeResult
+from .policy import PROBE_CONTRACT_VERSION, RISK_EVIDENCE_VERSION
 
 BUNDLED_DNSBL_FILE = "/app/ref/dnsbl.list"
+
+
+@dataclass(frozen=True)
+class HTTPResult:
+    transport_code: int
+    http_status: int
+    elapsed_ms: float
+    body: str = ""
+    host: str = ""
+    retry_after: float | None = None
+    error_code: str = ""
+
+
+class ProbeFailure(RuntimeError):
+    def __init__(self, code: str, response: HTTPResult | None = None):
+        self.code = code
+        self.response = response
+        super().__init__(safe_error_text(None, "quick-scan", code=code))
+
+
+def _retry_after_seconds(value: str, now: datetime | None = None) -> float | None:
+    try:
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    except (ValueError, TypeError):
+        try:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            return max(0.0, (deadline - (now or datetime.now(timezone.utc))).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
 
 
 def utc_now() -> str:
@@ -35,20 +74,27 @@ def utc_now() -> str:
 def generate_mihomo_probe_config(
     nodes: list[Node], start_port: int = 20000, listener_host: str = "127.0.0.1"
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    if start_port < 1024 or start_port + len(nodes) > 65535:
+    if start_port < 1024 or start_port > 65535 or (nodes and start_port + len(nodes) - 1 > 65535):
         raise ValueError("probe port range is outside 1024..65535")
     proxies: list[dict[str, Any]] = []
     listeners: list[dict[str, Any]] = []
     ports: dict[str, int] = {}
     names = [node.name for node in nodes]
-    duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
-    if duplicates:
-        raise ValueError(
-            "inventory contains duplicate proxy names; normalize them in Sub-Store before probing: "
-            + ", ".join(duplicates[:10])
-        )
+    duplicates = {name for name, count in Counter(names).items() if count > 1}
+    if any(node.proxy.get("dialer-proxy") in duplicates for node in nodes):
+        raise ValueError("ambiguous proxy dependency")
+    assigned_names = set(names) - duplicates
+    probe_names = {}
+    for node in sorted(nodes, key=lambda item: item.key):
+        candidate = node.name
+        if candidate in duplicates:
+            candidate = f"nh-probe-{node.key}"
+            while candidate in assigned_names:
+                candidate += "-alias"
+        assigned_names.add(candidate)
+        probe_names[node.key] = candidate
     for index, node in enumerate(nodes):
-        probe_name = node.name
+        probe_name = probe_names[node.key]
         proxy = {key: value for key, value in node.proxy.items() if not str(key).startswith("_")}
         proxy["name"] = probe_name
         port = start_port + index
@@ -121,7 +167,7 @@ class MihomoProbeEnvironment:
             )
             process = subprocess.Popen(
                 [self.config.probe.mihomo_binary, "-d", str(temp_path), "-f", str(config_path)],
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
@@ -176,8 +222,7 @@ class MihomoProbeEnvironment:
         deadline = time.monotonic() + self.config.probe.startup_timeout_seconds
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                output = process.stdout.read() if process.stdout else ""
-                raise RuntimeError(f"mihomo exited before readiness: {output[-1000:]}")
+                raise RuntimeError(safe_error_text(None, "quick-scan", code="probe_failed"))
             with socket.socket() as client:
                 client.settimeout(0.2)
                 if client.connect_ex(("127.0.0.1", port)) == 0:
@@ -200,22 +245,56 @@ class CurlQuickProbe:
         self._provider_lock = threading.Lock()
         self._provider_locks: dict[str, threading.Lock] = {}
         self._provider_cache: dict[str, tuple[float, str, float]] = {}
-        self._provider_backoff: dict[str, tuple[float, str]] = {}
+        self._provider_backoff: dict[tuple[str, ...], tuple[float, str]] = {}
         self._provider_counts: dict[str, Counter] = {}
+        self._provider_budget: dict[str, int] = {}
+        self._provider_failures: dict[str, list[tuple[float, int, str]]] = {}
+        self._diagnostic_retries: Counter[str] = Counter()
+        self._planned_routes: set[int] | None = None
 
-    def begin_scan(self) -> None:
+    def begin_scan(self, request_routes: list[int] | None = None) -> None:
         # Evidence may be shared for one IP within a scan, but never promoted
         # into another day's fresh evidence just because it was cached.
         with self._provider_lock:
             self._provider_cache.clear()
             self._provider_counts.clear()
+            self._provider_failures.clear()
+            self._diagnostic_retries.clear()
+            self._planned_routes = set(request_routes) if request_routes is not None else None
+            self._provider_budget.clear()
+            # Listener ports are reassigned between scans; only account and
+            # provider cooldowns have a meaning beyond this route allocation.
+            self._provider_backoff = {
+                key: value for key, value in self._provider_backoff.items()
+                if key[0] != "route"
+            }
+            if request_routes is not None:
+                for template in (
+                    self.config.probe.geo_url_template,
+                    self.config.probe.claude_ipinfo_url_template,
+                    self.config.probe.claude_ipapi_url_template,
+                ):
+                    source = urllib.parse.urlsplit(template).hostname or "unknown"
+                    self._provider_budget[source] = min(
+                        self.config.probe.provider_max_requests_per_scan,
+                        self._provider_budget.get(source, 0) + len(self._planned_routes),
+                    )
 
     def diagnostics(self) -> dict[str, Any]:
         with self._provider_lock:
             return {source: dict(counts) for source, counts in self._provider_counts.items()}
 
-    def _provider_get(self, port: int, url: str, timeout_seconds: float | None = None) -> tuple[str, float]:
+    def _provider_get(
+        self, port: int, url: str, timeout_seconds: float | None = None,
+        *, resource_kind: str = "geo", target_ip: str = "",
+    ) -> tuple[str, float]:
         source = urllib.parse.urlsplit(url).hostname or "unknown"
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        credentials = {name: query[name] for name in ("key", "token", "api_key") if name in query}
+        auth = hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
+        authenticated = any(any(value for value in values) for values in credentials.values())
+        cache_key = json.dumps((source, auth, resource_kind, target_ip or url, RISK_EVIDENCE_VERSION))
+        scopes = [("provider", source), ("account", source, auth), ("route", source, auth, str(port))]
         with self._provider_lock:
             lock = self._provider_locks.setdefault(source, threading.Lock())
         # Serialize each provider to avoid a quota burst, and coalesce lookups
@@ -224,79 +303,137 @@ class CurlQuickProbe:
             now = time.monotonic()
             with self._provider_lock:
                 counts = self._provider_counts.setdefault(source, Counter())
-                cached = self._provider_cache.get(url)
+                cached = self._provider_cache.get(cache_key)
                 if cached and cached[0] > now:
                     counts["cache_hits"] += 1
                     return cached[1], cached[2]
-                until, reason = self._provider_backoff.get(source, (0.0, ""))
-                if until > now:
+                active = [self._provider_backoff[key] for key in scopes if key in self._provider_backoff]
+                if any(until > now for until, _ in active):
                     counts["backoff_skips"] += 1
-                    raise RuntimeError(f"provider backoff: {reason}")
+                    raise ProbeFailure("provider_backoff")
+                budget = self._provider_budget.get(source, 0 if self._planned_routes is not None else self.config.probe.provider_max_requests_per_scan)
+                if (self._planned_routes is not None and port not in self._planned_routes) or counts["requests"] >= budget:
+                    counts["budget_skips"] += 1
+                    raise ProbeFailure("provider_budget_exhausted")
+                half_open = bool(active)
+                if half_open:
+                    if self._diagnostic_retries[source] >= 2:
+                        counts["diagnostic_budget_skips"] += 1
+                        raise ProbeFailure("provider_budget_exhausted")
+                    self._diagnostic_retries[source] += 1
+                    counts["half_open_requests"] += 1
                 counts["requests"] += 1
             try:
-                body, elapsed = self._get(port, url, timeout_seconds)
+                response = self._http_get(port, url, timeout_seconds)
+                body, elapsed = response.body, response.elapsed_ms
+                if response.transport_code or response.error_code or not 200 <= response.http_status < 300:
+                    code = (
+                        "provider_rate_limited" if response.http_status == 429
+                        else "provider_denied" if response.http_status in {401, 403}
+                        else "probe_timeout" if response.transport_code == 28
+                        else "provider_http_error" if response.http_status
+                        else "probe_failed"
+                    )
+                    raise ProbeFailure(code, response)
                 payload = json.loads(body)
                 if not isinstance(payload, dict) or payload.get("error"):
-                    raise ValueError("provider returned an error or invalid object")
+                    raise ProbeFailure("provider_invalid_response", response)
             except Exception as error:
-                # Do not persist request URLs: they can contain credentials.
-                message = str(error)
-                if "429" in message:
-                    code = "http_429"
-                elif "403" in message:
-                    code = "http_403"
-                elif re.search(r"\b5\d\d\b", message):
-                    code = "http_5xx"
-                elif "SSL" in message or "TLS" in message:
-                    code = "tls_error"
-                elif isinstance(error, subprocess.TimeoutExpired) or "timed out" in message.lower():
-                    code = "timeout"
-                elif isinstance(error, ValueError):
-                    code = "invalid_response"
-                else:
-                    code = "request_failed"
+                failure = error if isinstance(error, ProbeFailure) else ProbeFailure("provider_invalid_response")
+                response = failure.response
+                code = failure.code
                 with self._provider_lock:
                     counts[code] += 1
-                    if code in {"http_429", "http_403", "http_5xx"}:
-                        self._provider_backoff[source] = (time.monotonic() + 300, code)
-                raise RuntimeError(f"provider lookup failed: {code}") from None
+                    now = time.monotonic()
+                    status = response.http_status if response else 0
+                    retry_after = response.retry_after if response else None
+                    account_error = False
+                    if authenticated and response:
+                        try:
+                            error_payload = json.loads(response.body)
+                            marker = error_payload.get("error", {}) if isinstance(error_payload, dict) else {}
+                            marker = marker.get("code", "") if isinstance(marker, dict) else marker
+                            account_error = str(marker).lower() in {
+                                "invalid_api_key", "invalid_token", "invalid_authentication",
+                                "quota_exceeded", "insufficient_quota", "account_limit_exceeded",
+                            }
+                        except (ValueError, TypeError):
+                            pass
+                    if account_error:
+                        self._provider_backoff[scopes[1]] = (now + (retry_after if retry_after is not None else 300), code)
+                    else:
+                        delay = 300 if status == 403 else 60
+                        self._provider_backoff[scopes[2]] = (now + (retry_after if retry_after is not None else delay), code)
+                        failures = [(stamp, route, kind) for stamp, route, kind in self._provider_failures.get(source, []) if now - stamp <= 60]
+                        failures.append((now, port, code))
+                        self._provider_failures[source] = failures
+                        if len({route for _, route, kind in failures if kind == code}) >= 2 or half_open:
+                            self._provider_backoff[scopes[0]] = (now + max(60, retry_after or 0), code)
+                raise failure from None
             with self._provider_lock:
                 # Bound memory even for repeated independent audit jobs.
                 if len(self._provider_cache) >= 4096:
                     self._provider_cache.pop(next(iter(self._provider_cache)))
-                self._provider_cache[url] = (time.monotonic() + 3600, body, elapsed)
+                if _provider_payload_cacheable(payload, resource_kind):
+                    self._provider_cache[cache_key] = (time.monotonic() + 3600, body, elapsed)
+                else:
+                    counts["partial_responses"] += 1
+                for scope in scopes:
+                    self._provider_backoff.pop(scope, None)
+                self._provider_failures.pop(source, None)
                 counts["successes"] += 1
             return body, elapsed
 
     def _get(
         self, port: int, url: str, timeout_seconds: float | None = None
     ) -> tuple[str, float]:
+        response = self._http_get(port, url, timeout_seconds)
+        if response.transport_code or response.error_code or not 200 <= response.http_status < 300:
+            raise ProbeFailure("probe_timeout" if response.transport_code == 28 else "probe_failed", response)
+        return response.body, response.elapsed_ms
+
+    def _http_get(self, port: int | None, url: str, timeout_seconds: float | None = None) -> HTTPResult:
         timeout = timeout_seconds or self.config.probe.request_timeout_seconds
         started = time.monotonic()
-        result = subprocess.run(
-            [
-                "curl",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--fail-with-body",
-                "--proxy",
-                f"http://{self.config.probe.proxy_host}:{port}",
-                "--connect-timeout",
-                str(timeout),
-                "--max-time",
-                str(timeout),
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 3,
-            check=False,
-        )
-        elapsed_ms = (time.monotonic() - started) * 1000
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"curl exited {result.returncode}")
-        return result.stdout, elapsed_ms
+        with tempfile.TemporaryDirectory(prefix="node-health-http-") as directory:
+            body_path = Path(directory) / "body"
+            headers_path = Path(directory) / "headers"
+            command = ["curl", "--silent", "--show-error", "--location", "--max-redirs", "3",
+                       "--connect-timeout", str(timeout), "--max-time", str(timeout),
+                       "--max-filesize", str(self.config.probe.max_response_bytes),
+                       "--output", str(body_path), "--dump-header", str(headers_path),
+                       "--write-out", "%{http_code}\n%{url_effective}"]
+            if port is not None:
+                command.extend(["--proxy", f"http://{self.config.probe.proxy_host}:{port}"])
+            command.append(url)
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 3, check=False)
+                metadata = result.stdout.splitlines()
+                status = int(metadata[0]) if metadata and metadata[0].isdigit() else 0
+                host = urllib.parse.urlsplit(metadata[1]).hostname or "" if len(metadata) > 1 else ""
+                body = ""
+                error_code = ""
+                if body_path.exists():
+                    with body_path.open("rb") as stream:
+                        raw = stream.read(self.config.probe.max_response_bytes + 1)
+                    if len(raw) > self.config.probe.max_response_bytes:
+                        error_code = "provider_invalid_response"
+                    else:
+                        body = raw.decode("utf-8", errors="replace")
+                retry_after = None
+                if headers_path.exists():
+                    with headers_path.open("r", encoding="utf-8", errors="replace") as stream:
+                        headers = stream.read(65536)
+                    final_headers = re.split(r"\r?\n\r?\n", headers.strip())[-1]
+                    for line in final_headers.splitlines():
+                        key, _, value = line.partition(":")
+                        if key.lower() == "retry-after":
+                            retry_after = _retry_after_seconds(value.strip())
+                return HTTPResult(result.returncode, status, (time.monotonic() - started) * 1000, body, host, retry_after, error_code)
+            except subprocess.TimeoutExpired:
+                return HTTPResult(28, 0, (time.monotonic() - started) * 1000, error_code="probe_timeout")
+            except (OSError, ValueError):
+                return HTTPResult(1, 0, (time.monotonic() - started) * 1000, error_code="probe_failed")
 
     def _reachable(self, port: int, url: str) -> bool:
         try:
@@ -306,27 +443,10 @@ class CurlQuickProbe:
             return False
 
     def _direct_get(self, url: str, timeout_seconds: float) -> str:
-        result = subprocess.run(
-            [
-                "curl",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--fail-with-body",
-                "--connect-timeout",
-                str(timeout_seconds),
-                "--max-time",
-                str(timeout_seconds),
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds + 3,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or f"curl exited {result.returncode}")
-        return result.stdout
+        response = self._http_get(None, url, timeout_seconds)
+        if response.transport_code or response.error_code or response.http_status != 200:
+            raise ProbeFailure("probe_failed", response)
+        return response.body
 
     def diagnose_ai_service(self, service: str) -> dict[str, Any]:
         """Collect non-ranking diagnostics after a fleet-wide AI failure."""
@@ -345,13 +465,13 @@ class CurlQuickProbe:
 
         direct: dict[str, bool] = {}
         errors: list[str] = []
-        for url in direct_urls:
+        for index, url in enumerate(direct_urls):
             try:
                 self._direct_get(url, timeout)
-                direct[url] = True
-            except Exception as error:
-                direct[url] = False
-                errors.append(f"direct {url}: {error}")
+                direct[f"endpoint-{index + 1}"] = True
+            except Exception:
+                direct[f"endpoint-{index + 1}"] = False
+                errors.append(safe_error_text(None, "quick-scan", code="probe_failed"))
 
         official_status: dict[str, str] = {}
         try:
@@ -359,13 +479,12 @@ class CurlQuickProbe:
             status = response.get("status") if isinstance(response, dict) else None
             if isinstance(status, dict):
                 official_status = {
-                    "indicator": str(status.get("indicator") or ""),
-                    "description": str(status.get("description") or ""),
+                    "indicator": str(status.get("indicator")) if status.get("indicator") in {"none", "minor", "major", "critical"} else "unknown",
                 }
             else:
                 raise ValueError("official status response has no status object")
-        except Exception as error:
-            errors.append(f"official status: {error}")
+        except Exception:
+            errors.append(safe_error_text(None, "quick-scan", code="probe_failed"))
         return {
             "direct": direct,
             "official_status": official_status,
@@ -395,6 +514,7 @@ class CurlQuickProbe:
                     self.config.probe.claude_ipinfo_token,
                 ),
                 self.config.probe.claude_timeout_seconds,
+                resource_kind="ipinfo-risk", target_ip=exit_ip,
             )
             response = json.loads(body)
             data = response.get("data") if isinstance(response, dict) else None
@@ -420,10 +540,13 @@ class CurlQuickProbe:
                 "tor": ("tor", "is_tor"),
             }.items():
                 present, value = _first_present(privacy, keys)
-                if present:
-                    ipinfo_factors[factor] = _as_bool(value)
+                values = [_risk_bool(privacy[key]) for key in keys if key in privacy]
+                if any(value is True for value in values):
+                    ipinfo_factors[factor] = True
+                elif values and all(value is False for value in values):
+                    ipinfo_factors[factor] = False
             anonymous_present, anonymous = _first_present(data, ("is_anonymous",))
-            if anonymous_present and _as_bool(anonymous) and not any(
+            if anonymous_present and _risk_bool(anonymous) is True and not any(
                 ipinfo_factors.get(name) for name in ("proxy", "vpn", "tor")
             ):
                 ipinfo_factors["proxy"] = True
@@ -431,15 +554,18 @@ class CurlQuickProbe:
             privacy_hosting_present, privacy_hosting = _first_present(
                 privacy, ("hosting", "is_hosting")
             )
-            if hosting_present or privacy_hosting_present or asn.get("type") is not None:
-                ipinfo_factors["server"] = bool(
-                    _as_bool(hosting)
-                    or _as_bool(privacy_hosting)
-                    or str(asn.get("type") or "").strip().lower() == "hosting"
-                )
+            hosting_values = [_risk_bool(value) for present, value in ((hosting_present, hosting), (privacy_hosting_present, privacy_hosting)) if present]
+            usage_type = str(asn.get("type") or "").strip().lower()
+            if any(value is True for value in hosting_values) or usage_type == "hosting":
+                ipinfo_factors["server"] = True
+            elif hosting_values and all(value is False for value in hosting_values):
+                ipinfo_factors["server"] = False
+            elif not hosting_values and usage_type in {"isp", "business", "education", "government", "banking"}:
+                ipinfo_factors["server"] = False
             for factor, active in ipinfo_factors.items():
                 payload["factors"].setdefault(factor, {})["IPinfo"] = active
-            if ipinfo_factors or anonymous_present:
+            ipinfo_core = {"proxy", "vpn", "tor", "server"}
+            if any(ipinfo_factors.values()) or ipinfo_core <= ipinfo_factors.keys():
                 payload["risk_sources"]["IPinfo-privacy"] = (
                     "high" if any(ipinfo_factors.values()) else "low"
                 )
@@ -453,7 +579,7 @@ class CurlQuickProbe:
                 geo.get("country_code") or data.get("country_code") or ""
             ).upper()
         except Exception as error:
-            payload["errors"].append(f"ipinfo: {error}")
+            payload["errors"].append(safe_error_text(None, "quick-scan", code=error.code if isinstance(error, ProbeFailure) else "provider_invalid_response"))
 
         try:
             body, _ = self._provider_get(
@@ -465,6 +591,7 @@ class CurlQuickProbe:
                     self.config.probe.claude_ipapi_key,
                 ),
                 self.config.probe.claude_timeout_seconds,
+                resource_kind="ipapi-risk", target_ip=exit_ip,
             )
             response = json.loads(body)
             if not isinstance(response, dict):
@@ -493,26 +620,16 @@ class CurlQuickProbe:
                 "abuser": "is_abuser",
                 "robot": "is_crawler",
             }.items():
-                if field_name in response:
-                    ipapi_factors[factor] = _as_bool(response.get(field_name))
+                value = _risk_bool(response.get(field_name))
+                if value is not None:
+                    ipapi_factors[factor] = value
             for factor, active in ipapi_factors.items():
                 payload["factors"].setdefault(factor, {})["ipapi"] = active
-            score = company.get("abuser_score")
-            label_match = re.search(r"\(([^)]+)\)", str(score or ""))
-            if label_match:
-                label = " ".join(label_match.group(1).strip().lower().split())
-                if label in {"very low", "low", "medium", "moderate", "elevated", "high", "very high", "critical"}:
-                    payload["risk_sources"]["ipapi"] = label
+            score = _ipapi_score(company.get("abuser_score"))
+            if score is not None:
+                payload["risk_sources"]["ipapi"] = score
             if "ipapi" not in payload["risk_sources"]:
-                number_match = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)", str(score or ""))
-                if number_match:
-                    numeric = float(number_match.group(1))
-                    if 0 <= numeric <= 1:
-                        numeric *= 100
-                    if 0 <= numeric <= 100:
-                        payload["risk_sources"]["ipapi"] = f"{numeric:.2f}"
-            if "ipapi" not in payload["risk_sources"]:
-                if ipapi_factors:
+                if any(ipapi_factors.values()) or {"proxy", "vpn", "tor", "server", "abuser"} <= ipapi_factors.keys():
                     payload["risk_sources"]["ipapi-flags"] = (
                         "high" if any(ipapi_factors.values()) else "low"
                     )
@@ -534,7 +651,7 @@ class CurlQuickProbe:
                 or ""
             ).upper()
         except Exception as error:
-            payload["errors"].append(f"ipapi: {error}")
+            payload["errors"].append(safe_error_text(None, "quick-scan", code=error.code if isinstance(error, ProbeFailure) else "provider_invalid_response"))
 
         payload["complete"] = risk_providers == {"IPinfo", "ipapi"}
         return payload
@@ -542,44 +659,13 @@ class CurlQuickProbe:
     def _check_claude(self, port: int, generic_exit_ip: str) -> ClaudeResult:
         checked_at = utc_now()
         errors: list[str] = []
-        trace_ok = False
-        anthropic_ok = False
-        exit_ip = ""
-        country = ""
-        uncertain_failure = False
-        try:
-            body, _ = self._get(
-                port,
-                self.config.probe.claude_trace_url,
-                self.config.probe.claude_timeout_seconds,
-            )
-            trace = _parse_cloudflare_trace(body)
-            candidate_ip = str(trace.get("ip") or "").strip()
-            address = ipaddress.ip_address(candidate_ip)
-            if not address.is_global:
-                raise ValueError("Claude trace egress IP is not public")
-            exit_ip = str(address)
-            country = str(trace.get("loc") or "").upper()
-            trace_ok = True
-        except Exception as error:
-            uncertain_failure = uncertain_failure or _is_uncertain_probe_error(error)
-            errors.append(f"claude.ai: {error}")
-        try:
-            self._get(
-                port,
-                self.config.probe.anthropic_trace_url,
-                self.config.probe.claude_timeout_seconds,
-            )
-            anthropic_ok = True
-        except Exception as error:
-            uncertain_failure = uncertain_failure or _is_uncertain_probe_error(error)
-            errors.append(f"anthropic.com: {error}")
-
-        supported = (
-            country in set(self.config.probe.claude_supported_countries)
-            if country
-            else None
-        )
+        site = self._check_site(port, self.config.probe.claude_trace_url, set(self.config.probe.claude_supported_countries))
+        secondary = self._check_site(port, self.config.probe.anthropic_trace_url, None)
+        trace_ok = site.result_class in {"available", "restricted"}
+        anthropic_ok = secondary.result_class == "available"
+        exit_ip, country = site.exit_ip, site.country
+        supported = site.result_class == "available" if trace_ok else None
+        errors.extend(safe_error_text(None, "quick-scan", code=value.error_code) for value in (site, secondary) if value.error_code)
         intelligence: dict[str, Any] = {}
         if trace_ok and exit_ip != generic_exit_ip:
             intelligence = self._claude_risk_intelligence(port, exit_ip)
@@ -591,10 +677,6 @@ class CurlQuickProbe:
             status = "available"
         elif trace_ok or anthropic_ok:
             status = "degraded"
-        elif uncertain_failure:
-            status = "unknown"
-        elif errors:
-            status = "unreachable"
         else:
             status = "unknown"
         return ClaudeResult(
@@ -613,7 +695,35 @@ class CurlQuickProbe:
             intelligence_complete=bool(intelligence.get("complete")),
             checked_at=checked_at,
             error="; ".join(errors)[:1000],
+            site_probe=site,
+            anthropic_probe=secondary,
+            risk_evidence_version=RISK_EVIDENCE_VERSION,
         )
+
+    def _check_site(self, port: int, url: str, supported_countries: set[str] | None) -> SiteProbeResult:
+        response = self._http_get(port, url, self.config.probe.claude_timeout_seconds)
+        result = SiteProbeResult(
+            attempted=True, probe_contract_version=PROBE_CONTRACT_VERSION,
+            observation_id=uuid.uuid4().hex, checked_at=utc_now(),
+            http_status=response.http_status, transport_code=response.transport_code,
+        )
+        expected_host = urllib.parse.urlsplit(url).hostname or ""
+        if response.transport_code or response.error_code or response.http_status != 200:
+            result.error_code = "probe_timeout" if response.transport_code == 28 else "probe_failed"
+            return result
+        try:
+            trace = _parse_cloudflare_trace(response.body)
+            address = ipaddress.ip_address(trace.get("ip", ""))
+            country = trace.get("loc", "")
+            if not address.is_global or not re.fullmatch(r"[A-Z]{2}", country):
+                raise ValueError
+            if trace.get("h", "").lower() != expected_host.lower() or response.host.lower() != expected_host.lower():
+                raise ValueError
+            result.exit_ip, result.country, result.host = str(address), country, expected_host.lower()
+            result.result_class = "available" if supported_countries is None or country in supported_countries else "restricted"
+        except (ValueError, TypeError):
+            result.error_code = "provider_invalid_response"
+        return result
 
     def check(self, node: Node, port: int) -> QuickResult:
         checked_at = utc_now()
@@ -630,23 +740,26 @@ class CurlQuickProbe:
                     raise ValueError("egress IP is not public")
                 ips.append(ip)
                 latencies.append(latency)
-            except Exception as error:  # result records the bounded external failure
-                failures.append(str(error))
+            except Exception:
+                failures.append(safe_error_text(None, "quick-scan", code="probe_failed"))
         if not ips:
-            return QuickResult(available=False, checked_at=checked_at, error="; ".join(failures)[:1000])
+            return QuickResult(available=False, checked_at=checked_at, sample_count=max(1, self.config.probe.samples), error="; ".join(failures)[:1000])
 
         exit_ip = ips[0]
         country = ""
         asn = ""
         try:
-            body, _ = self._provider_get(port, self.config.probe.geo_url_template.format(ip=exit_ip))
+            body, _ = self._provider_get(port, self.config.probe.geo_url_template.format(ip=exit_ip), resource_kind="geo", target_ip=exit_ip)
             geo = json.loads(body)
             country = str(geo.get("country_code") or geo.get("country") or "").upper()
+            if not re.fullmatch(r"[A-Z]{2}", country):
+                country = ""
             asn = str(geo.get("asn") or geo.get("org") or "")
         except Exception as error:
-            failures.append(f"geo: {error}")
+            failures.append(safe_error_text(None, "quick-scan", code=error.code if isinstance(error, ProbeFailure) else "provider_invalid_response"))
 
         claude = self._check_claude(port, exit_ip)
+        chatgpt = self._check_site(port, self.config.probe.chatgpt_url, set(self.config.probe.chatgpt_supported_countries))
         return QuickResult(
             available=True,
             exit_ip=exit_ip,
@@ -656,10 +769,13 @@ class CurlQuickProbe:
             success_rate=round(len(ips) / max(1, self.config.probe.samples), 4),
             exit_ip_stable=len(set(ips)) == 1,
             google_ok=self._reachable(port, self.config.probe.google_url),
-            chatgpt_ok=self._reachable(port, self.config.probe.chatgpt_url),
+            chatgpt_ok=True if chatgpt.result_class == "available" else False if chatgpt.result_class == "restricted" else None,
             claude=claude,
             checked_at=checked_at,
             error="; ".join(failures)[:1000],
+            chatgpt=chatgpt,
+            success_count=len(ips),
+            sample_count=max(1, self.config.probe.samples),
         )
 
 
@@ -669,6 +785,39 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _risk_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _ipapi_score(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(?:\((Very Low|Low|Elevated|Medium|High|Very High)\))?\s*", str(value), re.IGNORECASE)
+    if match is None:
+        return None
+    number = float(match.group(1))
+    if not math.isfinite(number) or not 0 <= number <= 1:
+        return None
+    return match.group(2).lower() if match.group(2) else f"{number * 100:.2f}"
+
+
+def _provider_payload_cacheable(payload: dict[str, Any], resource_kind: str) -> bool:
+    if resource_kind == "geo":
+        return bool(re.fullmatch(r"[A-Z]{2}", str(payload.get("country_code") or payload.get("country") or "").upper()))
+    if resource_kind == "ipapi-risk":
+        company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
+        fields = ("is_proxy", "is_vpn", "is_tor", "is_datacenter", "is_abuser")
+        values = [_risk_bool(payload.get(key)) for key in fields]
+        return _ipapi_score(company.get("abuser_score")) is not None or any(value is True for value in values) or all(value is False for value in values)
+    if resource_kind == "ipinfo-risk":
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        privacy = data.get("privacy") or data.get("anonymous")
+        privacy = privacy if isinstance(privacy, dict) else {}
+        values = [_risk_bool(privacy.get(key)) for key in ("proxy", "vpn", "tor", "hosting")]
+        return any(value is True for value in values) or all(value is False for value in values)
+    return False
 
 
 def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> tuple[bool, Any]:
@@ -701,26 +850,18 @@ def _provider_url(
 
 
 def _parse_cloudflare_trace(body: str) -> dict[str, str]:
+    if "<" in body or len(body) > 16384:
+        raise ValueError("invalid trace")
     values: dict[str, str] = {}
     for line in body.splitlines():
         key, separator, value = line.partition("=")
         if separator and key.strip():
+            if key.strip() in values:
+                raise ValueError("duplicate trace field")
             values[key.strip()] = value.strip()
-    if not values:
+    if not all(values.get(key) for key in ("ip", "loc", "h")):
         raise ValueError("response is not a Cloudflare trace")
     return values
-
-
-def _is_uncertain_probe_error(error: Exception) -> bool:
-    if isinstance(error, subprocess.TimeoutExpired):
-        return True
-    message = str(error).strip().lower()
-    if any(token in message for token in ("timeout", "timed out", "curl exited 28")):
-        return True
-    return bool(
-        re.search(r"(?:http(?: status| error)?\s*)?429\b", message)
-        or re.search(r"(?:http(?: status| error)?\s*)?5\d\d\b", message)
-    )
 
 
 class IPQualityAuditor:
@@ -756,34 +897,30 @@ class IPQualityAuditor:
                         "IPQUALITY_CHECKPOINT_FILE": str(checkpoint),
                         "IPQUALITY_REQUEST_TIMEOUT": str(self.config.probe.request_timeout_seconds),
                         "IPQUALITY_SKIP_MAIL": "1",
+                        "IPQUALITY_SKIP_AI": "1",
                         "IPQUALITY_DNSBL_FILE": BUNDLED_DNSBL_FILE,
                     },
                 )
-            except (OSError, subprocess.TimeoutExpired) as error:
-                partial = None
-                try:
-                    partial = _extract_json(checkpoint.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError):
-                    pass
-                saved = normalize_ipquality(partial, checked_at) if partial else FullResult(completed=False, checked_at=checked_at)
-                saved.completed = False
-                saved.error = str(error)
-                return saved
-        details = _extract_json(result.stdout)
-        if details is None:
-            suffix = (result.stderr or result.stdout)[-1800:]
-            exit_note = f" (exit {result.returncode})" if result.returncode else ""
-            return FullResult(
-                completed=False,
-                checked_at=checked_at,
-                error=(f"IPQuality returned no JSON{exit_note}: {suffix}").strip(),
-            )
-        normalized = normalize_ipquality(details, checked_at)
-        # ip.sh can emit valid IPv4 JSON and still exit 1 because its final
-        # disabled-IPv6 condition is false. The JSON is the authoritative
-        # completion signal. The bundled script also ends with an explicit
-        # success exit, but accepting valid JSON keeps older images compatible.
-        return normalized
+            except (OSError, subprocess.TimeoutExpired):
+                return _partial_full_result(checkpoint, checked_at)
+            details = _extract_json(result.stdout)
+            automation = details.get("Automation") if isinstance(details, dict) else None
+            if result.returncode or details is None or (isinstance(automation, dict) and automation.get("complete") is not True):
+                return _partial_full_result(checkpoint, checked_at, details)
+            return normalize_ipquality(details, checked_at)
+
+
+def _partial_full_result(checkpoint: Path, checked_at: str, fallback: dict[str, Any] | None = None) -> FullResult:
+    partial = None
+    try:
+        partial = _extract_json(checkpoint.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        pass
+    partial = partial or fallback
+    saved = normalize_ipquality(partial, checked_at) if partial else FullResult(completed=False, checked_at=checked_at)
+    saved.completed = False
+    saved.error = safe_error_text(None, "full-scan", code="full_audit_incomplete")
+    return saved
 
 
 def _extract_json(output: str) -> dict[str, Any] | None:
@@ -807,7 +944,7 @@ def _extract_json(output: str) -> dict[str, Any] | None:
 
 def normalize_ipquality(details: dict[str, Any], checked_at: str = "") -> FullResult:
     risk_sources: dict[str, str] = {}
-    source = details.get("Score") or details.get("risk_sources") or details.get("risk") or {}
+    source = details["Score"] if isinstance(details.get("Score"), dict) else details.get("risk_sources") or details.get("risk") or {}
     if isinstance(source, dict):
         for key, value in source.items():
             if isinstance(value, dict):
@@ -817,14 +954,14 @@ def normalize_ipquality(details: dict[str, Any], checked_at: str = "") -> FullRe
     factor = details.get("Factor") if isinstance(details.get("Factor"), dict) else {}
     tor_value = factor.get("Tor", details.get("tor") or details.get("is_tor"))
     if isinstance(tor_value, dict):
-        tor = any(bool(value) for value in tor_value.values())
+        tor = any(value is True for value in tor_value.values())
     elif isinstance(tor_value, list):
-        tor = any(bool(value) for value in tor_value)
+        tor = any(value is True for value in tor_value)
     else:
-        tor = bool(tor_value)
+        tor = tor_value is True
     for label in ("Proxy", "VPN", "Server", "Abuser", "Robot"):
         value = factor.get(label)
-        active = any(bool(item) for item in value.values()) if isinstance(value, dict) else bool(value)
+        active = any(item is True for item in value.values()) if isinstance(value, dict) else value is True
         if active and label.lower() not in {item.lower() for item in labels}:
             labels.append(label.lower())
     mail = details.get("Mail") if isinstance(details.get("Mail"), dict) else {}
@@ -842,10 +979,16 @@ def normalize_ipquality(details: dict[str, Any], checked_at: str = "") -> FullRe
     dnsbl = dnsbl_listed_count > 0
     head = details.get("Head") if isinstance(details.get("Head"), dict) else {}
     audited_exit_ip = str(head.get("IP") or details.get("ip") or "").strip()
+    public_egress = False
     try:
-        audited_exit_ip = str(ipaddress.ip_address(audited_exit_ip))
+        address = ipaddress.ip_address(audited_exit_ip)
+        audited_exit_ip = str(address)
+        public_egress = address.is_global
     except ValueError:
         audited_exit_ip = ""
+    media = details.get("Media") if isinstance(details.get("Media"), dict) else {}
+    chatgpt_data = media.get("ChatGPT") if isinstance(media.get("ChatGPT"), dict) else {}
+    observation = SiteProbeResult.from_dict(chatgpt_data.get("Probe"))
     return FullResult(
         completed=True,
         audited_exit_ip=audited_exit_ip,
@@ -856,6 +999,9 @@ def normalize_ipquality(details: dict[str, Any], checked_at: str = "") -> FullRe
         labels=[str(item) for item in labels],
         details=details,
         checked_at=checked_at or utc_now(),
+        risk_evidence_version=RISK_EVIDENCE_VERSION if public_egress and isinstance(details.get("Score"), dict) and isinstance(details.get("Factor"), dict) else 0,
+        chatgpt=observation,
+        chatgpt_evidence_version=observation.probe_contract_version,
     )
 
 
@@ -878,11 +1024,11 @@ def run_parallel(
             node = futures[future]
             try:
                 results[node.key] = future.result()
-            except Exception as error:
+            except Exception:
                 if result_kind == "full":
-                    results[node.key] = FullResult(completed=False, checked_at=utc_now(), error=str(error))
+                    results[node.key] = FullResult(completed=False, checked_at=utc_now(), error=safe_error_text(None, "full-scan", code="full_audit_failed"))
                 else:
-                    results[node.key] = QuickResult(available=False, checked_at=utc_now(), error=str(error))
+                    results[node.key] = QuickResult(available=False, checked_at=utc_now(), error=safe_error_text(None, "quick-scan", code="probe_failed"))
             completed += 1
             if progress_callback is not None:
                 progress_callback(completed, total)
