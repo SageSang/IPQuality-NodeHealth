@@ -20,6 +20,7 @@ from .config import AppConfig, load_config
 from .errors import safe_error_text
 from .policy import EVIDENCE_POLICY_VERSION
 from .port_mapping import MAP_SCHEMA_VERSION, CONSUMER_CONTRACT
+from .runtime_bundle import BUNDLE_SCHEMA_VERSION
 from .service import NodeHealthService, ScanStartError
 
 SOFTWARE_VERSION = "0.4.0-dev"
@@ -249,8 +250,30 @@ class ApiHandler(BaseHTTPRequestHandler):
                 {"service_version": SOFTWARE_VERSION, "ranking_version": current.get("version"),
                  "source_revision": os.environ.get("NODE_HEALTH_REVISION", "unknown"),
                  "evidence_policy_version": EVIDENCE_POLICY_VERSION, "runtime_map_schema_version": MAP_SCHEMA_VERSION,
+                 "runtime_bundle_schema_version": BUNDLE_SCHEMA_VERSION,
                  "runtime_contract": CONSUMER_CONTRACT},
             )
+            return
+        match = re.fullmatch(r"/api/v1/runtime-bundles/([^/]+)", path)
+        if match:
+            # This response contains subscription credentials, even on loopback.
+            if not self.server.config.http.api_token or not self._authorized():
+                self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            try:
+                body = self.server.service.store.read_runtime_bundle(match.group(1))
+            except FileNotFoundError:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "runtime_bundle_unavailable"})
+                return
+            except (OSError, ValueError):
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "runtime_bundle_unavailable"})
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/current.json":
             current = self.server.service.store.load_current()

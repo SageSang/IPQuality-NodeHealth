@@ -2,7 +2,7 @@
 
 本页描述 `0.4.0-dev` 的接口和迁移步骤，不表示已经部署。
 普通订阅仍走 `inventory -> node-health -> healthy`；固定端口消费者改为
-`inventory + /local-socks-map.json -> 显式转换 -> 本地验证/应用`。
+`NAS 同代私有订阅包（inventory + map）-> 显式转换 -> 本地验证/应用`。
 旧顺序转换器不能表达空槽，不要让两个更新入口同时写同一份配置。
 
 ## 能力与兼容性
@@ -13,7 +13,7 @@
 - AI 指标为站点/地区探测，未验证登录或对话。ChatGPT 单次站点/支持地区项12分、同服务出口独立地理一致3分，Claude10分。旧 Yes/Native 不授新资格。
 - 旧健康加分和晋级资格重新累计；原已满六天且仍在原槽/原连接的节点可获一次迁移宽限，首次迁移提交后七个日历日到期，最多延迟一个有效日，不叠加、不加分、不晋级。
 - 同名不同连接可独立探测；有歧义的 dialer 依赖会拒绝。固定消费者目前对 dialer-proxy 或未审阅的复杂配置引用拒绝整批，不静默删除节点。
-- 严格 fingerprint 会因改名、新增或连接轮换而暂停整份应用，直到下一次成功扫描；失败时可能更久。最后已应用配置继续运行，但旧出口可能已失效。可使用现有手动 maintenance，不新增自动扫描控制回路。
+- 严格 fingerprint 校验同代包内的订阅与映射，改名、新增或连接轮换不会使消费者误取另一份实时订阅。快照中的远端出口仍可能在扫描后失效；最后已应用配置继续运行，可等下一次定时 maintenance 或使用现有手动入口，不新增自动扫描控制回路。
 
 ## 本地验收与真实校准
 
@@ -70,6 +70,19 @@ NODE_HEALTH_SERVER_INSTANCE_ID=YOUR_REVIEWED_STABLE_ID
 进度的 percent 为阶段百分比；waiting-retry/rechecking 提供轮次、待复检数和 next_retry_at。
 默认地区规则来自 `node_health/region_rules.json`；配置中的自定义 regions 仍可覆盖，消费者采用服务发布的 effective region，不重复猜地区。
 
+### 从 59aec6a 修复同代订阅交付
+
+1. 将 node-health 镜像改为已审阅修复版本的固定 digest。若 `.env` 中已有 `NODE_HEALTH_IMAGE`，只改该值；若 Compose 直接填写 image，改相应服务的 image，不同时新增第二处配置。Container Manager 只重建 node-health 服务，无需因此重建 Mihomo、Sub-Store 或改变网络。
+2. 复用现有 `/app/data` 挂载。服务在其中创建 `runtime-bundles` 私有目录（0700，文件0600），不新增容器或挂载，也不写入 `/app/reports`。该目录包含完整订阅凭证，备份必须限制访问。当前和前一已提交代保留，未提交或已回收代不会通过接口提供；清理失败只记录安全日志。
+3. 复用现有非空 `http.api_token`。已配置 token、namespace 和 server_instance_id 时，`config.yaml`、Compose 结构和现有环境变量无需额外修改。私有接口即使监听 loopback 也不允许空 token；本次复用的是现有管理 API 权限，不是独立只读权限。
+4. 更新后核对 `/version` 的 source_revision 和 `runtime_bundle_schema_version=1`。旧 current/state 没有完整输入，包接口会返回 404，不自动重建排名。默认等下一次定时 maintenance 或明确触发一次，生成配套产物；按已有身份、时效规则复用检测历史，不清空状态、不强制 rebuild，也不重置 M1。不能把新下载订阅填入旧映射，暂不提供猜测式补包工具。
+5. 路由器更新同版本 controller，并配置 `RUNTIME_BUNDLE_URL` 和 `RUNTIME_TOKEN_FILE`。token 文件由 root 持有、权限0600，只存现有 NAS token，不把值放入命令行、URL、公开文件或日志。旧 SOURCE_URL/RANKING_URL 可留作历史参考，但新轮询不再读取它们，也不会在失败后退回实时 Sub-Store。
+6. 先下载包、离线转换核验实际端口与配置差异，再在已批准维护窗口应用路由。NAS 镜像更新不会安装路由脚本；首次 D2 的 profile、实例、端口及回滚准备仍须完成。
+
+`GET /api/v1/runtime-bundles/latest` 用 `Authorization: Bearer ...` 获取一个 JSON 包；同接口最后一段换成 `bundle_id` 可读取保留的指定代。包 schema=1，含唯一发布 revision、base64 原始订阅字节、字节 SHA-256 和完整 map。mapping_version 不是包 ID，未变的映射可对应不同扫描代。原始订阅在扫描前限制16MiB，包限制32MiB。
+
+私有响应带 `Cache-Control: no-store`；鉴权失败401，缺少或回收代404，损坏/不可读503。使用已有 HTTPS 或受限可信 LAN；HTTP 的 Bearer token 不提供传输加密。下载不跟随重定向，凭据只用于配置的地址。公开 current/map/report 不增加订阅或凭据。运行恢复仍先于下载/退避；下载或转换失败不更改当前代理配置。
+
 ## 路由器只读预检
 
 先核对实际服务实现及路径，再决定安装或变更；本页命令不是远端执行授权。
@@ -109,7 +122,7 @@ apply-ranking.sh INVENTORY_YAML MAP_JSON MAPPING_VERSION
 check-ranking.sh
 ```
 
-同一时刻仅启用一个定时更新入口。旧 SOURCE_URL 若指向 healthy 必须改为无健康排序的 inventory，RANKING_URL 改为新 map 端点。
+同一时刻仅启用一个定时更新入口。新轮询使用 NAS 的 RUNTIME_BUNDLE_URL，不再配置 Sub-Store 实时 SOURCE_URL 作为固定端口输入。
 无可信映射/过期/实例或 fingerprint 不符时拒绝新应用；默认新目标最长36小时，旧已应用配置不会因此自动关闭。
 
 ## 提交、恢复和可观察性

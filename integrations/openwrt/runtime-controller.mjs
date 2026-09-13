@@ -46,6 +46,10 @@ function failureCode(error) {
     'local runtime recovery incomplete; previous generation retained': 'recovery_incomplete',
     'final export directory overlaps runtime dependencies': 'export_dependency_overlap',
     'mapping or inventory download failed': 'download_failed',
+    'runtime bundle download failed': 'download_failed',
+    'invalid runtime bundle': 'bundle_invalid',
+    'runtime token file must be private and nonempty': 'runtime_auth_invalid',
+    'invalid runtime bundle URL': 'runtime_source_invalid',
     'mapping digest mismatch': 'mapping_invalid',
     'inventory fingerprint mismatch': 'mapping_invalid',
     'unsupported mapping contract or purpose': 'contract_unsupported',
@@ -91,7 +95,7 @@ function validatePaths() {
   if (target === path.parse(target).root) throw new Error('dedicated export directory required');
   const inputs = process.argv[2] === 'apply' ? process.argv.slice(3, 5) : [];
   const dependencies = [work, cache, configPath, core, converterPath, service, process.argv[1], process.execPath,
-    env.RUNTIME_PROFILE_PATH, env.SERVICE_PID_FILE, env.NODE_HEALTH_ENV_FILE, ...inputs,
+    env.RUNTIME_PROFILE_PATH, env.SERVICE_PID_FILE, env.NODE_HEALTH_ENV_FILE, env.RUNTIME_TOKEN_FILE, ...inputs,
     env.JS_YAML_PATH, ...String(env.NODE_PATH || '').split(path.delimiter)].filter(Boolean);
   for (const dependency of dependencies) {
     const value = realPath(dependency);
@@ -407,43 +411,74 @@ async function apply(sourcePath, mapPath, expectedVersion) {
   } catch { process.stderr.write('node-health apply: committed; derived cleanup pending\n'); }
   return next;
 }
-async function download(url, destination) {
-  if (!/^https?:\/\//i.test(url)) throw new Error('HTTP subscription URL required');
+const MAX_BUNDLE_BYTES = 32 * 1024 * 1024;
+async function downloadBundle(destination, stage) {
+  let url;
+  try { url = new URL(env.RUNTIME_BUNDLE_URL); } catch { throw new Error('invalid runtime bundle URL'); }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash || url.search ||
+      !/^\/api\/v1\/runtime-bundles\/(latest|s-[A-Za-z0-9][A-Za-z0-9._-]{0,125})$/.test(url.pathname)) {
+    throw new Error('invalid runtime bundle URL');
+  }
+  let token;
+  try {
+    const file = fs.lstatSync(env.RUNTIME_TOKEN_FILE);
+    if (!file.isFile() || (file.mode & 0o077) || file.uid !== process.getuid() || file.size > 4096) throw new Error();
+    token = fs.readFileSync(env.RUNTIME_TOKEN_FILE, 'utf8').trim();
+    if (!token || /[^\x21-\x7e]/.test(token)) throw new Error();
+  } catch { throw new Error('runtime token file must be private and nonempty'); }
+  const headers = path.join(stage, 'headers');
+  atomicWrite(headers, `Authorization: Bearer ${token}\n`);
+  atomicWrite(destination, '');
   await new Promise((resolve, reject) => {
-    const child = spawn('curl', ['--fail', '--silent', '--location', '--proto', '=http,https', '--proto-redir', '=http,https',
-      '--header', 'Cache-Control: no-cache', '--header', 'Pragma: no-cache',
-      '--connect-timeout', env.CURL_CONNECT_TIMEOUT || '10', '--max-time', env.CURL_MAX_TIME || '120', '--output', destination, url],
-    { stdio: 'ignore' });
+    // No redirects: neither credentials nor the private response may cross origins.
+    const child = spawn('curl', ['--disable', '--fail', '--silent', '--proto', '=http,https', '--max-redirs', '0',
+      '--header', `@${headers}`, '--header', 'Cache-Control: no-cache',
+      '--max-filesize', String(MAX_BUNDLE_BYTES), '--write-out', '%{http_code}',
+      '--connect-timeout', env.CURL_CONNECT_TIMEOUT || '10', '--max-time', env.CURL_MAX_TIME || '120', '--output', destination, url.toString()],
+    { stdio: ['ignore', 'pipe', 'ignore'] });
+    let status = '';
+    child.stdout.on('data', data => { status = (status + data.toString()).slice(-3); });
     downloadChild = child;
     child.once('error', () => reject(new Error('download command unavailable')));
-    child.once('exit', code => {
+    child.once('close', code => {
       downloadChild = null;
-      code === 0 ? resolve() : reject(new Error('mapping or inventory download failed'));
+      code === 0 && status === '200' ? resolve() : reject(new Error('runtime bundle download failed'));
     });
   });
 }
+function unpackBundle(file, source, mapping) {
+  if (fs.statSync(file).size > MAX_BUNDLE_BYTES) throw new Error('invalid runtime bundle');
+  const bundle = readJSON(file);
+  if (bundle.schema_version !== 1 || typeof bundle.bundle_id !== 'string' ||
+      !/^s-[A-Za-z0-9][A-Za-z0-9._-]{0,125}$/.test(bundle.bundle_id) || bundle.inventory_encoding !== 'base64' ||
+      typeof bundle.inventory !== 'string' || !bundle.inventory.length) throw new Error('invalid runtime bundle');
+  const inventory = Buffer.from(bundle.inventory, 'base64');
+  if (inventory.length > 16 * 1024 * 1024 || inventory.toString('base64') !== bundle.inventory ||
+      `sha256:${crypto.createHash('sha256').update(inventory).digest('hex')}` !== bundle.inventory_sha256) {
+    throw new Error('invalid runtime bundle');
+  }
+  const requested = new URL(env.RUNTIME_BUNDLE_URL).pathname.split('/').at(-1);
+  if (requested !== 'latest' && requested !== bundle.bundle_id) throw new Error('invalid runtime bundle');
+  const map = converter.validateMapping(bundle.mapping, approvals());
+  atomicWrite(source, inventory);
+  writeJSON(mapping, map);
+  return map;
+}
 async function poll() {
   await recoverLocal();
+  for (const name of fs.readdirSync(cache)) {
+    if (/^download\.[A-Za-z0-9]{6}$/.test(name)) fs.rmSync(path.join(cache, name), { recursive: true, force: true });
+  }
   if (exists(backoffPath) && readJSON(backoffPath).retry_after > Date.now()) { currentPhase = 'backoff'; return; }
   checkInterrupted();
   const stage = fs.mkdtempSync(path.join(cache, 'download.'));
   try {
-    const first = path.join(stage, 'first.json'), final = path.join(stage, 'map.json'), source = path.join(stage, 'inventory.yaml');
-    currentPhase = 'download-map';
-    await download(env.RANKING_URL || '', first);
+    const bundle = path.join(stage, 'bundle.json'), final = path.join(stage, 'map.json'), source = path.join(stage, 'inventory.yaml');
+    currentPhase = 'download-bundle';
+    await downloadBundle(bundle, stage);
     currentPhase = 'validate-target';
-    const mapA = converter.validateMapping(readJSON(first), approvals());
-    const url = new URL(env.SOURCE_URL || '');
-    if (url.hash || /\/download\/collection\/healthy\/?$/.test(url.pathname) ||
-        url.searchParams.get('target') !== 'ClashMeta' || url.searchParams.get('noCache') !== 'true') throw new Error('complete uncached ClashMeta inventory URL required');
-    url.searchParams.set('_node_health_version', mapA.mapping_version);
-    currentPhase = 'download-inventory';
-    await download(url.toString(), source);
-    currentPhase = 'download-map';
-    await download(env.RANKING_URL, final);
-    const mapB = converter.validateMapping(readJSON(final), approvals());
-    if (mapA.mapping_version !== mapB.mapping_version) throw new Error('mapping changed during download');
-    await apply(source, final, mapB.mapping_version);
+    const map = unpackBundle(bundle, source, final);
+    await apply(source, final, map.mapping_version);
     fs.rmSync(backoffPath, { force: true });
   } catch (error) {
     const previous = exists(backoffPath) ? readJSON(backoffPath).attempts : 0;

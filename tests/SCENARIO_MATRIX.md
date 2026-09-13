@@ -135,6 +135,8 @@ Real same-environment positive calibration, actual runtime profile/core/port-dif
 
 ## Deployment gates
 
+Runtime bundle regressions are in `test_runtime_bundles.py` and the HTTP poll cases in `test_openwrt_apply_e2e.py`: exact input/duplicate aliases during upstream mutation; unique current/previous committed generations; interrupted publication and startup GC; reader/GC serialization; legacy state and M1 preservation; strict nonempty authentication, private no-store responses and public-output secrecy; corrupt, expired or mismatched bundles; redirect rejection and private token validation; no live-subscription fallback; local recovery before download failures; unchanged DNS/profile and no-op runtime behavior.
+
 Deployment is blocked unless all of the following pass:
 
 1. Python test suite.

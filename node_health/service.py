@@ -31,7 +31,7 @@ from .audit import (
 from .inventory import (
     Download,
     download_bytes,
-    fetch_inventory,
+    fetch_inventory_snapshot,
     inventory_digest,
     parse_clash_inventory,
 )
@@ -1095,7 +1095,7 @@ class NodeHealthService:
             self._task_started_at = started_iso
         self._set_progress("downloading")
         previous = migrate_evidence_state(self.store.load_state(), self.config.policy, started_at)
-        nodes, source_digest = fetch_inventory(self.config, self.downloader)
+        nodes, source_digest, inventory_payload = fetch_inventory_snapshot(self.config, self.downloader)
         nodes, previous, identity_events = reconcile_previous_state(nodes, previous)
         nodes = resolve_effective_regions(nodes, previous, requested_mode)
         invalidate_removed_migration_slots(previous, {node.key for node in nodes})
@@ -1269,7 +1269,8 @@ class NodeHealthService:
         state = finalize_evidence_migration(state, generated_at, configured_timezone)
         current["evidence_policy_version"] = EVIDENCE_POLICY_VERSION
         current["evidence_migration"] = copy.deepcopy(state.get("evidence_migration"))
-        self.store.publish(current, state, assessments, changes, generated_at.astimezone(configured_timezone))
+        self.store.publish(current, state, assessments, changes, generated_at.astimezone(configured_timezone),
+                           inventory_payload=inventory_payload)
         with self._status_lock:
             self._last_quality_summary = dict(current["quality_summary"])
         return current

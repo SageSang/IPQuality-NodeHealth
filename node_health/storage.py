@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -22,6 +23,7 @@ from .models import NodeAssessment
 from .audit import audit_day_parts, validate_audit_id
 from .reconcile import SCHEMA_VERSION
 from .slots import ranking_key
+from .runtime_bundle import MAX_BUNDLE_BYTES, build_runtime_bundle, byte_digest, valid_bundle_id
 
 
 _FIXED_REGION_PORT_BLOCK_SIZE = 200
@@ -178,6 +180,8 @@ class StateStore:
         self.state_path = config.data_dir / "state.json"
         self.current_path = config.data_dir / "current.json"
         self.snapshots_dir = config.data_dir / "state-snapshots"
+        self.runtime_bundles_dir = config.data_dir / "runtime-bundles"
+        self._publication_lock = threading.RLock()
         self.audit_jobs_dir = config.data_dir / "audit-jobs"
         self.scheduled_reports_dir = config.reports_dir / "scheduled"
         self.audit_reports_dir = config.reports_dir / "audits"
@@ -185,6 +189,7 @@ class StateStore:
         ensure_supported_evidence(self.load_state())
         self._recover_interrupted_audits()
         self._recover_committed_alerts()
+        self._try_prune_runtime_bundles()
 
     def _recover_interrupted_audits(self) -> None:
         if not self.audit_jobs_dir.exists():
@@ -381,6 +386,45 @@ class StateStore:
     def load_current(self) -> dict[str, Any]:
         return read_json(self.current_path, {})
 
+    def read_runtime_bundle(self, identifier: str = "latest") -> bytes:
+        with self._publication_lock:
+            current = self.load_current()
+            descriptors = [value for key in ("runtime_bundle", "previous_runtime_bundle")
+                           if isinstance(value := current.get(key), dict)]
+            if identifier == "latest":
+                descriptor = current.get("runtime_bundle")
+            else:
+                if not valid_bundle_id(identifier):
+                    raise ValueError("invalid runtime bundle identifier")
+                descriptor = next((item for item in descriptors if item.get("bundle_id") == identifier), None)
+            if not isinstance(descriptor, dict):
+                raise FileNotFoundError("runtime bundle unavailable")
+            revision = str(descriptor.get("bundle_id") or "")
+            if not valid_bundle_id(revision):
+                raise ValueError("invalid runtime bundle descriptor")
+            with (self.runtime_bundles_dir / f"{revision}.json").open("rb") as stream:
+                body = stream.read(MAX_BUNDLE_BYTES + 1)
+            if len(body) > MAX_BUNDLE_BYTES or byte_digest(body) != descriptor.get("sha256"):
+                raise ValueError("runtime bundle integrity failure")
+            return body
+
+    def _prune_runtime_bundles(self) -> None:
+        if not self.runtime_bundles_dir.exists():
+            return
+        current = self.load_current()
+        retained = {str(value.get("bundle_id")) for key in ("runtime_bundle", "previous_runtime_bundle")
+                    if isinstance(value := current.get(key), dict)}
+        for path in self.runtime_bundles_dir.glob("*.json"):
+            if valid_bundle_id(path.stem) and path.stem not in retained:
+                path.unlink(missing_ok=True)
+        _fsync_directory(self.runtime_bundles_dir)
+
+    def _try_prune_runtime_bundles(self) -> None:
+        try:
+            self._prune_runtime_bundles()
+        except OSError as error:
+            LOGGER.warning("private runtime retention: %s", safe_error_text(error, "publishing"))
+
     def publish(
         self,
         current: dict[str, Any],
@@ -388,6 +432,24 @@ class StateStore:
         assessments: list[NodeAssessment],
         slot_changes: list[dict[str, str]],
         generated_at: datetime,
+        *,
+        inventory_payload: bytes | None = None,
+    ) -> None:
+        # Readers finish copying a selected private generation before GC can remove it.
+        with self._publication_lock:
+            try:
+                self._publish(current, state, assessments, slot_changes, generated_at, inventory_payload)
+            finally:
+                self._try_prune_runtime_bundles()
+
+    def _publish(
+        self,
+        current: dict[str, Any],
+        state: dict[str, Any],
+        assessments: list[NodeAssessment],
+        slot_changes: list[dict[str, str]],
+        generated_at: datetime,
+        inventory_payload: bytes | None,
     ) -> None:
         current.update(sanitize_error_fields(current))
         state.update(sanitize_error_fields(state))
@@ -402,6 +464,21 @@ class StateStore:
             revision = f"s-{stamp}-{uuid.uuid4().hex[:12]}"
         current["state_revision"] = revision
         state["state_revision"] = revision
+        previous_current = self.load_current()
+        current["previous_runtime_bundle"] = (previous_current.get("runtime_bundle")
+                                              or previous_current.get("previous_runtime_bundle"))
+        current["runtime_bundle"] = None
+        if inventory_payload is not None and current.get("runtime_target_status") == "ready":
+            bundle = build_runtime_bundle(inventory_payload, current["port_mapping"], revision, self.config)
+            content = json.dumps(bundle, ensure_ascii=False, separators=(",", ":"))
+            encoded = content.encode("utf-8")
+            if len(encoded) > MAX_BUNDLE_BYTES:
+                raise ValueError("runtime bundle exceeds size limit")
+            self.runtime_bundles_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.runtime_bundles_dir.chmod(0o700)
+            _fsync_directory(self.config.data_dir)
+            write_text_exclusive(self.runtime_bundles_dir / f"{revision}.json", content)
+            current["runtime_bundle"] = {"bundle_id": revision, "sha256": byte_digest(encoded)}
         report_json = build_report_json(
             current,
             assessments,

@@ -14,7 +14,15 @@ This anonymous endpoint projects the map in committed current state. Its schema 
 
 Every input occurrence has an entry ID. Each nonempty binding names region, port, connection key, entry ID and stable slot or dynamic index. Empty stable slots are explicit null bindings with no listener or TXT line. Dynamic ports start at base+3 regardless of holes; other has no stable slots and spans 64200-65535. Python's `port_mapping.py` is the sole allocator. Consumers validate and render, never select replacements or compact slots.
 
-The mapping hash excludes timestamps and scores. The inventory fingerprint preserves duplicate multiplicity but ignores source ordering and YAML formatting. A renamed, new or rotated entry requires a newly coherent map; the fixed consumer retains its last verified configuration until the next successful scan. Ordinary consumers still retain all new/unknown input entries.
+The mapping hash excludes timestamps and scores. The inventory fingerprint preserves duplicate multiplicity but ignores source ordering and YAML formatting. The fixed consumer gets this map together with its exact scan input from the private runtime bundle, never from a second live Sub-Store download. Remote endpoints may still expire between scans; snapshot consistency is not proof of ongoing remote reachability. Ordinary consumers still retain all new/unknown input entries.
+
+## Private runtime bundles
+
+`GET /api/v1/runtime-bundles/latest` returns a single schema-1 JSON response containing `bundle_id`, `inventory_encoding=base64`, the original inventory bytes, `inventory_sha256` and `mapping`. `/api/v1/runtime-bundles/<bundle_id>` reads a retained committed generation. `/version` advertises `runtime_bundle_schema_version=1`. The unique state revision identifies a bundle even when two scans have the same mapping hash.
+
+Every request requires the existing nonempty `http.api_token` as a Bearer header, including loopback requests. This reuses the admin API credential, not a new read-only role. Responses are `no-store`. Missing/retired generations return 404, damaged/unreadable bundles return a safe 503, and unauthorized requests return 401. A pre-upgrade state has no bundle until a successful new maintenance scan; starting the new image does not invent input or evidence.
+
+Private files live under the existing `data_dir/runtime-bundles` (directory 0700, files 0600), outside reports and public projections. Treat the data backup as credential-bearing. The exact input is limited to 16 MiB before scanning and the encoded bundle to 32 MiB. Files are exclusive, synced before the current commit, and checked against a committed byte digest on read. Only current and previous committed bundles are retained; uncommitted files are never served. Publication, private reads and cleanup share a lock. Cleanup failures are logged safely without blocking startup or turning a successful publication into a failed scan.
 
 ## Publication, snapshots, and reports
 
@@ -36,13 +44,15 @@ Exact keys win; connection rotation may inherit a slot only through mutually uni
 
 Use a complete `inventory` collection without the health operator. Put `health-ranking-operator.js` last in the otherwise complete `healthy` chain, with `rankingUrl` pointing to `/current.json`; retain `target=ClashMeta&noCache=true`. A stable connection contributes one representative before the dynamic tail; additional aliases cannot displace other stable representatives. Failure preserves the full original input.
 
-The ClashMeta producer can remove underscore metadata. Adding `_nh_slot` to an ordinary proxy object is therefore not a guaranteed fixed-port transport. OpenWrt's D2 consumer reads the explicit map and matching inventory independently.
+The ClashMeta producer can remove underscore metadata. Adding `_nh_slot` to an ordinary proxy object is therefore not a guaranteed fixed-port transport. OpenWrt consumes the NAS private snapshot containing the exact inventory used for its map. Sub-Store cache-busting parameters do not provide historical snapshots.
 
 ## OpenWrt poller
 
 Install the matching shell entry points, `runtime-controller.mjs`, `convert-ranking.mjs`, strict converter, Node and js-yaml. A working kernel `flock` implementation and local process proof (ubus/procd, or an explicit PID file with the same core and -f path) are required. Missing dependencies fail before configuration/service changes; the two entry points share one inherited-descriptor lock released on process exit, including SIGKILL.
 
-The poller performs local pending recovery and self-healing before upstream backoff or network downloads. It downloads map, inventory, map and verifies namespace/instance, schema, purpose, approved plan, age, exact fingerprint and binding completeness. URL cache-busting is not treated as a content/version lock. Do not keep the old sequential updater running in parallel.
+The poller performs local pending recovery and self-healing before upstream backoff or network downloads. Set `RUNTIME_BUNDLE_URL` and `RUNTIME_TOKEN_FILE`; the latter must be a regular 0600 file owned by the runtime user (root in the documented installation), containing the NAS API token. Download uses a private header file, ignores curl startup configuration, rejects redirects and accepts only HTTP 200. Use HTTPS or a trusted restricted LAN; Bearer authentication alone does not encrypt HTTP. URLs cannot include credentials, queries or fragments.
+
+The received inventory byte hash, schema, purpose, approved namespace/instance/plan, age, exact fingerprint and binding completeness are all checked before applying. No failure falls back to a live `SOURCE_URL` or `RANKING_URL`; those legacy values are ignored by this poller. Interrupted private downloads are removed on the next poll after local recovery. Do not keep the old sequential updater running in parallel.
 
 Source/profile mismatch is visible via a safe `CACHE_DIR/last-error.json` code and phase. It does not authorize an unreviewed profile, source switch or a weaker fallback. Profile/DNS/IPv6/LAN/core choices remain those reviewed for the actual installation.
 

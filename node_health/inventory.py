@@ -24,12 +24,13 @@ from .models import Node, NodeAlias
 
 
 Download = Callable[[str, dict[str, str], float], bytes]
+MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 
 
 def download_bytes(url: str, headers: dict[str, str], timeout: float) -> bytes:
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+        return response.read(MAX_INVENTORY_BYTES + 1)
 
 
 def classify_region(name: str, patterns: dict[str, list[str]]) -> str:
@@ -126,12 +127,21 @@ def inventory_digest(nodes: list[Node]) -> str:
 
 
 def fetch_inventory(config: AppConfig, downloader: Download = download_bytes) -> tuple[list[Node], str]:
+    nodes, source_digest, _ = fetch_inventory_snapshot(config, downloader)
+    return nodes, source_digest
+
+
+def fetch_inventory_snapshot(
+    config: AppConfig, downloader: Download = download_bytes
+) -> tuple[list[Node], str, bytes]:
     payload = downloader(
         config.inventory.url,
         config.inventory.headers,
         config.inventory.timeout_seconds,
     )
+    if not isinstance(payload, bytes) or not 0 < len(payload) <= MAX_INVENTORY_BYTES:
+        raise ValueError("inventory exceeds size limit or is empty")
     nodes = parse_clash_inventory(payload, config.region_patterns)
     if not nodes:
         raise ValueError("inventory contains no usable proxies")
-    return nodes, inventory_digest(nodes)
+    return nodes, inventory_digest(nodes), payload
