@@ -12,7 +12,7 @@ from .models import Evaluation, FullResult, Node, QuickResult, SiteProbeResult
 
 
 GRADE_ORDER = {"A": 0, "B": 1, "C": 2}
-EVIDENCE_POLICY_VERSION = 1
+EVIDENCE_POLICY_VERSION = 2
 PROBE_CONTRACT_VERSION = 1
 RISK_EVIDENCE_VERSION = 1
 
@@ -135,11 +135,25 @@ def normalize_risk_value(value: Any) -> str:
 def valid_risk_sources(full: FullResult | None) -> dict[str, str]:
     if full is None or not full.completed or full.risk_evidence_version != RISK_EVIDENCE_VERSION:
         return {}
-    return {
-        str(name): normalized
-        for name, value in full.risk_sources.items()
-        if (normalized := normalize_risk_value(value))
-    }
+    return _independent_risks(full.risk_sources)
+
+
+def _provider_identity(name: str) -> str:
+    normalized = str(name).strip().lower()
+    return {"ipinfo-privacy": "ipinfo", "ipapi-flags": "ipapi"}.get(normalized, normalized)
+
+
+def _independent_risks(sources: dict[str, str]) -> dict[str, str]:
+    selected: dict[str, tuple[str, str]] = {}
+    for name, value in sources.items():
+        normalized = normalize_risk_value(value)
+        if not normalized:
+            continue
+        provider = _provider_identity(name)
+        previous = selected.get(provider)
+        if previous is None or _risk_severity(normalized) > _risk_severity(previous[1]):
+            selected[provider] = (str(name), normalized)
+    return dict(selected.values())
 
 
 def risk_sources_conflict(full: FullResult | None) -> bool:
@@ -306,7 +320,7 @@ def full_has_confirmed_redline(
     if sum(1 for value in valid_risk_sources(full).values() if _is_high_risk(value)) >= 2:
         return True
     factors = _factor_source_counts(full)
-    return any(factors[name] >= 3 for name in ("proxy", "vpn", "server", "abuser"))
+    return factors["abuser"] >= 3
 
 
 def _full_country_majority(details: dict[str, Any]) -> str:
@@ -350,7 +364,7 @@ def _factor_source_counts(full: FullResult | None) -> dict[str, int]:
                     None,
                 )
                 if isinstance(value, dict):
-                    counts[name] += sum(1 for item in value.values() if _as_bool(item))
+                    counts[name] += len({_provider_identity(source) for source, item in value.items() if _as_bool(item)})
                 elif isinstance(value, list):
                     counts[name] += sum(1 for item in value if _as_bool(item))
                 elif _as_bool(value):
@@ -373,7 +387,7 @@ def _claude_factor_source_counts(quick: QuickResult) -> dict[str, int]:
         if normalized not in counts:
             continue
         if isinstance(sources, dict):
-            counts[normalized] += sum(1 for item in sources.values() if _as_bool(item))
+            counts[normalized] += len({_provider_identity(source) for source, item in sources.items() if _as_bool(item)})
         elif isinstance(sources, list):
             counts[normalized] += sum(1 for item in sources if _as_bool(item))
         elif _as_bool(sources):
@@ -434,10 +448,7 @@ def _route_risk_profile(
         factors["tor"]
         or len(high_sources) >= 2
         or dnsbl_count >= dnsbl_threshold
-        or any(
-            factors[name] >= 3
-            for name in ("proxy", "vpn", "server", "abuser")
-        )
+        or factors["abuser"] >= 3
     )
     clean = bool(
         len(risks) >= minimum_sources
@@ -475,12 +486,8 @@ def _risk_profile(
         and quick.claude.exit_ip != quick.exit_ip
     )
     if split_claude_route:
-        claude_risks = {
-            str(name): normalized
-            for name, value in quick.claude.risk_sources.items()
-            if quick.claude.risk_evidence_version == RISK_EVIDENCE_VERSION
-            if (normalized := normalize_risk_value(value))
-        }
+        claude_risks = (_independent_risks(quick.claude.risk_sources)
+                        if quick.claude.risk_evidence_version == RISK_EVIDENCE_VERSION else {})
         routes["claude"] = _route_risk_profile(
             claude_risks,
             _claude_factor_source_counts(quick),

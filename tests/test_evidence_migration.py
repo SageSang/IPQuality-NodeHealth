@@ -58,7 +58,7 @@ def test_legacy_migration_is_pure_idempotent_and_preserves_placement():
     for key in ("schema_version","version","state_revision","stable_slots","frozen_order","ranked_order",
                 "slot_changed_at","promotion_cooldown_at","availability_baselines"):
         assert migrated[key] == previous[key]
-    assert migrated["evidence_policy_version"] == migrated["minimum_evidence_reader_version"] == 1
+    assert migrated["evidence_policy_version"] == migrated["minimum_evidence_reader_version"] == 2
     assert migrate_evidence_state(migrated, PolicyConfig(), NOW + timedelta(days=1)) == migrated
     assert migrate_evidence_state(previous, PolicyConfig(), NOW + timedelta(days=1)) == migrated
 
@@ -78,7 +78,7 @@ def test_raw_risk_recomputed_but_legacy_ai_and_qualification_not_revalidated():
     assert node["last_claude"]["factors"] == {}
     assert node["last_claude"]["intelligence_complete"] is False
     assert node["last_claude"]["risk_evidence_version"] == 0
-    assert node["qualification_version"] == 1
+    assert node["qualification_version"] == 2
     assert node["healthy_streak_days"] == node["consecutive_full_passes"] == 0
     assert node["daily_quality_history"] == []
     assert node["unavailable_grace_active"] is False

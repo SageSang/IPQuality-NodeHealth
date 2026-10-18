@@ -31,6 +31,7 @@ from .config import AppConfig
 from .errors import safe_error_text
 from .models import ClaudeResult, FullResult, Node, QuickResult, SiteProbeResult
 from .policy import PROBE_CONTRACT_VERSION, RISK_EVIDENCE_VERSION
+from .risk_intelligence import IPINFO_FIELDS, IPAPI_FIELDS, flags_risk, ipinfo_factors, ipapi_factors
 
 BUNDLED_DNSBL_FILE = "/app/ref/dnsbl.list"
 
@@ -247,6 +248,7 @@ class CurlQuickProbe:
         self._provider_cache: dict[str, tuple[float, str, float]] = {}
         self._provider_backoff: dict[tuple[str, ...], tuple[float, str]] = {}
         self._provider_counts: dict[str, Counter] = {}
+        self._provider_observations: dict[str, dict[str, Any]] = {}
         self._provider_budget: dict[str, int] = {}
         self._provider_failures: dict[str, list[tuple[float, int, str]]] = {}
         self._diagnostic_retries: Counter[str] = Counter()
@@ -282,13 +284,21 @@ class CurlQuickProbe:
 
     def diagnostics(self) -> dict[str, Any]:
         with self._provider_lock:
-            return {source: dict(counts) for source, counts in self._provider_counts.items()}
+            return {source: {**dict(counts), **self._provider_observations.get(source, {})}
+                    for source, counts in self._provider_counts.items()}
 
     def _provider_get(
         self, port: int, url: str, timeout_seconds: float | None = None,
         *, resource_kind: str = "geo", target_ip: str = "",
     ) -> tuple[str, float]:
         source = urllib.parse.urlsplit(url).hostname or "unknown"
+        if not url.strip():
+            with self._provider_lock:
+                self._provider_counts.setdefault(resource_kind, Counter())["missing_config"] += 1
+                self._provider_observations[resource_kind] = {
+                    "last_status": "provider_missing_config", "last_checked_at": utc_now(),
+                }
+            raise ProbeFailure("provider_missing_config")
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         credentials = {name: query[name] for name in ("key", "token", "api_key") if name in query}
         auth = hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
@@ -303,6 +313,8 @@ class CurlQuickProbe:
             now = time.monotonic()
             with self._provider_lock:
                 counts = self._provider_counts.setdefault(source, Counter())
+                observation = self._provider_observations.setdefault(source, {})
+                observation["credential_configured"] = authenticated
                 cached = self._provider_cache.get(cache_key)
                 if cached and cached[0] > now:
                     counts["cache_hits"] += 1
@@ -329,7 +341,8 @@ class CurlQuickProbe:
                 if response.transport_code or response.error_code or not 200 <= response.http_status < 300:
                     code = (
                         "provider_rate_limited" if response.http_status == 429
-                        else "provider_denied" if response.http_status in {401, 403}
+                        else "provider_invalid_auth" if response.http_status == 401
+                        else "provider_forbidden" if response.http_status == 403
                         else "probe_timeout" if response.transport_code == 28
                         else "provider_http_error" if response.http_status
                         else "probe_failed"
@@ -347,13 +360,16 @@ class CurlQuickProbe:
                     now = time.monotonic()
                     status = response.http_status if response else 0
                     retry_after = response.retry_after if response else None
-                    account_error = False
+                    observation.update(last_status=code, last_http_status=status, last_checked_at=utc_now())
+                    # A 403 alone may be route-specific. A 401 or explicit
+                    # credential/quota error can stop the same account globally.
+                    account_error = bool(authenticated and status == 401)
                     if authenticated and response:
                         try:
                             error_payload = json.loads(response.body)
                             marker = error_payload.get("error", {}) if isinstance(error_payload, dict) else {}
                             marker = marker.get("code", "") if isinstance(marker, dict) else marker
-                            account_error = str(marker).lower() in {
+                            account_error = account_error or str(marker).lower() in {
                                 "invalid_api_key", "invalid_token", "invalid_authentication",
                                 "quota_exceeded", "insufficient_quota", "account_limit_exceeded",
                             }
@@ -374,7 +390,19 @@ class CurlQuickProbe:
                 # Bound memory even for repeated independent audit jobs.
                 if len(self._provider_cache) >= 4096:
                     self._provider_cache.pop(next(iter(self._provider_cache)))
-                if _provider_payload_cacheable(payload, resource_kind):
+                complete = _provider_payload_cacheable(payload, resource_kind)
+                observation.update(last_status="complete" if complete else "partial",
+                                   last_http_status=response.http_status, last_checked_at=utc_now())
+                if resource_kind in {"ipinfo-risk", "ipapi-risk"}:
+                    fields = ipinfo_factors(payload) if resource_kind == "ipinfo-risk" else ipapi_factors(payload)
+                    required = IPINFO_FIELDS if resource_kind == "ipinfo-risk" else IPAPI_FIELDS
+                    observation["capabilities"] = {
+                        "resource_kind": resource_kind, "risk_usable": complete,
+                        "present_flags": sorted(fields), "missing_flags": sorted(required - fields.keys()),
+                    }
+                if complete:
+                    observation["last_success_at"] = utc_now()
+                    counts["complete_responses"] += 1
                     self._provider_cache[cache_key] = (time.monotonic() + 3600, body, elapsed)
                 else:
                     counts["partial_responses"] += 1
@@ -525,54 +553,22 @@ class CurlQuickProbe:
             asn_value = data.get("as") or data.get("asn")
             asn = asn_value if isinstance(asn_value, dict) else {}
             company = data.get("company") if isinstance(data.get("company"), dict) else {}
-            privacy_value = data.get("privacy") or data.get("anonymous")
-            privacy = privacy_value if isinstance(privacy_value, dict) else {}
             payload["asn"] = str(
                 asn.get("asn")
                 or (asn_value if isinstance(asn_value, str) else "")
                 or ""
             )
             payload["organization"] = str(asn.get("name") or company.get("name") or "")
-            ipinfo_factors: dict[str, bool] = {}
-            for factor, keys in {
-                "proxy": ("proxy", "is_proxy", "relay", "is_relay"),
-                "vpn": ("vpn", "is_vpn"),
-                "tor": ("tor", "is_tor"),
-            }.items():
-                present, value = _first_present(privacy, keys)
-                values = [_risk_bool(privacy[key]) for key in keys if key in privacy]
-                if any(value is True for value in values):
-                    ipinfo_factors[factor] = True
-                elif values and all(value is False for value in values):
-                    ipinfo_factors[factor] = False
-            anonymous_present, anonymous = _first_present(data, ("is_anonymous",))
-            if anonymous_present and _risk_bool(anonymous) is True and not any(
-                ipinfo_factors.get(name) for name in ("proxy", "vpn", "tor")
-            ):
-                ipinfo_factors["proxy"] = True
-            hosting_present, hosting = _first_present(data, ("is_hosting",))
-            privacy_hosting_present, privacy_hosting = _first_present(
-                privacy, ("hosting", "is_hosting")
-            )
-            hosting_values = [_risk_bool(value) for present, value in ((hosting_present, hosting), (privacy_hosting_present, privacy_hosting)) if present]
-            usage_type = str(asn.get("type") or "").strip().lower()
-            if any(value is True for value in hosting_values) or usage_type == "hosting":
-                ipinfo_factors["server"] = True
-            elif hosting_values and all(value is False for value in hosting_values):
-                ipinfo_factors["server"] = False
-            elif not hosting_values and usage_type in {"isp", "business", "education", "government", "banking"}:
-                ipinfo_factors["server"] = False
-            for factor, active in ipinfo_factors.items():
+            provider_factors = ipinfo_factors(response)
+            for factor, active in provider_factors.items():
                 payload["factors"].setdefault(factor, {})["IPinfo"] = active
-            ipinfo_core = {"proxy", "vpn", "tor", "server"}
-            if any(ipinfo_factors.values()) or ipinfo_core <= ipinfo_factors.keys():
-                payload["risk_sources"]["IPinfo-privacy"] = (
-                    "high" if any(ipinfo_factors.values()) else "low"
-                )
+            risk = flags_risk(provider_factors, IPINFO_FIELDS)
+            if risk:
+                payload["risk_sources"]["IPinfo-privacy"] = risk
                 risk_providers.add("IPinfo")
             usage = str(asn.get("type") or "").strip().lower()
             company_type = str(company.get("type") or "").strip().lower()
-            if usage == "isp" and company_type != "hosting" and not ipinfo_factors.get("server", False):
+            if usage == "isp" and company_type != "hosting" and not provider_factors.get("server", False):
                 payload["residential"] = "probable"
             geo = data.get("geo") if isinstance(data.get("geo"), dict) else {}
             payload["country"] = str(
@@ -611,36 +607,23 @@ class CurlQuickProbe:
                 or response.get("asn_org")
                 or ""
             )
-            ipapi_factors: dict[str, bool] = {}
-            for factor, field_name in {
-                "proxy": "is_proxy",
-                "vpn": "is_vpn",
-                "tor": "is_tor",
-                "server": "is_datacenter",
-                "abuser": "is_abuser",
-                "robot": "is_crawler",
-            }.items():
-                value = _risk_bool(response.get(field_name))
-                if value is not None:
-                    ipapi_factors[factor] = value
-            for factor, active in ipapi_factors.items():
+            provider_factors = ipapi_factors(response)
+            for factor, active in provider_factors.items():
                 payload["factors"].setdefault(factor, {})["ipapi"] = active
             score = _ipapi_score(company.get("abuser_score"))
+            risk = flags_risk(provider_factors, IPAPI_FIELDS)
             if score is not None:
                 payload["risk_sources"]["ipapi"] = score
-            if "ipapi" not in payload["risk_sources"]:
-                if any(ipapi_factors.values()) or {"proxy", "vpn", "tor", "server", "abuser"} <= ipapi_factors.keys():
-                    payload["risk_sources"]["ipapi-flags"] = (
-                        "high" if any(ipapi_factors.values()) else "low"
-                    )
-            if "ipapi" in payload["risk_sources"] or "ipapi-flags" in payload["risk_sources"]:
+            elif risk:
+                payload["risk_sources"]["ipapi-flags"] = risk
+            if score is not None or risk:
                 risk_providers.add("ipapi")
             usage = str(asn.get("type") or "").strip().lower()
             company_type = str(company.get("type") or "").strip().lower()
             if (
                 usage == "isp"
                 and company_type != "hosting"
-                and not ipapi_factors.get("server", False)
+                and not provider_factors.get("server", False)
                 and payload["residential"] == "probable"
             ):
                 payload["residential"] = "confirmed"
@@ -653,7 +636,7 @@ class CurlQuickProbe:
         except Exception as error:
             payload["errors"].append(safe_error_text(None, "quick-scan", code=error.code if isinstance(error, ProbeFailure) else "provider_invalid_response"))
 
-        payload["complete"] = risk_providers == {"IPinfo", "ipapi"}
+        payload["complete"] = len(risk_providers) >= self.config.policy.claude_min_valid_risk_sources
         return payload
 
     def _check_claude(self, port: int, generic_exit_ip: str) -> ClaudeResult:
@@ -693,6 +676,7 @@ class CurlQuickProbe:
             factors=dict(intelligence.get("factors") or {}),
             residential=str(intelligence.get("residential") or "unknown"),
             intelligence_complete=bool(intelligence.get("complete")),
+            intelligence_checked_at=checked_at if intelligence else "",
             checked_at=checked_at,
             error="; ".join(errors)[:1000],
             site_probe=site,
@@ -787,10 +771,6 @@ def _as_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _risk_bool(value: Any) -> bool | None:
-    return value if isinstance(value, bool) else None
-
-
 def _ipapi_score(value: Any) -> str | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -808,23 +788,10 @@ def _provider_payload_cacheable(payload: dict[str, Any], resource_kind: str) -> 
         return bool(re.fullmatch(r"[A-Z]{2}", str(payload.get("country_code") or payload.get("country") or "").upper()))
     if resource_kind == "ipapi-risk":
         company = payload.get("company") if isinstance(payload.get("company"), dict) else {}
-        fields = ("is_proxy", "is_vpn", "is_tor", "is_datacenter", "is_abuser")
-        values = [_risk_bool(payload.get(key)) for key in fields]
-        return _ipapi_score(company.get("abuser_score")) is not None or any(value is True for value in values) or all(value is False for value in values)
+        return _ipapi_score(company.get("abuser_score")) is not None or bool(flags_risk(ipapi_factors(payload), IPAPI_FIELDS))
     if resource_kind == "ipinfo-risk":
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        privacy = data.get("privacy") or data.get("anonymous")
-        privacy = privacy if isinstance(privacy, dict) else {}
-        values = [_risk_bool(privacy.get(key)) for key in ("proxy", "vpn", "tor", "hosting")]
-        return any(value is True for value in values) or all(value is False for value in values)
+        return bool(flags_risk(ipinfo_factors(payload), IPINFO_FIELDS))
     return False
-
-
-def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> tuple[bool, Any]:
-    for key in keys:
-        if key in mapping:
-            return True, mapping.get(key)
-    return False, None
 
 
 def _provider_url(

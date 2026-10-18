@@ -130,6 +130,31 @@ def _migration_metadata(previous: dict[str, Any], policy: PolicyConfig) -> dict[
             "committed_at": "", "expires_at": "", "original_slots": original_slots}
 
 
+def _reset_detection(prior: dict[str, Any]) -> None:
+    """Keep identity/placement only; v2 starts a new detection baseline."""
+    for field in ("legacy_evidence", "last_full_recomputed_from_legacy", "last_frozen_observation"):
+        prior.pop(field, None)
+    prior.update({
+        "qualification_version": EVIDENCE_POLICY_VERSION,
+        "healthy_streak_days": 0, "last_healthy_day": "",
+        "unavailable_grace_active": False, "daily_quality_history": [],
+        "consecutive_full_passes": 0, "last_full_pass_day": "",
+        "consecutive_unavailable_runs": 0, "consecutive_unavailable_valid_days": 0,
+        "last_unavailable_day": "", "last_full": None, "last_claude": None,
+        "last_exit_ip": "", "last_country": "", "last_quick_checked_at": "",
+        "transient_recovery": False,
+        "last_full_checked_at": "", "last_full_exit_ip": "",
+        "last_full_attempt_at": "", "last_full_attempt_error": "",
+        "last_score": None, "score_day": "", "previous_day_score": None,
+        "previous_score_day": "", "score_components": {}, "score_evidence": {},
+        "ai_grade": "B", "risk_grade": "B", "overall_grade": "B",
+        "residential_grade": "unknown", "last_risk_source_count": 0,
+        "risk_data_conflict": False, "last_decision": "pending-revalidation",
+        "current_status": "pending-revalidation", "full_audit_pending": True,
+        "evidence_refresh_pending": ["chatgpt", "claude-risk", "generic-risk"],
+    })
+
+
 def migrate_evidence_state(
     previous: dict[str, Any], policy: PolicyConfig, now: datetime
 ) -> dict[str, Any]:
@@ -141,11 +166,17 @@ def migrate_evidence_state(
     if not isinstance(nodes, dict):
         nodes = {}
         state["nodes"] = nodes
-    first_migration = previous.get("evidence_policy_version", 0) < EVIDENCE_POLICY_VERSION
+    first_migration = previous.get("evidence_policy_version", 0) < 1
     if first_migration and nodes and "evidence_migration" not in state:
         state["evidence_migration"] = _migration_metadata(previous, policy)
+    if previous.get("evidence_policy_version") == 1:
+        state["rebaseline_required"] = True
+        state.pop("evidence_migration", None)
     for key, prior in nodes.items():
         if not isinstance(prior, dict) or prior.get("qualification_version") == EVIDENCE_POLICY_VERSION:
+            continue
+        if prior.get("qualification_version") == 1:
+            _reset_detection(prior)
             continue
         prior.setdefault("legacy_evidence", {
             "source_state_revision": str(previous.get("state_revision") or ""),

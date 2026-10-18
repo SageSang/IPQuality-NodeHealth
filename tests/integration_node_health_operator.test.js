@@ -622,6 +622,82 @@ function testOperatorDoesNotInventStableSlots() {
   assert.strictEqual(ordering.get(keys[2]), 2);
 }
 
+async function testSubscriptionPinOverlay() {
+  const proxies = ['A', 'B', 'C', 'D', 'E', 'F'].map(name => proxy(`US ${name}`, `${name}.example`));
+  const keys = proxies.map(item => operatorModule.nodeKey(normalizeClashMetaProxy(item)));
+  const state = {
+    schema_version: 2, version: 'pin-overlay', region_order: ['united-states'],
+    regions: {'united-states': {stable_slots: {1: keys[0], 2: keys[1], 3: keys[2]},
+      ranked: keys.slice(3), rejected: {[keys[4]]: 'unavailable'}}},
+    identity_index: Object.fromEntries(proxies.map((item, i) => [keys[i], operatorModule.selectedIdentity(item)])),
+  };
+  const input = [...proxies].reverse();
+  const run = (list = input) => operatorModule.operator(list, 'ClashMeta', {
+    options: {rankingUrl: 'http://node-health.invalid/current.json'}, ProxyUtils: proxyUtilsFor(state),
+  });
+  const baseline = await run();
+  assert.deepStrictEqual(baseline, proxies);
+  for (const [pins, expected] of [
+    [[4], [4, 0, 1, 2, 3, 5]], [[1], [1, 0, 2, 3, 4, 5]],
+    [[4, 1], [4, 1, 0, 2, 3, 5]], [[4, 1, 5], [4, 1, 5, 0, 2, 3]], [[], [0, 1, 2, 3, 4, 5]],
+  ]) {
+    state.subscription_preferences = {schema_version: 1, status: 'ready', revision: 1,
+      pinned_nodes: pins.map(i => keys[i])};
+    const before = JSON.stringify(state);
+    const output = await run();
+    assert.deepStrictEqual(output, expected.map(i => proxies[i]));
+    assert.strictEqual(JSON.stringify(state), before);
+    assert.deepStrictEqual(output.filter(item => !pins.includes(proxies.indexOf(item))),
+      baseline.filter(item => !pins.includes(proxies.indexOf(item))));
+  }
+  // No duplicate or invented entry when the pinned node isn't in this client's input.
+  state.subscription_preferences.pinned_nodes = [keys[4], keys[1]];
+  assert.deepStrictEqual(await run(input.filter(item => item !== proxies[4])),
+    [proxies[1], proxies[0], proxies[2], proxies[3], proxies[5]]);
+  // A malformed optional preference keeps the automatic ranking, not reversed input.
+  for (const preferences of [{schema_version: 99}, {schema_version: 1, status: 'unavailable'},
+    {schema_version: 1, status: 'ready', revision: 1, pinned_nodes: [keys[0], keys[0]]}]) {
+    state.subscription_preferences = preferences;
+    assert.deepStrictEqual(await run(), baseline);
+  }
+  delete state.subscription_preferences;
+  assert.deepStrictEqual(await run(), baseline);
+
+  // Aliases and repeated occurrences are preserved; the stable representative wins.
+  const stableAlias = {...proxies[1], name: 'US B alias'};
+  const dynamicAlias = {...proxies[4], name: 'US E alias'};
+  const duplicate = {...proxies[4]};
+  const all = [dynamicAlias, duplicate, stableAlias, ...input];
+  const aliasesBaseline = await run(all);
+  for (const pinned of [[keys[1]], [keys[4]], [keys[4], keys[1]]]) {
+    state.subscription_preferences = {schema_version: 1, status: 'ready', revision: 2, pinned_nodes: pinned};
+    const result = await run(all);
+    const moved = result.slice(0, pinned.length);
+    assert.strictEqual(result.length, all.length);
+    for (const item of all) assert.strictEqual(result.filter(entry => entry === item).length, 1);
+    assert.deepStrictEqual(result.slice(pinned.length), aliasesBaseline.filter(item => !moved.includes(item)));
+    if (pinned.includes(keys[1])) assert.strictEqual(result[pinned.indexOf(keys[1])], proxies[1]);
+  }
+}
+
+async function testPinsAcrossRegionsRotationAndFrozenOther() {
+  const hk = proxy('Hong Kong A', 'hk.example');
+  const old = proxy('Other B', 'old.example');
+  const rotated = {...old, server: 'new.example'};
+  const keys = [hk, old].map(item => operatorModule.nodeKey(normalizeClashMetaProxy(item)));
+  const state = {schema_version: 2, version: 'global-pin', region_order: ['hong-kong', 'other'],
+    regions: {'hong-kong': {stable_slots: {1: keys[0]}, ranked: [], rejected: {}},
+      other: {stable_slots: {}, ranked: [keys[1]], rejected: {}}},
+    identity_index: {[keys[0]]: operatorModule.selectedIdentity(hk), [keys[1]]: operatorModule.selectedIdentity(old)},
+    subscription_preferences: {schema_version: 1, status: 'ready', revision: 3, pinned_nodes: [keys[1]]}};
+  const before = JSON.stringify(state);
+  const result = await operatorModule.operator([hk, rotated], 'ClashMeta', {
+    options: {rankingUrl: 'http://node-health.invalid/current.json'}, ProxyUtils: proxyUtilsFor(state),
+  });
+  assert.deepStrictEqual(result, [rotated, hk]);
+  assert.strictEqual(JSON.stringify(state), before);
+}
+
 (async () => {
   await testIdentityVector();
   await testOperatorOrderingAndCompleteFallback();
@@ -636,6 +712,8 @@ function testOperatorDoesNotInventStableSlots() {
   await testOperatorPreservesAll250InputsAndUnknownTailOrder();
   testFixedConsumerRejectsLegacyRankingAndMissingApprovals();
   testOperatorDoesNotInventStableSlots();
+  await testSubscriptionPinOverlay();
+  await testPinsAcrossRegionsRotationAndFrozenOther();
   process.stdout.write('integration_node_health_operator: ok\n');
 })().catch((error) => {
   console.error(error);

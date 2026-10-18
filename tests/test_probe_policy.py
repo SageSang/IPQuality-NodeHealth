@@ -780,7 +780,7 @@ def test_crawler_only_is_a_small_penalty_but_not_a_risk_downgrade():
     assert evaluation.components["risk"] == 24
 
 
-def test_three_source_proxy_consensus_is_risk_c():
+def test_three_source_proxy_consensus_is_soft_risk_b():
     policy = PolicyConfig(expected_country={"united-states": "US"})
     full = full_result(
         completed=True,
@@ -791,9 +791,9 @@ def test_three_source_proxy_consensus_is_risk_c():
         },
     )
     evaluation = evaluate_node(node("a"), quick(), full, policy, 2)
-    assert evaluation.risk_grade == "C"
-    assert evaluation.redline
-    assert "risk-consensus-severe" in evaluation.reasons
+    assert evaluation.risk_grade == "B"
+    assert not evaluation.redline
+    assert "risk-consensus-severe" not in evaluation.reasons
 
 
 def test_claude_route_evidence_does_not_fill_generic_risk_coverage():

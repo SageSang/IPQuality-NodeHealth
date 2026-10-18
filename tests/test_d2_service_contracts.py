@@ -59,7 +59,7 @@ def test_migration_publishes_version_and_m1_once_without_rebuild(tmp_path):
     migration = state["evidence_migration"]
     assert migrated["mode"] == "maintenance"
     assert migrated["regions"]["united-states"]["stable_slots"] == before
-    assert state["evidence_policy_version"] == state["minimum_evidence_reader_version"] == 1
+    assert state["evidence_policy_version"] == state["minimum_evidence_reader_version"] == 2
     assert state["nodes"][key]["healthy_streak_days"] == 0
     assert state["nodes"][key]["unavailable_grace_active"] is True
     assert migration["original_slots"][0]["consumed"] is True
@@ -173,7 +173,7 @@ def test_one_of_three_never_builds_six_day_qualification(tmp_path):
         assert node["healthy_streak_days"] == 0
         assert node["unavailable_grace_active"] is False
         assert all(not row["evidence_valid"] for row in node["daily_quality_history"])
-        assert all(row["qualification_version"] == 1 for row in node["daily_quality_history"])
+        assert all(row["qualification_version"] == 2 for row in node["daily_quality_history"])
 
 
 def test_exact_key_rename_and_outage_share_effective_region(tmp_path):

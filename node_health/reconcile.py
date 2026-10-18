@@ -194,6 +194,7 @@ def reconcile_previous_state(
             "last_decision": "identity-rotated-pending",
             "current_status": "identity-rotated-pending",
             "identity_rotated_from": old_key,
+            "rotation_audit_pending": True,
         }
         events.append(
             {

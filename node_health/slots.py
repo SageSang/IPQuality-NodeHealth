@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections import Counter
+import math
 from datetime import date, datetime, timedelta, timezone
 
 from .config import PolicyConfig
@@ -181,6 +183,7 @@ def assign_all_regions(
     frozen_regions: dict[str, str] | None = None,
     previous_ranked_order: dict[str, list[str]] | None = None,
     previous_rejected: dict[str, dict[str, str]] | None = None,
+    *, preserve_placement: bool = False,
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, str]]]:
     grouped: dict[str, list[NodeAssessment]] = {}
     for assessment in assessments:
@@ -212,6 +215,7 @@ def assign_all_regions(
         region_items = grouped.get(region, [])
         region_slot_count = 0 if region == "other" else slot_count
         old = previous.get(region, {})
+        promotion_diagnostics = {"status": "not-applicable"}
         if region in frozen_regions:
             slots = {str(slot): str(key) for slot, key in old.items() if key}
             current_keys = {item.node.key for item in region_items}
@@ -227,6 +231,14 @@ def assign_all_regions(
             promotion_slots: set[str] = set()
         else:
             slots, ranked, rejected = assign_region_slots(mode, region_items, old, region_slot_count)
+            if preserve_placement and mode == "maintenance" and region_slot_count:
+                current_keys = {item.node.key for item in region_items}
+                slots = {slot: key for slot, key in old.items() if key in current_keys}
+                ranked = [key for key in previous_ranked_order.get(region, [])
+                          if key in current_keys and key not in slots.values()]
+                ranked.extend(item.node.key for item in region_items
+                              if item.node.key not in slots.values() and item.node.key not in ranked)
+                promotion_diagnostics["status"] = "detection-rebaseline"
             if mode == "maintenance" and region == "other":
                 current_keys = {item.node.key for item in region_items}
                 frozen: list[str] = []
@@ -251,18 +263,20 @@ def assign_all_regions(
                 for item in region_items if item.node.key in slots.values()
             )
             promotion_slots = set()
-            if mode == "maintenance" and region_slot_count and policy is not None and not required_slot_change and not grace_active:
+            if mode == "maintenance" and region_slot_count and policy is not None and not required_slot_change and not grace_active and not preserve_placement:
                 slots, promotion_slots = _apply_promotions(
                     slots,
                     region_items,
                     previous_promotion_cooldown_at.get(region, ""),
                     policy,
                     now,
+                    promotion_diagnostics,
                 )
                 assigned = set(slots.values())
                 ranked = [item.node.key for item in sorted(region_items, key=ranking_key) if item.node.key not in assigned]
 
         regions[region] = {
+            "promotion_diagnostics": promotion_diagnostics,
             "stable_slots": slots,
             "stable_status": {
                 slot: _stable_status(key, by_key.get(key), previous_nodes.get(key, {}))
@@ -357,9 +371,26 @@ def _promotion_margin_holds(candidate: NodeAssessment, incumbent: NodeAssessment
             incumbent_score = float(incumbent_history[day].get("score"))
         except (TypeError, ValueError):
             return False
+        if not math.isfinite(candidate_score) or not math.isfinite(incumbent_score):
+            return False
         if candidate_score < incumbent_score + margin:
             return False
     return True
+
+
+def _promotion_blockers(item: NodeAssessment, policy: PolicyConfig, *, candidate: bool = False) -> list[str]:
+    reasons = []
+    if not item.quick.available:
+        reasons.append("unavailable")
+    if not item.evidence_valid or not item.fresh_full_completed or not item.fresh_full_usable:
+        reasons.append("current-evidence-incomplete")
+    if type(item.qualification_version) is not int or item.qualification_version != EVIDENCE_POLICY_VERSION:
+        reasons.append("qualification-version")
+    if not sample_qualified(item.quick, policy):
+        reasons.append("insufficient-samples")
+    if candidate and item.healthy_streak_days < policy.promotion_min_healthy_days:
+        reasons.append("insufficient-healthy-days")
+    return reasons
 
 
 def _apply_promotions(
@@ -368,62 +399,74 @@ def _apply_promotions(
     promotion_cooldown_at: str,
     policy: PolicyConfig,
     now: datetime,
+    diagnostics: dict | None = None,
 ) -> tuple[dict[str, str], set[str]]:
+    diagnostic = diagnostics if diagnostics is not None else {}
+    diagnostic.update(status="no-qualifying-candidate", blocked_slots={}, candidate_blockers={})
     if not policy.promotion_enabled or policy.promotion_max_per_region_per_run <= 0:
+        diagnostic["status"] = "disabled"
         return original_slots, set()
     last_promotion = _parse_changed_at(promotion_cooldown_at)
     if last_promotion is not None:
-        local_last_promotion = (
-            last_promotion.astimezone(now.tzinfo)
-            if now.tzinfo is not None
-            else last_promotion
-        )
-        if (
-            now.date() - local_last_promotion.date()
-        ).days < policy.promotion_cooldown_days:
+        local_last_promotion = last_promotion.astimezone(now.tzinfo) if now.tzinfo is not None else last_promotion
+        if (now.date() - local_last_promotion.date()).days < policy.promotion_cooldown_days:
+            diagnostic["status"] = "cooldown"
             return original_slots, set()
 
     slots = dict(original_slots)
     by_key = {item.node.key: item for item in assessments}
     promoted: set[str] = set()
+    blockers: Counter[str] = Counter()
     for _ in range(policy.promotion_max_per_region_per_run):
-        incumbent_options: list[tuple[tuple[object, ...], str, NodeAssessment]] = []
+        incumbent_options = []
         for slot, key in slots.items():
+            if slot in promoted:
+                continue
             item = by_key.get(key)
-            if item is None or not item.quick.available:
+            reasons = _promotion_blockers(item, policy) if item else ["absent"]
+            if reasons:
+                diagnostic["blocked_slots"][slot] = reasons
                 continue
             latency = item.quick.latency_ms if item.quick.latency_ms is not None else 0.0
             incumbent_options.append(((-GRADE_ORDER.get(item.evaluation.overall_grade, 2), item.evaluation.score, -latency, slot), slot, item))
-        if not incumbent_options:
-            break
-        _, weakest_slot, incumbent = min(incumbent_options, key=lambda value: value[0])
-        if (not incumbent.evidence_valid or not incumbent.fresh_full_completed or not incumbent.fresh_full_usable
-                or incumbent.qualification_version != EVIDENCE_POLICY_VERSION
-                or type(incumbent.qualification_version) is not int
-                or not sample_qualified(incumbent.quick, policy)):
-            break
         assigned = set(slots.values())
-        candidates = sorted((
-            item for item in assessments
-            if item.node.key not in assigned
-            and item.quick.available
-            and item.fresh_full_completed
-            and item.fresh_full_usable
-            and item.evidence_valid
-            and item.qualification_version == EVIDENCE_POLICY_VERSION
-            and type(item.qualification_version) is int
-            and sample_qualified(item.quick, policy)
-            and item.healthy_streak_days >= policy.promotion_min_healthy_days
-            and GRADE_ORDER.get(item.evaluation.overall_grade, 2) <= GRADE_ORDER.get(incumbent.evaluation.overall_grade, 2)
-            and GRADE_ORDER.get(item.evaluation.ai_grade, 2) <= GRADE_ORDER.get(incumbent.evaluation.ai_grade, 2)
-            and GRADE_ORDER.get(item.evaluation.risk_grade, 2) <= GRADE_ORDER.get(incumbent.evaluation.risk_grade, 2)
-            and _RESIDENTIAL_ORDER.get(item.evaluation.residential_grade, 0) >= _RESIDENTIAL_ORDER.get(incumbent.evaluation.residential_grade, 0)
-        ), key=ranking_key)
-        candidate = next((item for item in candidates if _promotion_margin_holds(item, incumbent, policy.promotion_evidence_days, policy.promotion_score_margin)), None)
-        if candidate is None:
+        candidates = []
+        for item in sorted(assessments, key=ranking_key):
+            if item.node.key in assigned:
+                continue
+            reasons = _promotion_blockers(item, policy, candidate=True)
+            if reasons:
+                blockers.update(reasons)
+            else:
+                candidates.append(item)
+        replacement = None
+        for _, slot, incumbent in sorted(incumbent_options, key=lambda value: value[0]):
+            for candidate in candidates:
+                if (any(GRADE_ORDER.get(getattr(candidate.evaluation, field), 2) > GRADE_ORDER.get(getattr(incumbent.evaluation, field), 2)
+                        for field in ("overall_grade", "ai_grade", "risk_grade"))
+                        or _RESIDENTIAL_ORDER.get(candidate.evaluation.residential_grade, 0) < _RESIDENTIAL_ORDER.get(incumbent.evaluation.residential_grade, 0)):
+                    blockers["grade-regression"] += 1
+                    continue
+                common = set(_history_by_day(candidate)) & set(_history_by_day(incumbent))
+                if len(common) < policy.promotion_evidence_days:
+                    blockers["insufficient-common-days"] += 1
+                    continue
+                if not _promotion_margin_holds(candidate, incumbent, policy.promotion_evidence_days, policy.promotion_score_margin):
+                    blockers["score-margin-or-invalid-history"] += 1
+                    continue
+                replacement = slot, candidate
+                break
+            if replacement:
+                break
+        if not replacement:
             break
-        slots[weakest_slot] = candidate.node.key
-        promoted.add(weakest_slot)
+        slot, candidate = replacement
+        slots[slot] = candidate.node.key
+        promoted.add(slot)
+    diagnostic["candidate_blockers"] = dict(blockers)
+    diagnostic["promoted_slots"] = sorted(promoted)
+    if promoted:
+        diagnostic["status"] = "promoted"
     return slots, promoted
 
 

@@ -92,6 +92,7 @@ class ClaudeResult:
     route_stable: bool = True
     intelligence_complete: bool = False
     intelligence_cached: bool = False
+    intelligence_checked_at: str = ""
     service_outage: bool = False
     checked_at: str = ""
     error: str = ""
@@ -191,4 +192,4 @@ class NodeAssessment:
     unavailable_grace_active: bool = False
     daily_quality_history: list[dict[str, Any]] = field(default_factory=list)
     evidence_valid: bool = False
-    qualification_version: int = 1
+    qualification_version: int = 2

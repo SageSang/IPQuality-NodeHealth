@@ -28,6 +28,8 @@ node-health 从带 `target=ClashMeta&noCache=true` 的 Sub-Store `inventory` 获
 
 当前代码的操作步骤见 [D2 部署门禁与迁移说明](deploy/DEPLOY_D2.md)；[旧简化部署](deploy/DEPLOY_SIMPLE.md)仅作历史配置参考。升级代码不会自动修改路由器；端口差异、现场配置、维护窗口和回滚资料应先审阅，实际应用变化可能中断 local-socks 连接。
 
+普通 `healthy` 订阅支持通过管理 API 设置 0–3 个有顺序的置顶节点。设置保存后，下一次刷新订阅即可生效；其余条目保持自动顺序。置顶与固定三槽位、检测评分、晋级冷却及自建 Mihomo/local-socks 端口完全独立。服务端和 Sub-Store 排序脚本须配套升级；接口、并发版本和异常恢复说明见 [订阅置顶接口](integrations/README.md#subscription-pin-preferences)。
+
 ##### 屏幕截图
 ![截图](https://raw.githubusercontent.com/xykt/IPQuality/main/res/cn_IPv4.svg)
 

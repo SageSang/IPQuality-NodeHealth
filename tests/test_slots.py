@@ -71,7 +71,7 @@ def assessment(
         consecutive_unavailable_valid_days=unavailable_days,
         unavailable_grace_active=grace_active,
         daily_quality_history=[
-            {"qualification_version": 1, **entry} for entry in (history if history is not None else [
+            {"qualification_version": 2, **entry} for entry in (history if history is not None else [
                 {"day": f"2026-07-{day}", "score": score, "evidence_valid": True}
                 for day in ("21", "22", "23")
             ])
@@ -857,7 +857,7 @@ def test_quality_promotion_cooldown_uses_configured_local_calendar_day():
     assert changes[0]["reason"] == "superior-candidate"
 
 
-def test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence():
+def test_promotion_skips_weakest_slot_without_evidence_and_checks_other_slots():
     previous_slots = {
         "united-states": {"1": "a", "2": "b", "3": "c"}
     }
@@ -893,8 +893,9 @@ def test_promotion_waits_when_the_weakest_stable_slot_lacks_fresh_high_evidence(
             {"united-states": "2026-07-01T00:00:00+00:00"},
             datetime(2026, 7, 24, tzinfo=timezone.utc),
         )
-        assert regions["united-states"]["stable_slots"] == previous_slots["united-states"]
-        assert changes == []
+        assert regions["united-states"]["stable_slots"] == {"1": "a", "2": "f", "3": "c"}
+        assert len(changes) == 1 and changes[0]["reason"] == "superior-candidate"
+        assert regions["united-states"]["promotion_diagnostics"]["blocked_slots"] == {"1": ["current-evidence-incomplete"]}
 
 
 def test_promotion_requires_fresh_usable_evidence_from_the_candidate():

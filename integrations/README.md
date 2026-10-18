@@ -26,13 +26,25 @@ Private files live under the existing `data_dir/runtime-bundles` (directory 0700
 
 ## Publication, snapshots, and reports
 
-The state layout remains schema 2. Evidence policy/probe versions are independent; legacy health qualifications are re-established without clearing stable identities, other order or cooldowns. Original raw facts remain available for traceability. A bounded one-time M1 migration exception can preserve original earned failure protection without adding score or promotion evidence.
+The state layout remains schema 2; the current evidence/scoring policy is **2**, while raw probe/risk contracts remain 1. Upgrading from policy 1 discards old scores, cached detection results, health days and promotion history. It preserves node identities, placement, cooldowns and the independent subscription preferences. The first successful maintenance scan audits every available node and preserves surviving slot/ranked/other positions, so existing port bindings remain stable for unchanged inventory. Missing identities leave holes; new identities append. Unavailable or incomplete nodes retain a durable pending-audit marker and are retried when available. Later maintenance scans resume normal replacement/promotion rules. A full scan supplies fresh scores, not six days of health qualification. Do not use `rebuild` merely to refresh evidence: it intentionally reallocates slots.
+
+The reset is transactional with publication. A failed scan leaves the committed generation untouched. A policy-1 binary rejects policy-2 state; rolling back requires the matching pre-upgrade data backup, not just an older image. Historical report archives remain unchanged. The older pre-policy-1 M1 handling is separate; this upgrade does not carry it forward or create/extend grace entitlements.
 
 Snapshots, maps and report archives are prepared before `current.json` selects the committed revision. Latest views recover from that revision. NAS reports and regional/all TXT are **targets**, not proof of router application. Temporary audits are proposals and cannot pass the production map validator. The router's local `applied.json` and associated exports are its application receipt; no network receipt/control plane is introduced.
 
 AI points describe site/region probes, not account or conversation success. ChatGPT uses one 12-point site/support observation plus up to 3 points of independent same-service-egress geography; Claude contributes up to 10. Duplicate quick/full observations and legacy Yes/Native strings do not create additional evidence. Error responses and unknown risk flags cannot become positive evidence.
 
 Health/error APIs retain bounded codes, phase and diagnostic ID. Legacy report errors receive safe read projections; original archives are not overwritten. Retry progress explicitly reports waiting-retry/rechecking, retry round, pending nodes and next_retry_at; percent_scope is phase.
+
+## Detection diagnostics and policy 2
+
+Hosting/server, proxy and VPN flags retain soft penalties and prevent a clean A, but cannot by themselves produce C or a synthesized high-risk score. Confirmed Tor, DNSBL at the configured threshold, two independent high-risk sources and three independent abuse reports still trigger C. Generic and Claude egress evidence remain separate. Flag-derived scores require all expected boolean fields; missing, string or numeric pseudo-booleans remain unknown. A positive hosting flag or a country/ASN-only response does not qualify as a complete risk provider. Aliases of the same provider count once.
+
+`probe_diagnostics` in private reports distinguishes `provider_invalid_auth` (401), `provider_forbidden` (403), rate limits, partial 200 responses and complete capabilities. It includes the last checked/success times and present/missing flags, without credentials, query strings or raw responses. `successes` counts accepted JSON HTTP responses; `complete_responses` counts usable responses. Counters reset each scan; last-success time is process-local. A 403 alone does not prove an account problem. Provider credentials and subscriptions still need operational verification; this code does not fix a denied account. Existing cache, retry-after, bounded backoff and request budgets remain active.
+
+A rotated connection that fails the existing quick retries defers its deep audit. The pending marker survives restart and forces a fresh audit on recovery; old connection reputation is never inherited. In ordinary promotion, an incumbent without fresh valid evidence is skipped while other eligible slots can still be compared. Regional `promotion_diagnostics` identifies cooldown, blocked slots, missing current evidence, insufficient health/common days, grade regression and failed margin checks. The thresholds remain 6 health days, 3 common valid days, 15 points, 7 cooldown days and at most one ordinary promotion per region/run.
+
+Authenticated `GET /api/v1/nodes` adds `available` and `score_provenance`: observed score, ranking-score source/day, scoring-policy version, evidence validity, quick/full/Claude observation times, and Claude intelligence cache/time. Components describe this round's observation; if the ranking score is retained, components need not sum to that retained score. A cached provider result is not a new day's qualifying observation. These fields stay out of the anonymous ranking projection.
 
 ## Stable node identity
 
@@ -45,6 +57,92 @@ Exact keys win; connection rotation may inherit a slot only through mutually uni
 Use a complete `inventory` collection without the health operator. Put `health-ranking-operator.js` last in the otherwise complete `healthy` chain, with `rankingUrl` pointing to `/current.json`; retain `target=ClashMeta&noCache=true`. A stable connection contributes one representative before the dynamic tail; additional aliases cannot displace other stable representatives. Failure preserves the full original input.
 
 The ClashMeta producer can remove underscore metadata. Adding `_nh_slot` to an ordinary proxy object is therefore not a guaranteed fixed-port transport. OpenWrt consumes the NAS private snapshot containing the exact inventory used for its map. Sub-Store cache-busting parameters do not provide historical snapshots.
+
+## Subscription pin preferences
+
+The service and the Sub-Store operator support a shared, ordered list of up to
+three pinned connections for ordinary `healthy` subscriptions. Pins are global
+within that subscription: a selected node can move ahead of the first region.
+Every request first computes the existing automatic order, then moves one
+representative occurrence per pin to the front. Remaining occurrences preserve
+their relative order, including aliases and unknown nodes. A stable connection
+uses its existing representative. Pins never filter or duplicate proxies.
+
+For automatic order `A B C D E`, with stable slots `1=A, 2=B, 3=C`, pinning `E`
+produces `E A B C D`; pinning `B` produces `B A C D E`. The stored slots remain
+`1=A, 2=B, 3=C` in both cases. Scoring, health qualifications, probe selection,
+cooldowns, normal slot replacement, fixed ports and SOCKS exports are independent
+of preferences. A failed probe does not revoke a pin. Missing nodes are skipped,
+but their preferences are retained. Exact connection keys survive display-name
+changes; rotation uses the existing mutually unique/source-compatible identity
+rules. Missing or ambiguous identities are visible in the admin response.
+
+All three management routes require a **nonempty** `http.api_token` and its
+`Authorization: Bearer ...` header, even on loopback:
+
+| Method and path | Response / operation |
+| --- | --- |
+| `GET /api/v1/nodes` | Names, keys, regions, scores, confidence, automatic slots and pin positions |
+| `GET /api/v1/subscription-preferences` | Saved keys, resolved keys, per-pin status, revision and ETag |
+| `PUT /api/v1/subscription-preferences` | Replace the ordered list; an empty list restores automatic order |
+
+Node positions describe **published connection representatives**, not every
+alias or a client's filtered live input. `stable_slot` and `pin_position` are
+different fields. In the preference response, `pinned_nodes` are the saved keys;
+`resolved_pinned_nodes` are their current matches. When a saved key has rotated,
+callers can submit that saved key or the resolved key on their next edit. A
+changed list canonicalizes proven matches to current keys; callers should use
+the returned saved list and ETag for the next edit. No proxy credentials are
+returned by these routes.
+
+Example (use the ETag returned by GET, not a hardcoded revision):
+
+```sh
+curl -i "$NODE_HEALTH_URL/api/v1/subscription-preferences" \
+  -H "Authorization: Bearer $NODE_HEALTH_TOKEN"
+
+curl -i -X PUT "$NODE_HEALTH_URL/api/v1/subscription-preferences" \
+  -H "Authorization: Bearer $NODE_HEALTH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'If-Match: "0"' \
+  --data '{"pinned_nodes":["<node_key returned by GET /api/v1/nodes>"]}'
+```
+
+PUT accepts only `pinned_nodes`, with 0–3 unique keys. Unknown new keys, duplicate
+keys or extra fields return 422; malformed JSON/ETags return 400; a missing
+If-Match returns 428; a stale revision returns 412. Missing/incorrect tokens
+return 401. An unchanged list at the current revision succeeds without creating
+a new revision. On an uncertain response, GET the saved settings before retrying.
+
+Preferences are atomically stored in `data_dir/preferences.json`, independently
+of scan state, under the single service process's short preference lock. The file
+also retains an allowlisted identity population to prevent ambiguous rotation
+matches; it contains no proxy configuration or credentials. Back it up with the
+data directory. It is neither cleared on restart nor written by a scan. An absent
+file means no pins; malformed/unreadable preferences return a safe admin 503 and
+are never silently reset. Restore a known-good copy if necessary.
+
+`/current.json` adds `subscription_preferences` at response time, with its own
+schema 1, status, revision, modification time and resolved `pinned_nodes`. All
+existing schema-2 ranking fields keep their original meaning. A preference PUT
+does not rewrite the stored `current.json`, `state.json`, reports, runtime bundle
+or map; health timestamps and ranking versions do not change. `/version`
+advertises `subscription_preferences_schema_version=1`.
+
+After a successful PUT, newly started ranking/subscription requests see the new
+preferences without waiting for a scan. The client must refresh its subscription;
+the API does not claim to have switched its active proxy. Already-running reads
+may finish with the previous revision. Responses use `Cache-Control: no-store`,
+and the operator downloads fresh ranking on every execution. Keep it last in the
+processing chain, and check downstream caches or client-side sorting. Sub-Store's
+outer `noCache=true` does not disable arbitrary script-result caches.
+
+Upgrade the service and operator together. Old operators ignore the additive
+field; new operators accept old servers without preferences. Malformed optional
+preferences fall back to automatic order; an unavailable ranking retains the
+existing complete-input fallback. Clearing the list restores automatic ordering
+without resetting health history. This change requires no OpenWrt updater,
+fixed-port converter or runtime-profile upgrade.
 
 ## OpenWrt poller
 

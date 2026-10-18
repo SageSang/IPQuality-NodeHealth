@@ -24,6 +24,8 @@ from .audit import audit_day_parts, validate_audit_id
 from .reconcile import SCHEMA_VERSION
 from .slots import ranking_key
 from .runtime_bundle import MAX_BUNDLE_BYTES, build_runtime_bundle, byte_digest, valid_bundle_id
+from .preferences import (PreferenceConflict, PreferencesUnavailable, empty_preferences,
+                          identity_snapshot, resolve_preferences, validate_keys, validate_preferences)
 
 
 _FIXED_REGION_PORT_BLOCK_SIZE = 200
@@ -182,6 +184,8 @@ class StateStore:
         self.snapshots_dir = config.data_dir / "state-snapshots"
         self.runtime_bundles_dir = config.data_dir / "runtime-bundles"
         self._publication_lock = threading.RLock()
+        self.preferences_path = config.data_dir / "preferences.json"
+        self._preferences_lock = threading.RLock()
         self.audit_jobs_dir = config.data_dir / "audit-jobs"
         self.scheduled_reports_dir = config.reports_dir / "scheduled"
         self.audit_reports_dir = config.reports_dir / "audits"
@@ -385,6 +389,64 @@ class StateStore:
 
     def load_current(self) -> dict[str, Any]:
         return read_json(self.current_path, {})
+
+    def load_preferences(self) -> dict[str, Any]:
+        with self._preferences_lock:
+            try:
+                if self.preferences_path.stat().st_size > 4 * 1024 * 1024:
+                    raise PreferencesUnavailable("subscription_preferences_unavailable")
+                return validate_preferences(read_json(self.preferences_path))
+            except FileNotFoundError:
+                return empty_preferences()
+            except (OSError, ValueError) as error:
+                raise PreferencesUnavailable("subscription_preferences_unavailable") from error
+
+    def update_preferences(self, keys: Any, expected_revision: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        keys = validate_keys(keys)
+        # Independent of the long-running scan and publication locks. The scan
+        # never reads or writes this file; a pin cannot change its decisions.
+        with self._preferences_lock:
+            previous = self.load_preferences()
+            if previous["revision"] != expected_revision:
+                raise PreferenceConflict("preference_revision_conflict")
+            try:
+                current = self.load_current()
+            except (OSError, ValueError) as error:
+                raise PreferencesUnavailable("subscription_preferences_unavailable") from error
+            try:
+                index = identity_snapshot(current.get("identity_index", {}))
+                prior_view = resolve_preferences(previous, current)
+            except (ValueError, TypeError, KeyError, AttributeError) as error:
+                raise PreferencesUnavailable("subscription_preferences_unavailable") from error
+            if any(key not in index and key not in previous["pinned_nodes"] for key in keys):
+                raise ValueError("unknown node key")
+            if keys == previous["pinned_nodes"]:
+                return previous, current
+            # A client may edit using saved pre-rotation keys. Canonicalize
+            # their proven matches before capturing a new identity population;
+            # otherwise adding the new key to the anchors would hide the match.
+            remap = {pin["node_key"]: pin["resolved_node_key"] for pin in prior_view["pins"]
+                     if pin["resolved_node_key"]}
+            keys = validate_keys([remap.get(key, key) for key in keys])
+            anchors = {}
+            if any(key not in index for key in keys):
+                anchors.update(previous["identity_index"])
+            if keys:
+                anchors.update(index)
+            value = {"schema_version": 1, "revision": previous["revision"] + 1,
+                     "updated_at": datetime.now(timezone.utc).isoformat(),
+                     "pinned_nodes": keys, "identity_index": anchors}
+            validate_preferences(value)
+            # Validate the response projection before committing, including
+            # identity resolution for retained missing/rotated preferences.
+            try:
+                resolve_preferences(value, current)
+            except (ValueError, TypeError, KeyError, AttributeError) as error:
+                raise PreferencesUnavailable("subscription_preferences_unavailable") from error
+            if len(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")) + 1 > 4 * 1024 * 1024:
+                raise PreferencesUnavailable("subscription_preferences_unavailable")
+            atomic_write_json(self.preferences_path, value)
+            return value, current
 
     def read_runtime_bundle(self, identifier: str = "latest") -> bytes:
         with self._publication_lock:
@@ -1237,6 +1299,9 @@ _REASON_ZH = {
     "tor-exit": "检测到 Tor 出口",
     "claude-tor-exit": "Claude 专用出口检测到 Tor",
     "full-audit-incomplete": "本轮深度检测未完成",
+    "rotation-audit-pending": "连接已轮换，等待新连接深检",
+    "baseline-audit-pending": "检测基线已重置，等待完整深检",
+    "fresh-risk-unconfirmed": "本轮风险来源证据不足，暂停累计",
     "transient-recovery": "延迟复检后恢复",
     "ai-services-unavailable": "ChatGPT 与 Claude 均确认不可用",
     "risk-consensus-severe": "多个来源共同确认严重风险",

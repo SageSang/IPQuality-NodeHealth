@@ -1132,16 +1132,22 @@ class NodeHealthService:
                 self.config.policy,
                 started_at.astimezone(timezone.utc),
             )
-            # A safely reconciled logical node has new connection parameters.
-            # Always rebuild its reputation immediately instead of waiting for
-            # the maintenance rotation sample. If it is unreachable, the full
-            # attempt still records that this mandatory audit was attempted.
-            selected.update(
-                event["after"]
-                for event in identity_events
-                if event.get("after") in quick_results
-            )
+            # Retried quick failures cannot yield useful deep evidence. A
+            # durable marker forces the audit when the new connection recovers.
             prior_nodes = previous.get("nodes", {})
+            pending_full_audits = {key for key, prior in prior_nodes.items()
+                                   if prior.get("full_audit_pending")}
+            selected.update(key for key in pending_full_audits
+                            if key in quick_results and quick_results[key].available)
+            selected.difference_update(key for key in pending_full_audits
+                                       if key in quick_results and not quick_results[key].available)
+            pending_rotations = {key for key, prior in prior_nodes.items()
+                                 if prior.get("rotation_audit_pending")}
+            selected.update(key for key in pending_rotations
+                            if key in quick_results and quick_results[key].available)
+            deferred_rotations = {key for key in pending_rotations
+                                  if key in quick_results and not quick_results[key].available}
+            selected.difference_update(deferred_rotations)
             previous_slots = previous.get("stable_slots", {})
             fixed_regions = {
                 node.region for node in nodes if node.region != "other"
@@ -1226,6 +1232,7 @@ class NodeHealthService:
             frozen_regions,
             _previous_ranked_order(previous),
             previous.get("rejected_by_region", {}),
+            preserve_placement=bool(previous.get("rebaseline_required")),
         )
         generated_at = self.clock()
         if generated_at.tzinfo is None:
@@ -1258,6 +1265,10 @@ class NodeHealthService:
         current["ai_guard_samples"] = getattr(self, "_ai_guard_samples", {})
         current["quality_summary"] = {
             "nodes": len(assessments),
+            "detection_rebaseline": bool(previous.get("rebaseline_required")),
+            "baseline_audits_pending": sum(bool(prior_nodes.get(item.node.key, {}).get("full_audit_pending"))
+                                           and not item.fresh_full_usable for item in assessments),
+            "rotation_audits_deferred": len(deferred_rotations),
             "fresh_full_attempts": sum(item.fresh_full_attempt is not None for item in assessments),
             "fresh_full_completed": sum(item.fresh_full_completed for item in assessments),
             "fresh_full_usable": sum(item.fresh_full_usable for item in assessments),
@@ -1359,6 +1370,7 @@ class NodeHealthService:
                 quick.claude.residential = prior_claude.residential
                 quick.claude.intelligence_complete = True
                 quick.claude.intelligence_cached = True
+                quick.claude.intelligence_checked_at = prior_claude.intelligence_checked_at or prior_claude.checked_at
                 quick.claude.risk_evidence_version = prior_claude.risk_evidence_version
             if quick.chatgpt_service_outage:
                 quick.chatgpt_ok = None
@@ -1645,12 +1657,29 @@ class NodeHealthService:
                     evaluation.score = float(prior["last_score"])
                 except (TypeError, ValueError):
                     pass
+            evaluation.evidence.setdefault("observed_score", evaluation.score)
+            evaluation.evidence.setdefault("ranking_score_source", "fresh" if evidence_valid else "mixed-or-incomplete")
+            evaluation.evidence.setdefault("ranking_score_day", current_day)
+            evaluation.evidence.update(
+                scoring_policy_version=EVIDENCE_POLICY_VERSION,
+                evidence_valid=evidence_valid, available=quick.available,
+                quick_checked_at=quick.checked_at,
+                full_checked_at=full.checked_at if full else "",
+                claude_checked_at=quick.claude.checked_at,
+                claude_intelligence_checked_at=quick.claude.intelligence_checked_at,
+                claude_intelligence_cached=quick.claude.intelligence_cached,
+            )
+            if prior.get("full_audit_pending") and not fresh_is_trustworthy:
+                evaluation.reasons.append("baseline-audit-pending")
+            if prior.get("rotation_audit_pending") and not fresh_is_trustworthy:
+                evaluation.reasons.append("rotation-audit-pending")
             if fresh_full is not None and not fresh_full.completed:
                 evaluation.reasons.append("full-audit-incomplete")
             elif fresh_full is not None and not fresh_is_trustworthy:
-                evaluation.reasons.append(
-                    "fresh-ai-unconfirmed"
-                )
+                if not fresh_risk_is_trustworthy:
+                    evaluation.reasons.append("fresh-risk-unconfirmed")
+                if not fresh_chatgpt_is_trustworthy:
+                    evaluation.reasons.append("fresh-ai-unconfirmed")
             if fresh_full is not None and evaluation.confidence == "low":
                 passes = 0
             if evaluation.redline or (
@@ -1738,6 +1767,12 @@ class NodeHealthService:
                 "name": item.node.name,
                 **node_identity(item.node),
                 "score": item.evaluation.score,
+                "available": item.quick.available,
+                "score_provenance": {name: item.evaluation.evidence.get(name) for name in (
+                    "observed_score", "ranking_score_source", "ranking_score_day", "scoring_policy_version",
+                    "evidence_valid", "quick_checked_at", "full_checked_at", "claude_checked_at",
+                    "claude_intelligence_cached", "claude_intelligence_checked_at",
+                )},
                 "confidence": item.evaluation.confidence,
                 "decision": item.evaluation.decision,
                 "reasons": item.evaluation.reasons,
@@ -1948,6 +1983,12 @@ class NodeHealthService:
             ):
                 pending.discard("claude-risk")
             node_state[item.node.key]["evidence_refresh_pending"] = sorted(pending)
+            node_state[item.node.key]["rotation_audit_pending"] = bool(
+                prior.get("rotation_audit_pending") and not item.fresh_full_usable
+            )
+            node_state[item.node.key]["full_audit_pending"] = bool(
+                prior.get("full_audit_pending") and not item.fresh_full_usable
+            )
             if item.node.region in frozen_regions and prior:
                 frozen_observation = {
                     "checked_at": item.quick.checked_at,

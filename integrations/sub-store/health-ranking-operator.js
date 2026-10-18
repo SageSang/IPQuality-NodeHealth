@@ -860,6 +860,31 @@ function chooseRepresentative(entries, identity) {
   return [...(matching.length ? matching : entries)].sort(compareAliases)[0];
 }
 
+function applyPinnedOrder(entries, preferences, identities, stableRepresentatives) {
+  if (preferences == null) return entries; // Backward-compatible server.
+  if (!isRecord(preferences) || preferences.schema_version !== 1 ||
+      preferences.status !== 'ready' || !Number.isSafeInteger(preferences.revision) ||
+      preferences.revision < 0 || !Array.isArray(preferences.pinned_nodes) ||
+      preferences.pinned_nodes.length > 3 ||
+      preferences.pinned_nodes.some((key) => typeof key !== 'string' || !NODE_KEY_PATTERN.test(key)) ||
+      new Set(preferences.pinned_nodes).size !== preferences.pinned_nodes.length) {
+    if (typeof console !== 'undefined' && typeof console.error === 'function') {
+      console.error('[node-health] preferences unavailable; preserving automatic order');
+    }
+    return entries;
+  }
+  const prefix = [];
+  for (const key of preferences.pinned_nodes) {
+    const matches = entries.filter((entry) => entry.stateKey === key);
+    if (!matches.length || !identities[key]) continue;
+    const representative = stableRepresentatives.get(key) || chooseRepresentative(matches, identities[key]);
+    prefix.push(representative);
+  }
+  const moved = new Set(prefix);
+  // Remove only the moved occurrences, never all aliases of their connection.
+  return [...prefix, ...entries.filter((entry) => !moved.has(entry))];
+}
+
 async function operator(proxies, targetPlatform, context) {
   if (!Array.isArray(proxies)) throw new TypeError('proxy input must be an array');
   try {
@@ -900,6 +925,7 @@ async function operator(proxies, targetPlatform, context) {
 
     selected.forEach((entry, index) => {
       const stateKey = resolved.get(index) || entry.key;
+      entry.stateKey = stateKey;
       entry.healthOrder = order.has(stateKey) ? order.get(stateKey) : Number.MAX_SAFE_INTEGER;
       if (stableKeys.has(stateKey) && representatives.get(stateKey) !== entry) {
         entry.healthOrder = extraAliasOrder.get(stateKey);
@@ -909,7 +935,8 @@ async function operator(proxies, targetPlatform, context) {
       (left, right) =>
         left.healthOrder - right.healthOrder || left.originalIndex - right.originalIndex,
     );
-    return selected.map((entry) => entry.proxy);
+    return applyPinnedOrder(selected, state.subscription_preferences, state.identity_index, representatives)
+      .map((entry) => entry.proxy);
   } catch (error) {
     if (typeof console !== 'undefined' && typeof console.error === 'function') {
       console.error('[node-health] ranking unavailable; preserving complete input order');
@@ -924,6 +951,7 @@ if (typeof module === 'object' && module.exports) {
     REGION_ORDER,
     STABLE_SLOT_COUNT,
     aliasEntryId,
+    applyPinnedOrder,
     buildOrdering,
     canonicalJson,
     clashMetaNodeKey,

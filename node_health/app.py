@@ -22,6 +22,8 @@ from .policy import EVIDENCE_POLICY_VERSION
 from .port_mapping import MAP_SCHEMA_VERSION, CONSUMER_CONTRACT
 from .runtime_bundle import BUNDLE_SCHEMA_VERSION
 from .service import NodeHealthService, ScanStartError
+from .preferences import (PreferenceConflict, PreferencesUnavailable, node_catalog,
+                          public_preferences, resolve_preferences)
 
 SOFTWARE_VERSION = "0.4.0-dev"
 MAX_API_BODY_BYTES = 16 * 1024
@@ -185,16 +187,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return
         known = {"/version", "/current.json", "/local-socks-map.json", "/api/run", "/api/v1/run", "/api/audits", "/api/v1/audits"}
+        known.update({"/api/v1/nodes", "/api/v1/subscription-preferences"})
         route = path if path in known else ("/api/audits/:id" if path.startswith(("/api/audits/", "/api/v1/audits/")) else "/unknown")
         method = self.command if self.command in {"GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS"} else "OTHER"
         LOGGER.info("http method=%s route=%s", method, route)
 
-    def _json(self, status: int, value: Any) -> None:
+    def _json(self, status: int, value: Any, *, etag: str | None = None) -> None:
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if etag is not None:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(body)
 
@@ -240,6 +245,23 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = urlsplit(self.path).path
+        if path in {"/api/v1/nodes", "/api/v1/subscription-preferences"}:
+            if not self.server.config.http.api_token or not self._authorized():
+                self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                return
+            try:
+                preferences = self.server.service.store.load_preferences()
+                current = self.server.service.store.load_current()
+                if path == "/api/v1/nodes" and not current:
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no published ranking"})
+                    return
+                value = (node_catalog(current, preferences) if path == "/api/v1/nodes"
+                         else resolve_preferences(preferences, current))
+            except (OSError, ValueError, TypeError, KeyError):
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "subscription_preferences_unavailable"})
+                return
+            self._json(HTTPStatus.OK, value, etag=f'"{preferences["revision"]}"')
+            return
         if path == "/healthz":
             self._json(HTTPStatus.OK, self.server.service.status())
             return
@@ -251,6 +273,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                  "source_revision": os.environ.get("NODE_HEALTH_REVISION", "unknown"),
                  "evidence_policy_version": EVIDENCE_POLICY_VERSION, "runtime_map_schema_version": MAP_SCHEMA_VERSION,
                  "runtime_bundle_schema_version": BUNDLE_SCHEMA_VERSION,
+                 "subscription_preferences_schema_version": 1,
                  "runtime_contract": CONSUMER_CONTRACT},
             )
             return
@@ -280,7 +303,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not current:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "no published ranking"})
             else:
-                self._json(HTTPStatus.OK, public_ranking_document(current))
+                document = public_ranking_document(current)
+                try:
+                    document["subscription_preferences"] = public_preferences(
+                        self.server.service.store.load_preferences(), current)
+                except (OSError, ValueError, TypeError, KeyError):
+                    document["subscription_preferences"] = {
+                        "schema_version": 1, "status": "unavailable", "pinned_nodes": []}
+                    LOGGER.warning("subscription preferences unavailable; using automatic subscription order")
+                self._json(HTTPStatus.OK, document)
             return
         if path == "/local-socks-map.json":
             current = self.server.service.store.load_current()
@@ -339,6 +370,50 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, status)
             return
         self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if urlsplit(self.path).path != "/api/v1/subscription-preferences":
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        if not self.server.config.http.api_token or not self._authorized():
+            self._json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        condition = self.headers.get("If-Match")
+        if condition is None:
+            self._json(HTTPStatus.PRECONDITION_REQUIRED, {"error": "If-Match is required"})
+            return
+        match = re.fullmatch(r'"(0|[1-9][0-9]{0,15})"', condition)
+        if not match:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "If-Match must be a quoted preference revision"})
+            return
+        try:
+            body = self._request_json()
+        except TypeError as error:
+            self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"error": str(error)})
+            return
+        except OverflowError as error:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(error)})
+            return
+        except ValueError as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if set(body) != {"pinned_nodes"}:
+            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "only pinned_nodes is accepted"})
+            return
+        try:
+            preferences, current = self.server.service.store.update_preferences(
+                body["pinned_nodes"], int(match.group(1)))
+            value = resolve_preferences(preferences, current)
+        except PreferenceConflict:
+            self._json(HTTPStatus.PRECONDITION_FAILED, {"error": "preference_revision_conflict"})
+            return
+        except (PreferencesUnavailable, OSError):
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "subscription_preferences_unavailable"})
+            return
+        except ValueError:
+            self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": "invalid or unknown pinned_nodes"})
+            return
+        self._json(HTTPStatus.OK, value, etag=f'"{preferences["revision"]}"')
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         parsed = urlsplit(self.path)
