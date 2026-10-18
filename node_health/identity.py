@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -13,6 +14,18 @@ from .models import Node, NodeAlias
 SOURCE_ID_FIELDS = ("_nh_source_id", "_source_id")
 ORIGINAL_NAME_FIELDS = ("_nh_original_name", "_original_name")
 IDENTITY_METADATA_FIELDS = {*SOURCE_ID_FIELDS, *ORIGINAL_NAME_FIELDS}
+# Freeze Python's existing whitespace semantics for the cross-language
+# identity contract. U+FEFF is deliberately preserved, not treated as space.
+IDENTITY_WHITESPACE = "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+_IDENTITY_SPACES = re.compile(f"[{re.escape(IDENTITY_WHITESPACE)}]+")
+
+
+def trim_identity_whitespace(value: str) -> str:
+    return value.strip(IDENTITY_WHITESPACE)
+
+
+def _collapse_identity_whitespace(value: str) -> str:
+    return _IDENTITY_SPACES.sub(" ", trim_identity_whitespace(value))
 
 
 def _json_compatible(value: Any) -> Any:
@@ -67,11 +80,11 @@ def node_key(proxy: Mapping[str, Any]) -> str:
 
 
 def normalize_source_id(value: Any) -> str:
-    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).lower()
+    return _collapse_identity_whitespace(unicodedata.normalize("NFKC", str(value or ""))).lower()
 
 
 def normalize_original_name(value: Any) -> str:
-    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split()).lower()
+    return _collapse_identity_whitespace(unicodedata.normalize("NFKC", str(value or ""))).lower()
 
 
 def source_id(proxy: Mapping[str, Any]) -> str:
@@ -84,10 +97,10 @@ def source_id(proxy: Mapping[str, Any]) -> str:
 
 def original_name(proxy: Mapping[str, Any]) -> str:
     for field in ORIGINAL_NAME_FIELDS:
-        value = " ".join(str(proxy.get(field) or "").split())
+        value = _collapse_identity_whitespace(str(proxy.get(field) or ""))
         if value:
             return value
-    return " ".join(str(proxy.get("name") or "").split())
+    return _collapse_identity_whitespace(str(proxy.get("name") or ""))
 
 
 def logical_id(source: str, normalized_name: str) -> str:

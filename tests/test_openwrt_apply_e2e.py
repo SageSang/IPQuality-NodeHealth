@@ -448,3 +448,145 @@ def test_gc_failure_does_not_revoke_commit_and_is_retried(runtime):
     assert runtime.run().returncode == 0
     assert runtime.receipt() == receipt
     assert not orphan.exists()
+
+
+BASELINE_FAULT = r'''
+const fs=require('fs'), path=require('path');
+const cache=process.env.CACHE_DIR, applied=path.join(cache,'applied.json');
+const journal=path.join(cache,'baseline-pending.json');
+const selected=process.env.TEST_BASELINE_FAULT;
+let receiptRenamed=false;
+function fault(label) {
+  if(selected!==label) return;
+  if(process.env.TEST_BASELINE_KILL==='1') process.kill(process.pid,'SIGKILL');
+  throw new Error('synthetic baseline fault');
+}
+const copy=fs.copyFileSync;
+fs.copyFileSync=function(source,destination,...args) {
+  const result=copy.call(this,source,destination,...args);
+  if(String(destination).includes('/generations/') && String(destination).endsWith('/core') && !fs.existsSync(applied)) fault('after-core');
+  return result;
+};
+const rename=fs.renameSync;
+fs.renameSync=function(source,destination) {
+  const label=destination===journal?'journal':destination===applied&&!fs.existsSync(applied)?'receipt':String(destination).endsWith('/baseline.json')?'snapshot':'';
+  if(label) fault('before-'+label);
+  const result=rename.call(this,source,destination);
+  if(label==='receipt') receiptRenamed=true;
+  if(label) fault('after-'+label);
+  return result;
+};
+const sync=fs.fsyncSync;
+fs.fsyncSync=function(fd) {
+  if(receiptRenamed && fs.readlinkSync('/proc/self/fd/'+fd)===cache) {receiptRenamed=false; fault('receipt-dir-sync');}
+  return sync.call(this,fd);
+};
+const remove=fs.rmSync;
+fs.rmSync=function(target,...args) {
+  if(process.env.TEST_BASELINE_CLEANUP_FAILURE && String(target).includes('/generations/')) throw new Error('synthetic cleanup fault');
+  return remove.call(this,target,...args);
+};
+const unlink=fs.unlinkSync;
+fs.unlinkSync=function(target) {if(target===journal) fault('journal-unlink');return unlink.call(this,target);};
+'''
+
+
+def baseline_fault(runtime, phase, **extra):
+    script = runtime.directory / 'baseline-fault.cjs'
+    script.write_text(BASELINE_FAULT)
+    return {'NODE_OPTIONS': f'--require={script}', 'TEST_BASELINE_FAULT': phase, **extra}
+
+
+def test_first_baseline_rejects_invalid_exports_without_copying_core(runtime):
+    before = runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text()
+    unexpected = runtime.export / 'unexpected'; unexpected.mkdir()
+    for _ in range(4):
+        result = runtime.run()
+        assert result.returncode != 0 and 'phase=baseline' in result.stderr
+        assert not (runtime.cache / 'applied.json').exists()
+        assert not list((runtime.cache / 'generations').iterdir())
+        assert not (runtime.cache / 'baseline-pending.json').exists()
+        assert before == (runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text())
+    assert runtime.log.read_text() == ''
+    unexpected.rmdir()
+    assert runtime.run().returncode == 0
+    assert runtime.receipt()['kind'] == 'managed'
+    runtime.wait_socket(62000)
+
+
+@pytest.mark.parametrize('phase', ['after-core', 'before-snapshot', 'after-snapshot', 'before-receipt'])
+def test_uncommitted_baseline_exceptions_are_cleaned_and_retryable(runtime, phase):
+    before = runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text()
+    for _ in range(3):
+        result = runtime.run(**baseline_fault(runtime, phase))
+        assert result.returncode != 0
+        assert not (runtime.cache / 'applied.json').exists()
+        assert not (runtime.cache / 'baseline-pending.json').exists()
+        assert not list((runtime.cache / 'generations').iterdir())
+        assert before == (runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text())
+    assert runtime.run().returncode == 0
+    assert len(list((runtime.cache / 'generations').iterdir())) == 2
+
+
+@pytest.mark.parametrize('phase', ['after-journal', 'after-core', 'after-snapshot', 'before-receipt', 'after-receipt'])
+def test_baseline_crash_recovery_obeys_the_persisted_receipt(runtime, phase):
+    before = runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text()
+    result = runtime.run(**baseline_fault(runtime, phase, TEST_BASELINE_KILL='1'))
+    assert result.returncode != 0
+    journal = runtime.cache / 'baseline-pending.json'
+    pending = json.loads(journal.read_text())
+    committed = phase == 'after-receipt'
+    assert (runtime.cache / 'applied.json').exists() == committed
+    runtime.backoff()
+    assert runtime.run(apply=False).returncode == 0
+    assert not journal.exists()
+    directories = list((runtime.cache / 'generations').iterdir())
+    assert len(directories) == int(committed)
+    if committed:
+        assert runtime.receipt()['generation_id'] == pending['generation_id']
+        assert (directories[0] / 'core').read_bytes() == before[1]
+    assert before == (runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text())
+    assert runtime.run().returncode == 0
+    runtime.wait_socket(62000)
+
+
+@pytest.mark.parametrize('phase', ['after-receipt', 'receipt-dir-sync'])
+def test_baseline_commit_survives_an_exception_after_receipt_rename(runtime, phase):
+    before = runtime.config.read_bytes(), runtime.core.read_bytes(), runtime.pid.read_text()
+    result = runtime.run(**baseline_fault(runtime, phase))
+    assert result.returncode != 0
+    receipt = runtime.receipt()
+    assert receipt['kind'] == 'legacy-baseline'
+    generation = runtime.cache / 'generations' / receipt['generation_id']
+    assert (generation / 'config.yaml').read_bytes() == before[0]
+    assert (generation / 'core').read_bytes() == before[1]
+    assert not (runtime.cache / 'baseline-pending.json').exists()
+    assert runtime.pid.read_text() == before[2]
+    assert runtime.run().returncode == 0
+    assert generation.is_dir()
+
+
+@pytest.mark.parametrize('committed', [False, True])
+def test_failed_baseline_cleanup_blocks_new_builds_until_it_succeeds(runtime, committed):
+    extra = (baseline_fault(runtime, 'journal-unlink') if committed else
+             baseline_fault(runtime, 'after-core', TEST_BASELINE_CLEANUP_FAILURE='1'))
+    for _ in range(4):
+        assert runtime.run(**extra).returncode != 0
+        directories = list((runtime.cache / 'generations').iterdir())
+        assert len(directories) == 1
+        assert sum((p / 'core').stat().st_size for p in directories) == runtime.core.stat().st_size
+        assert (runtime.cache / 'applied.json').exists() == committed
+        assert (runtime.cache / 'baseline-pending.json').is_file()
+    assert runtime.run().returncode == 0
+    assert not (runtime.cache / 'baseline-pending.json').exists()
+    assert len(list((runtime.cache / 'generations').iterdir())) == 2
+
+
+def test_unmarked_legacy_generation_is_not_reaped_without_a_receipt(runtime):
+    import uuid
+    directory = runtime.cache / 'generations' / str(uuid.uuid4())
+    directory.mkdir(parents=True)
+    shutil.copy2(runtime.core, directory / 'core')
+    runtime.backoff()
+    assert runtime.run(apply=False).returncode == 0
+    assert (directory / 'core').is_file()

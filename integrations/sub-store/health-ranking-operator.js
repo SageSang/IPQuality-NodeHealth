@@ -198,12 +198,19 @@ function nodeKey(proxy) {
   return sha256Hex(canonicalJson(proxy, true));
 }
 
+// Same frozen identity whitespace as Python and the local-SOCKS converter.
+const IDENTITY_SPACES = /[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu;
+const IDENTITY_EDGES = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+function trimIdentityText(value) {
+  return String(value || '').replace(IDENTITY_EDGES, '');
+}
+
 function normalizeIdentityText(value) {
-  return String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+  return normalizeOriginalName(String(value || '').normalize('NFKC')).toLowerCase();
 }
 
 function normalizeOriginalName(value) {
-  return String(value || '').trim().replace(/\s+/gu, ' ');
+  return trimIdentityText(value).replace(IDENTITY_SPACES, ' ');
 }
 
 function sourceId(proxy) {
@@ -439,7 +446,7 @@ const REGION_MATCHERS = REGION_RULES.map((rule) => [
 ]);
 
 function identityRegion(proxy, name) {
-  const explicit = String((proxy && proxy._region) || '').trim();
+  const explicit = trimIdentityText(proxy && proxy._region);
   if (REGION_ORDER.includes(explicit)) return explicit;
   for (const [region, matcher, codeMatcher] of REGION_MATCHERS) {
     if (matcher.test(name) || codeMatcher.test(name)) return region;
@@ -848,7 +855,7 @@ function compareAliases(left, right) {
     const difference = compareCodePoints(left.identity[field], right.identity[field]);
     if (difference) return difference;
   }
-  return compareCodePoints(String(left.proxy.name).trim(), String(right.proxy.name).trim()) ||
+  return compareCodePoints(trimIdentityText(left.proxy.name), trimIdentityText(right.proxy.name)) ||
     left.duplicateOrdinal - right.duplicateOrdinal;
 }
 
@@ -896,7 +903,7 @@ async function operator(proxies, targetPlatform, context) {
     const selected = proxies.map((proxy, originalIndex) => {
       const key = clashMetaNodeKey(proxy, context);
       const identity = selectedIdentity(proxy);
-      const name = String(proxy.name || '').trim();
+      const name = trimIdentityText(proxy.name);
       const signature = JSON.stringify([key, identity.source_id, identity.original_name, name]);
       const duplicateOrdinal = (occurrences.get(signature) || 0) + 1;
       occurrences.set(signature, duplicateOrdinal);

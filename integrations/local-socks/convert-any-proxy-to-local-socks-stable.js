@@ -31,9 +31,14 @@ function nodeKey(proxy) {
   if (!record(proxy)) throw new Error('proxy must be an object');
   return sha256Hex(canonicalJson(proxy, true));
 }
-const normalizeIdentityText = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
+// Identity whitespace matches Python's frozen set; FEFF remains content.
+const IDENTITY_SPACES = /[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/gu;
+const IDENTITY_EDGES = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
+const trimIdentityText = value => String(value || '').replace(IDENTITY_EDGES, '');
+const normalizeOriginalName = value => trimIdentityText(value).replace(IDENTITY_SPACES, ' ');
+const normalizeIdentityText = value => normalizeOriginalName(String(value || '').normalize('NFKC')).toLowerCase();
 const originalName = proxy => [proxy._nh_original_name, proxy._original_name, proxy.name]
-  .map(value => String(value || '').trim().replace(/\s+/gu, ' ')).find(Boolean) || '';
+  .map(normalizeOriginalName).find(Boolean) || '';
 const sourceId = proxy => [proxy._nh_source_id, proxy._source_id].map(normalizeIdentityText).find(Boolean) || '';
 const aliasEntryId = (key, source, original, name, ordinal = 1) => sha256Hex(JSON.stringify([key, source, original, name, ordinal]));
 
@@ -41,8 +46,8 @@ function inventoryEntries(proxies) {
   if (!Array.isArray(proxies) || !proxies.length) throw new Error('inventory has no proxies');
   const counts = new Map();
   return proxies.map(proxy => {
-    if (!record(proxy) || typeof proxy.name !== 'string' || !proxy.name.trim()) throw new Error('invalid inventory proxy');
-    const key = nodeKey(proxy), source = sourceId(proxy), original = originalName(proxy), name = proxy.name.trim();
+    if (!record(proxy) || typeof proxy.name !== 'string' || !trimIdentityText(proxy.name)) throw new Error('invalid inventory proxy');
+    const key = nodeKey(proxy), source = sourceId(proxy), original = originalName(proxy), name = trimIdentityText(proxy.name);
     const tuple = JSON.stringify([key, source, original, name]);
     const ordinal = (counts.get(tuple) || 0) + 1;
     counts.set(tuple, ordinal);
@@ -80,7 +85,7 @@ function validateMapping(map, approvals = {}) {
   const entries = new Map();
   for (const entry of map.entries) {
     if (!record(entry) || !HEX.test(entry.entry_id) || !HEX.test(entry.node_key) || entries.has(entry.entry_id) ||
-        !REGION_KEYS.includes(entry.region) || typeof entry.name !== 'string' || !entry.name.trim() ||
+        !REGION_KEYS.includes(entry.region) || typeof entry.name !== 'string' || !trimIdentityText(entry.name) ||
         typeof entry.source_id !== 'string' || typeof entry.original_name !== 'string' ||
         !Number.isInteger(entry.duplicate_ordinal) || entry.duplicate_ordinal < 1 ||
         aliasEntryId(entry.node_key, entry.source_id, entry.original_name, entry.name, entry.duplicate_ordinal) !== entry.entry_id) throw new Error('invalid or repeated mapping entry');

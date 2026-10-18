@@ -27,6 +27,7 @@ try {
 }
 const appliedPath = path.join(cache, 'applied.json');
 const pendingPath = path.join(cache, 'pending.json');
+const baselinePendingPath = path.join(cache, 'baseline-pending.json');
 const generationRoot = path.join(cache, 'generations');
 const backoffPath = path.join(cache, 'backoff.json');
 let currentPhase = 'startup';
@@ -259,23 +260,54 @@ function receiptFor(id, kind, map = null, rendered = null) {
 }
 async function ensureBaseline() {
   currentPhase = 'baseline';
+  recoverBaselineBuild();
   if (exists(appliedPath)) return readJSON(appliedPath);
   if (!exists(configPath) || !exists(core)) throw new Error('verified legacy runtime is required for initial migration');
   const config = readConfig(configPath);
   converter.runtimeProjection(config);
   if (!command(core, ['-d', work, '-t', '-f', configPath]) || !(await runtimeReady(config))) throw new Error('legacy runtime baseline is not ready');
+  // Reject unsupported exports before copying a potentially large core.
+  const exportsHash = hashExports(exportDir);
   const id = crypto.randomUUID(), directory = generation(id);
-  fs.mkdirSync(directory, { mode: 0o700 });
-  persistedCopy(configPath, path.join(directory, 'config.yaml'));
-  persistedCopy(core, path.join(directory, 'core'));
-  if (exists(exportDir)) copyExports(exportDir, path.join(directory, 'exports'));
-  const stat = fs.statSync(configPath);
-  writeJSON(path.join(directory, 'permissions.json'), { mode: stat.mode & 0o777, uid: stat.uid, gid: stat.gid });
-  const receipt = receiptFor(id, 'legacy-baseline');
-  writeJSON(path.join(directory, 'baseline.json'), receipt);
-  syncDirectory(generationRoot);
-  writeJSON(appliedPath, receipt);
-  return receipt;
+  try {
+    // Persist ownership before allocating/copying. A crash can leave a known
+    // build, but never an unmarked full core created by this code path.
+    writeJSON(baselinePendingPath, { schema_version: 1, kind: 'baseline-build', generation_id: id });
+    fs.mkdirSync(directory, { mode: 0o700 });
+    persistedCopy(configPath, path.join(directory, 'config.yaml'));
+    persistedCopy(core, path.join(directory, 'core'));
+    if (exists(exportDir)) copyExports(exportDir, path.join(directory, 'exports'));
+    const stat = fs.statSync(configPath);
+    writeJSON(path.join(directory, 'permissions.json'), { mode: stat.mode & 0o777, uid: stat.uid, gid: stat.gid });
+    const receipt = receiptFor(id, 'legacy-baseline');
+    if (receipt.exports_hash !== exportsHash) throw new Error('baseline exports changed during capture');
+    writeJSON(path.join(directory, 'baseline.json'), receipt);
+    syncDirectory(generationRoot);
+    writeJSON(appliedPath, receipt);
+    return receipt;
+  } finally {
+    // atomicWrite can throw after its rename has already committed a receipt.
+    // Read the durable selector; a local success flag is not sufficient.
+    recoverBaselineBuild();
+  }
+}
+function recoverBaselineBuild() {
+  if (!exists(baselinePendingPath)) return;
+  const pending = readJSON(baselinePendingPath);
+  if (pending.schema_version !== 1 || pending.kind !== 'baseline-build') throw new Error('invalid baseline journal');
+  const directory = generation(pending.generation_id);
+  if (exists(pendingPath)) throw new Error('baseline journal conflicts with pending apply');
+  if (exists(appliedPath)) {
+    const receipt = readJSON(appliedPath);
+    if (receipt.schema_version !== 1 || receipt.kind !== 'legacy-baseline' ||
+        receipt.generation_id !== pending.generation_id) throw new Error('baseline journal conflicts with applied receipt');
+    // The committed baseline survives even if journal cleanup needs a retry.
+  } else {
+    fs.rmSync(directory, { recursive: true, force: true });
+    syncDirectory(generationRoot);
+  }
+  fs.unlinkSync(baselinePendingPath);
+  syncDirectory(cache);
 }
 function replaceConfig(source, permissions) {
   atomicWrite(configPath, fs.readFileSync(source), permissions.mode);
@@ -331,6 +363,11 @@ function pruneGenerations() {
     if (!exists(generation(receipt.generation_id))) return;
     if (receipt.previous_generation_id != null) generation(receipt.previous_generation_id);
     const retained = new Set([receipt.generation_id, receipt.previous_generation_id]);
+    if (exists(baselinePendingPath)) {
+      const pending = readJSON(baselinePendingPath);
+      generation(pending.generation_id);
+      retained.add(pending.generation_id);
+    }
     if (exists(pendingPath)) {
       const pending = readJSON(pendingPath);
       generation(pending.previous_generation_id); generation(pending.next_generation_id);
@@ -353,6 +390,7 @@ function pruneGenerations() {
 async function recoverLocal() {
   try {
     currentPhase = 'recover';
+    recoverBaselineBuild();
     if (exists(pendingPath)) {
       const pending = readJSON(pendingPath);
       if (!exists(appliedPath)) throw new Error('pending apply has no recovery receipt');

@@ -19,6 +19,23 @@ const converter = require(path.join(
   'convert-any-proxy-to-local-socks-stable.js',
 ));
 
+// One shared vector set defines whitespace for Python and both standalone JS
+// consumers. FEFF is content; the C0 separators and NEL are whitespace.
+const identityWhitespace = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'identity-whitespace.json'), 'utf8'));
+for (const [codes, isSpace] of [[identityWhitespace.whitespace_codepoints, true], [identityWhitespace.non_whitespace_codepoints, false]]) {
+  for (const code of codes) {
+    const character = String.fromCodePoint(parseInt(code, 16));
+    const input = { name: 'Hong Kong Fallback', _nh_source_id: character, _source_id: 'BACKUP',
+      _nh_original_name: character, _original_name: 'Hong Kong Original' };
+    for (const consumer of [operatorModule, converter]) {
+      assert.strictEqual(consumer.sourceId(input), isSpace ? 'backup' : character, `source U+${code}`);
+      assert.strictEqual(consumer.originalName(input), isSpace ? 'Hong Kong Original' : character, `name U+${code}`);
+      assert.strictEqual(consumer.normalizeIdentityText(`${character}Ａ${character}Ｂ${character}`),
+        isSpace ? 'a b' : `${character}a${character}b${character}`, `normalize U+${code}`);
+    }
+  }
+}
+
 function proxy(name, server, extra = {}) {
   return {
     name,

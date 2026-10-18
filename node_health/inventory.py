@@ -19,6 +19,7 @@ from .identity import (
     normalize_original_name,
     original_name,
     source_id,
+    trim_identity_whitespace,
 )
 from .models import Node, NodeAlias
 
@@ -53,11 +54,11 @@ def parse_clash_inventory(payload: bytes | str, patterns: dict[str, list[str]]) 
     for index, proxy in enumerate(document["proxies"]):
         if not isinstance(proxy, dict):
             raise ValueError(f"inventory proxy at index {index} is not an object")
-        name = str(proxy.get("name", "")).strip()
+        name = trim_identity_whitespace(str(proxy.get("name", "")))
         if not name:
             raise ValueError(f"inventory proxy at index {index} has no name")
         key = node_key(proxy)
-        explicit_region = str(proxy.get("_region") or "").strip()
+        explicit_region = trim_identity_whitespace(str(proxy.get("_region") or ""))
         if explicit_region and explicit_region not in {*patterns, "other"}:
             raise ValueError(
                 f"inventory proxy {name!r} has unsupported _region {explicit_region!r}"

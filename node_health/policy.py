@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import re
 import copy
 import ipaddress
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Any
 
@@ -88,6 +90,7 @@ _RISK_SEVERITY = {
     "critical": 1.0,
 }
 _RISK_LABELS = frozenset(_RISK_SEVERITY)
+_RISK_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?")
 _DEFAULT_DNSBL_REDLINE_THRESHOLD = 3
 
 
@@ -107,18 +110,25 @@ def normalize_risk_value(value: Any) -> str:
     if value is None or isinstance(value, bool):
         return ""
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return ""
         return str(value) if math.isfinite(number) and 0 <= number <= 100 else ""
-    normalized = str(value).strip().lower().replace("_", " ").replace("-", " ")
-    normalized = " ".join(normalized.split())
-    if normalized in _UNKNOWN_RISK_VALUES:
+    raw = str(value).strip().lower()
+    if raw in _UNKNOWN_RISK_VALUES:
         return ""
-    numeric = normalized[:-1].strip() if normalized.endswith("%") else normalized
-    try:
-        number = float(numeric)
-    except ValueError:
-        return normalized if normalized in _RISK_LABELS else ""
-    return normalized if math.isfinite(number) and 0 <= number <= 100 else ""
+    numeric = raw[:-1].strip() if raw.endswith("%") else raw
+    # Signs and exponents belong to numbers. Label punctuation must never
+    # turn an invalid numeric value into a different, valid score.
+    if _RISK_NUMBER.fullmatch(numeric):
+        try:
+            number = Decimal(numeric)
+        except InvalidOperation:
+            return ""
+        return raw if number.is_finite() and 0 <= number <= 100 else ""
+    normalized = " ".join(raw.replace("_", " ").replace("-", " ").split())
+    return normalized if normalized in _RISK_LABELS else ""
 
 
 def valid_risk_sources(full: FullResult | None) -> dict[str, str]:
