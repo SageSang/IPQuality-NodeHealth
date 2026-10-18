@@ -1823,23 +1823,37 @@ local total=0
 local clean=0
 local blacklisted=0
 local other=0
-read_dnsbl_zones|filter_dnsbl_zones|sort -u|xargs -P "$parallel_jobs" -I {} bash -c '
-zone=$1
-reversed_ip=$2
-result=$(dig +short "${reversed_ip}.${zone}" A)
-if [[ -z $result ]];then
+local errors=0
+dnsbl_query(){
+local result status records
+if ! result=$(dig +time=3 +tries=1 +noall +comments +answer "${2}.${1}" A 2>/dev/null);then
+echo "Error"
+return
+fi
+status=$(printf '%s\n' "$result"|awk '/^;; ->>HEADER<<-/ {for(i=1;i<NF;i++) if($i=="status:"){gsub(/,/,"",$(i+1));print $(i+1)}}')
+case "$status" in
+NXDOMAIN)echo "Clean";;
+NOERROR)
+records=$(printf '%s\n' "$result"|awk '!/^;/ && NF')
+if [[ -z $records ]];then
 echo "Clean"
-elif [[ $result == "127.0.0.2" ]];then
+elif printf '%s\n' "$records"|awk '$4=="A" && $5=="127.0.0.2" {found=1} END {exit !found}';then
 echo "Blacklisted"
 else
 echo "Other"
-fi
-' _ {} "$reversed_ip"|{
+fi;;
+SERVFAIL|REFUSED|FORMERR|NOTIMP)echo "Error";;
+*)echo "Other";;
+esac
+}
+export -f dnsbl_query
+read_dnsbl_zones|filter_dnsbl_zones|sort -u|xargs -P "$parallel_jobs" -I {} bash -c 'dnsbl_query "$1" "$2"' _ {} "$reversed_ip"|{
 while IFS= read -r line;do
 ((total++))
 case "$line" in
 "Clean")((clean++));;
 "Blacklisted")((blacklisted++));;
+"Error")((errors++));;
 *)((other++))
 esac
 done
@@ -1847,7 +1861,7 @@ smail[t]="$total"
 smail[c]="$clean"
 smail[m]="$other"
 smail[b]="$blacklisted"
-echo "${smail[t]} ${smail[c]} ${smail[m]} ${smail[b]}"
+echo "${smail[t]} ${smail[c]} ${smail[m]} ${smail[b]} $errors"
 }
 }
 check_dnsbl(){
@@ -1861,6 +1875,7 @@ smail[t]=${num_array[0]:-0}
 smail[c]=${num_array[1]:-0}
 smail[m]=${num_array[2]:-0}
 smail[b]=${num_array[3]:-0}
+smail[e]=${num_array[4]:-0}
 smail[sdnsbl]="$Font_Cyan${smail[dnsbl]}  ${smail[available]}${smail[t]}   ${smail[clean]}${smail[c]}   ${smail[marked]}${smail[m]}   ${smail[blacklisted]}${smail[b]}$Font_Suffix"
 }
 show_head(){
@@ -2448,7 +2463,7 @@ mail_status=$(printf '%s\n' "$mail_status"|jq --arg name "$service" --argjson va
 done
 local probe_json="${chatgpt_probe_json:-\{\}}"
 printf '%s\n' "$probe_json"|jq -e 'type == "object"' >/dev/null 2>&1||return 1
-args+=(--argjson chatgpt_probe "$probe_json" --argjson mail_status "$mail_status" --arg mail_local "${smail[local]}" --arg dns_total "${smail[t]:-null}" --arg dns_clean "${smail[c]:-null}" --arg dns_marked "${smail[m]:-null}" --arg dns_blacklisted "${smail[b]:-null}")
+args+=(--argjson chatgpt_probe "$probe_json" --argjson mail_status "$mail_status" --arg mail_local "${smail[local]}" --arg dns_total "${smail[t]:-null}" --arg dns_clean "${smail[c]:-null}" --arg dns_marked "${smail[m]:-null}" --arg dns_blacklisted "${smail[b]:-null}" --arg dns_errors "${smail[e]:-null}")
 candidate=$(printf '%s\n' "$ipjson"|jq "${args[@]}" 'def boolean: if . == "true" then true elif . == "false" then false else null end;
 def country: if test("^[A-Za-z]{2}$") then ascii_upcase else null end;
 def count: if test("^[0-9]+$") then tonumber else null end;
@@ -2458,7 +2473,7 @@ def count: if test("^[0-9]+$") then tonumber else null end;
 | .Score = {IP2LOCATION:$score_IP2LOCATION,SCAMALYTICS:$score_SCAMALYTICS,ipapi:$score_ipapi,AbuseIPDB:$score_AbuseIPDB,IPQS:$score_IPQS,DBIP:$score_DBIP}
 | .Factor = {CountryCode:{IP2LOCATION:($factor_CountryCode_IP2LOCATION|country),SCAMALYTICS:($factor_CountryCode_SCAMALYTICS|country),ipapi:($factor_CountryCode_ipapi|country),IPQS:($factor_CountryCode_IPQS|country),DBIP:($factor_CountryCode_DBIP|country),IPinfo:($factor_CountryCode_IPinfo|country),ipregistry:($factor_CountryCode_ipregistry|country),ipdata:($factor_CountryCode_ipdata|country)},Proxy:{IP2LOCATION:($factor_Proxy_IP2LOCATION|boolean),SCAMALYTICS:($factor_Proxy_SCAMALYTICS|boolean),ipapi:($factor_Proxy_ipapi|boolean),IPQS:($factor_Proxy_IPQS|boolean),DBIP:($factor_Proxy_DBIP|boolean),IPinfo:($factor_Proxy_IPinfo|boolean),ipregistry:($factor_Proxy_ipregistry|boolean),ipdata:($factor_Proxy_ipdata|boolean)},Tor:{IP2LOCATION:($factor_Tor_IP2LOCATION|boolean),SCAMALYTICS:($factor_Tor_SCAMALYTICS|boolean),ipapi:($factor_Tor_ipapi|boolean),IPQS:($factor_Tor_IPQS|boolean),DBIP:($factor_Tor_DBIP|boolean),IPinfo:($factor_Tor_IPinfo|boolean),ipregistry:($factor_Tor_ipregistry|boolean),ipdata:($factor_Tor_ipdata|boolean)},VPN:{IP2LOCATION:($factor_VPN_IP2LOCATION|boolean),SCAMALYTICS:($factor_VPN_SCAMALYTICS|boolean),ipapi:($factor_VPN_ipapi|boolean),IPQS:($factor_VPN_IPQS|boolean),DBIP:($factor_VPN_DBIP|boolean),IPinfo:($factor_VPN_IPinfo|boolean),ipregistry:($factor_VPN_ipregistry|boolean),ipdata:($factor_VPN_ipdata|boolean)},Server:{IP2LOCATION:($factor_Server_IP2LOCATION|boolean),SCAMALYTICS:($factor_Server_SCAMALYTICS|boolean),ipapi:($factor_Server_ipapi|boolean),IPQS:($factor_Server_IPQS|boolean),DBIP:($factor_Server_DBIP|boolean),IPinfo:($factor_Server_IPinfo|boolean),ipregistry:($factor_Server_ipregistry|boolean),ipdata:($factor_Server_ipdata|boolean)},Abuser:{IP2LOCATION:($factor_Abuser_IP2LOCATION|boolean),SCAMALYTICS:($factor_Abuser_SCAMALYTICS|boolean),ipapi:($factor_Abuser_ipapi|boolean),IPQS:($factor_Abuser_IPQS|boolean),DBIP:($factor_Abuser_DBIP|boolean),IPinfo:($factor_Abuser_IPinfo|boolean),ipregistry:($factor_Abuser_ipregistry|boolean),ipdata:($factor_Abuser_ipdata|boolean)},Robot:{IP2LOCATION:($factor_Robot_IP2LOCATION|boolean),SCAMALYTICS:($factor_Robot_SCAMALYTICS|boolean),ipapi:($factor_Robot_ipapi|boolean),IPQS:($factor_Robot_IPQS|boolean),DBIP:($factor_Robot_DBIP|boolean),IPinfo:($factor_Robot_IPinfo|boolean),ipregistry:($factor_Robot_ipregistry|boolean),ipdata:($factor_Robot_ipdata|boolean)}}
 | .Media = {TikTok:{Status:$media_tiktok_status,Region:$media_tiktok_region,Type:$media_tiktok_type},DisneyPlus:{Status:$media_disney_status,Region:$media_disney_region,Type:$media_disney_type},Netflix:{Status:$media_netflix_status,Region:$media_netflix_region,Type:$media_netflix_type},Youtube:{Status:$media_youtube_status,Region:$media_youtube_region,Type:$media_youtube_type},AmazonPrimeVideo:{Status:$media_amazon_status,Region:$media_amazon_region,Type:$media_amazon_type},Reddit:{Status:$media_reddit_status,Region:$media_reddit_region,Type:$media_reddit_type},ChatGPT:{Status:$media_chatgpt_status,Region:$media_chatgpt_region,Type:$media_chatgpt_type,Probe:$chatgpt_probe}}
-| .Mail = ($mail_status + {Port25:(if $mail_local == "2" then null else $mail_local == "1" end),DNSBlacklist:{Total:($dns_total|count),Clean:($dns_clean|count),Marked:($dns_marked|count),Blacklisted:($dns_blacklisted|count)}})' 2>/dev/null)||return 1
+| .Mail = ($mail_status + {Port25:(if $mail_local == "2" then null else $mail_local == "1" end),DNSBlacklist:{QueryStatusVersion:1,Total:($dns_total|count),Clean:($dns_clean|count),Marked:($dns_marked|count),Blacklisted:($dns_blacklisted|count),ErrorCount:($dns_errors|count)}})' 2>/dev/null)||return 1
 printf '%s\n' "$candidate"|jq -e 'type == "object" and (.Head|type == "object") and (.Score|type == "object")' >/dev/null 2>&1||return 1
 ipjson="$candidate"
 }

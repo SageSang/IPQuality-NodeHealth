@@ -28,6 +28,7 @@ from typing import Any, Protocol
 import yaml
 
 from .config import AppConfig
+from .dnsbl import normalize_dnsbl
 from .errors import safe_error_text
 from .models import ClaudeResult, FullResult, Node, QuickResult, SiteProbeResult
 from .policy import PROBE_CONTRACT_VERSION, RISK_EVIDENCE_VERSION
@@ -82,8 +83,33 @@ def generate_mihomo_probe_config(
     ports: dict[str, int] = {}
     names = [node.name for node in nodes]
     duplicates = {name for name, count in Counter(names).items() if count > 1}
-    if any(node.proxy.get("dialer-proxy") in duplicates for node in nodes):
-        raise ValueError("ambiguous proxy dependency")
+    alias_keys: dict[str, set[str]] = {}
+    for node in nodes:
+        for name in {node.name, *(alias.name for alias in node.aliases)}:
+            alias_keys.setdefault(name, set()).add(node.key)
+    dependencies: dict[str, str] = {}
+    for node in nodes:
+        dependency = node.proxy.get("dialer-proxy")
+        if not dependency:
+            continue
+        if dependency == "DIRECT" and dependency not in alias_keys:
+            continue  # Mihomo's built-in direct dialer is not an inventory alias.
+        if not isinstance(dependency, str) or dependency not in alias_keys:
+            raise ValueError("missing proxy dependency")
+        if len(alias_keys[dependency]) != 1:
+            raise ValueError("ambiguous proxy dependency")
+        dependencies[node.key] = next(iter(alias_keys[dependency]))
+    # Each connection has at most one dialer; iterative traversal avoids a
+    # recursion limit for a large (or maliciously cyclic) inventory.
+    checked: set[str] = set()
+    for key in dependencies:
+        chain: set[str] = set()
+        while key in dependencies and key not in checked:
+            if key in chain:
+                raise ValueError("cyclic proxy dependency")
+            chain.add(key)
+            key = dependencies[key]
+        checked.update(chain)
     assigned_names = set(names) - duplicates
     probe_names = {}
     for node in sorted(nodes, key=lambda item: item.key):
@@ -98,6 +124,8 @@ def generate_mihomo_probe_config(
         probe_name = probe_names[node.key]
         proxy = {key: value for key, value in node.proxy.items() if not str(key).startswith("_")}
         proxy["name"] = probe_name
+        if node.key in dependencies:
+            proxy["dialer-proxy"] = probe_names[dependencies[node.key]]
         port = start_port + index
         proxies.append(proxy)
         listeners.append(
@@ -432,7 +460,8 @@ class CurlQuickProbe:
                        "--output", str(body_path), "--dump-header", str(headers_path),
                        "--write-out", "%{http_code}\n%{url_effective}"]
             if port is not None:
-                command.extend(["--proxy", f"http://{self.config.probe.proxy_host}:{port}"])
+                command.extend(["--proxy", f"http://{self.config.probe.proxy_host}:{port}",
+                                "--noproxy", ""])
             command.append(url)
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 3, check=False)
@@ -859,7 +888,8 @@ class IPQualityAuditor:
                     timeout=max(120, self.config.probe.request_timeout_seconds * 20),
                     check=False,
                     env={
-                        **os.environ,
+                        **{key: value for key, value in os.environ.items()
+                           if key.lower() != "no_proxy"},
                         "IPQUALITY_AUTOMATION": "1",
                         "IPQUALITY_CHECKPOINT_FILE": str(checkpoint),
                         "IPQUALITY_REQUEST_TIMEOUT": str(self.config.probe.request_timeout_seconds),
@@ -962,6 +992,7 @@ def normalize_ipquality(details: dict[str, Any], checked_at: str = "") -> FullRe
         tor=tor,
         dnsbl_blacklisted=dnsbl,
         dnsbl_listed_count=dnsbl_listed_count,
+        dnsbl_coverage=normalize_dnsbl(dns),
         risk_sources=risk_sources,
         labels=[str(item) for item in labels],
         details=details,

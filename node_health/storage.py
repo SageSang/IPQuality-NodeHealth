@@ -1318,6 +1318,7 @@ _REASON_ZH = {
     "claude-risk-incomplete": "Claude 专用出口风险数据不完整，沿用可信缓存并暂停累计",
     "chatgpt-intelligence-country-conflict": "ChatGPT 同一服务出口的国家与独立地理来源冲突，暂停累计",
     "fresh-ai-unconfirmed": "本轮 AI 站点/地区证据不确定，暂停累计",
+    "dnsbl-coverage-insufficient": "DNSBL 有效查询覆盖不足，不能确认清洁",
 }
 
 _REASON_PREFIX_ZH = {
@@ -1683,6 +1684,10 @@ def build_report_markdown(
             ]
         )
         if full:
+            dnsbl = full.get("dnsbl_coverage")
+            dnsbl = dnsbl if isinstance(dnsbl, dict) else {}
+            dnsbl_status = {"clean": "查询均无命中", "partial": "部分查询有效",
+                            "listed": "存在命中", "unknown": "未知"}.get(dnsbl.get("status"), "未知")
             risk_sources = ", ".join(
                 f"{key}={value}" for key, value in (full.get("risk_sources") or {}).items()
             ) or "无"
@@ -1698,6 +1703,8 @@ def build_report_markdown(
                     f"`{_zh_bool(full.get('dnsbl_blacklisted'))}`；DNSBL 命中数量="
                     f"`{full.get('dnsbl_listed_count', 0)}`；"
                     f"标签={_markdown_escape(labels)}",
+                    f"- DNSBL 查询证据：{dnsbl_status}；有效 {dnsbl.get('checked', 0)}/{dnsbl.get('total', 0)}；"
+                    f"未知 {dnsbl.get('unknown', 0)}；失败 {dnsbl.get('error_count', 0)}",
                     f"- 深度检测错误：{_markdown_escape(full.get('error') or '无')}",
                     "",
                 ]

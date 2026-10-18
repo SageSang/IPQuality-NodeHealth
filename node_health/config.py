@@ -146,6 +146,7 @@ class PolicyConfig:
     claude_min_valid_risk_sources: int = 2
     dnsbl_redline_threshold: int = 3
     dnsbl_severe_threshold: int = 3
+    dnsbl_min_checked_ratio: float = 0.8
     minimum_candidate_success_rate: float = 0.6666
     promotion_enabled: bool = True
     promotion_min_full_passes: int = 2
@@ -348,6 +349,10 @@ def _validate_config(config: AppConfig, local_socks_raw: dict[str, Any]) -> None
         raise ValueError("policy.dnsbl_redline_threshold must be at least 2")
     if config.policy.dnsbl_severe_threshold < 2:
         raise ValueError("policy.dnsbl_severe_threshold must be at least 2")
+    if (isinstance(config.policy.dnsbl_min_checked_ratio, bool)
+            or not isinstance(config.policy.dnsbl_min_checked_ratio, (int, float))
+            or not 0 < config.policy.dnsbl_min_checked_ratio <= 1):
+        raise ValueError("policy.dnsbl_min_checked_ratio must be in (0, 1]")
     if not 0 < config.policy.minimum_candidate_success_rate <= 1:
         raise ValueError("policy.minimum_candidate_success_rate must be in (0, 1]")
     if not 0 < config.policy.full_audit_daily_fraction <= 1:

@@ -217,8 +217,11 @@ def assign_all_regions(
         old = previous.get(region, {})
         promotion_diagnostics = {"status": "not-applicable"}
         if region in frozen_regions:
-            slots = {str(slot): str(key) for slot, key in old.items() if key}
             current_keys = {item.node.key for item in region_items}
+            # Outage protection freezes placement, not inventory membership.
+            slots = {str(slot): str(key) for slot, key in old.items()
+                     if key in current_keys and str(slot) in
+                     {str(index) for index in range(1, region_slot_count + 1)}}
             prior_order = previous_ranked_order.get(region, previous_frozen_order.get(region, []))
             ranked = [str(key) for key in prior_order if str(key) in current_keys and str(key) not in slots.values()]
             seen = set(ranked) | set(slots.values())

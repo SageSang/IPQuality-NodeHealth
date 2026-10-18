@@ -304,3 +304,147 @@ def test_exact_generation_response_must_match_requested_id(runtime, bundle_sourc
     assert runtime.run(apply=False, RUNTIME_BUNDLE_URL=url).returncode != 0
     assert len(state["requests"]) == 1
     assert runtime.log.read_text() == ""
+
+
+@pytest.mark.parametrize('entry', ['directory', 'symlink', 'broken-symlink'])
+def test_live_export_structure_drift_does_not_block_service_recovery(runtime, entry):
+    assert runtime.run().returncode == 0
+    receipt = runtime.receipt()
+    unexpected = runtime.export / 'unexpected'
+    if entry == 'directory': unexpected.mkdir()
+    else: unexpected.symlink_to(runtime.config if entry == 'symlink' else runtime.directory / 'missing')
+    runtime.close(); runtime.backoff()
+    result = runtime.run(apply=False)
+    assert result.returncode == 0, result.stderr
+    runtime.wait_socket(62000)
+    assert runtime.receipt() == receipt
+    assert not unexpected.exists() and not unexpected.is_symlink()
+    assert (runtime.export / 'all-plain.txt').read_text() == 'socks5://192.0.2.4:62000\n'
+
+
+@pytest.mark.parametrize('damage', ['bytes', 'delete-file', 'add-file', 'missing-directory', 'symlink'])
+@pytest.mark.parametrize('pending', [False, True])
+def test_corrupt_export_snapshot_is_not_published_but_service_is_recovered(runtime, damage, pending):
+    import uuid
+    assert runtime.run().returncode == 0
+    receipt = runtime.receipt()
+    exports = runtime.cache / 'generations' / receipt['generation_id'] / 'exports'
+    if damage == 'bytes': (exports / 'all-plain.txt').write_text('CORRUPT\n')
+    elif damage == 'delete-file': (exports / 'all-plain.txt').unlink()
+    elif damage == 'add-file': (exports / 'extra.txt').write_text('unexpected')
+    elif damage == 'missing-directory': shutil.rmtree(exports)
+    else: (exports / 'extra.txt').symlink_to(runtime.config)
+    (runtime.export / 'all-plain.txt').write_text('existing-live-export\n')
+    if pending:
+        (runtime.cache / 'pending.json').write_text(json.dumps({
+            'previous_generation_id': receipt['generation_id'], 'next_generation_id': str(uuid.uuid4())}))
+    runtime.close(); runtime.backoff()
+    result = runtime.run(apply=False)
+    assert result.returncode != 0
+    assert 'recovery_incomplete' in result.stderr
+    runtime.wait_socket(62000)
+    assert runtime.receipt() == receipt
+    assert (runtime.export / 'all-plain.txt').read_text() == 'existing-live-export\n'
+    if pending: assert (runtime.cache / 'pending.json').exists()
+
+
+@pytest.mark.parametrize('failure', ['candidate', 'restart', 'export'])
+def test_failed_generations_are_bounded_and_recovery_remains_usable(runtime, failure):
+    assert runtime.run().returncode == 0
+    receipt = runtime.receipt()
+    original_proxies, original_map = runtime.proxies, runtime.mapping
+    if failure == 'restart': runtime.set_target([proxy('Hong Kong A', 'bad.example')])
+    else: runtime.set_target([proxy('Hong Kong A', 'new.example')])
+    extra = {'TEST_REJECT_CANDIDATE': '1'} if failure == 'candidate' else ({'TEST_EXPORT_FAILURE': '1'} if failure == 'export' else {})
+    for _ in range(4):
+        assert runtime.run(**extra).returncode != 0
+        assert runtime.receipt() == receipt
+        runtime.wait_socket(62000)
+        # A fault that also blocks rollback retains its referenced candidate.
+        # Subsequent retries must not create more candidates in this state.
+        pending_path = runtime.cache / 'pending.json'
+        assert len(list((runtime.cache / 'generations').iterdir())) == (3 if pending_path.exists() else 2)
+        if pending_path.exists():
+            pending = json.loads(pending_path.read_text())
+            assert (runtime.cache / 'generations' / pending['next_generation_id']).is_dir()
+    runtime.set_target(original_proxies, original_map)
+    assert runtime.run().returncode == 0
+    runtime.backoff(); assert runtime.run(apply=False).returncode == 0
+    assert len(list((runtime.cache / 'generations').iterdir())) == 2
+
+
+@pytest.mark.parametrize('phase', ['before-pending', 'after-pending', 'after-config', 'before-receipt', 'after-receipt'])
+def test_gc_after_crash_preserves_commit_and_predecessor(runtime, phase):
+    assert runtime.run().returncode == 0
+    previous = runtime.receipt()
+    runtime.set_target([proxy('Hong Kong A', 'new.example')])
+    assert runtime.run(TEST_CRASH_PHASE=phase).returncode != 0
+    runtime.backoff()
+    assert runtime.run(apply=False).returncode == 0
+    runtime.wait_socket(62000)
+    receipt = runtime.receipt()
+    directories = list((runtime.cache / 'generations').iterdir())
+    assert any((d / 'baseline.json').is_file() for d in directories)
+    assert (runtime.cache / 'generations' / receipt['generation_id']).is_dir()
+    assert (runtime.cache / 'generations' / receipt['previous_generation_id']).is_dir()
+    assert len(directories) == (3 if phase == 'after-receipt' else 2)
+    assert (receipt['generation_id'] != previous['generation_id']) == (phase == 'after-receipt')
+
+
+def test_legacy_receipt_without_predecessor_is_accepted_and_gc_is_conservative(runtime):
+    import uuid
+    assert runtime.run().returncode == 0
+    receipt = runtime.receipt(); receipt.pop('previous_generation_id')
+    (runtime.cache / 'applied.json').write_text(json.dumps(receipt))
+    historical = runtime.cache / 'generations' / str(uuid.uuid4())
+    shutil.copytree(runtime.cache / 'generations' / receipt['generation_id'], historical)
+    (historical / 'candidate.json').unlink()
+    runtime.backoff()
+    assert runtime.run(apply=False).returncode == 0
+    assert historical.is_dir()
+    runtime.set_target([proxy('Hong Kong A', 'new.example')])
+    assert runtime.run().returncode == 0
+    assert not historical.exists()
+    assert runtime.receipt()['previous_generation_id'] == receipt['generation_id']
+
+
+def test_unreadable_live_export_can_be_repaired(runtime):
+    assert runtime.run().returncode == 0
+    broken = runtime.export / 'all-plain.txt'; broken.chmod(0)
+    runtime.close(); runtime.backoff()
+    result = runtime.run(apply=False)
+    assert result.returncode == 0, result.stderr
+    runtime.wait_socket(62000)
+    assert broken.read_text() == 'socks5://192.0.2.4:62000\n'
+
+
+def test_baseline_with_absent_export_directory_restores_absence(runtime):
+    shutil.rmtree(runtime.export)
+    runtime.set_target([proxy('Hong Kong A', 'new.example')])
+    result = runtime.run(APPROVED_INITIAL_MAPPING_VERSION=runtime.mapping['mapping_version'], TEST_CRASH_PHASE='after-config')
+    assert result.returncode != 0
+    runtime.backoff()
+    assert runtime.run(apply=False).returncode == 0
+    runtime.wait_socket(62000)
+    assert runtime.receipt()['exports_hash'] is None
+    assert not runtime.export.exists()
+
+
+def test_gc_failure_does_not_revoke_commit_and_is_retried(runtime):
+    import uuid
+    assert runtime.run().returncode == 0
+    orphan = runtime.cache / 'generations' / str(uuid.uuid4()); orphan.mkdir()
+    (orphan / 'candidate.json').write_text('{}')
+    fault = runtime.directory / 'gc-fault.cjs'
+    fault.write_text('const fs=require("fs"), original=fs.rmSync;fs.rmSync=function(p,...args){'
+                     f'if(p==={json.dumps(str(orphan))})throw new Error("synthetic gc failure");'
+                     'return original.call(this,p,...args);};')
+    runtime.set_target([proxy('Hong Kong A', 'new.example')])
+    result = runtime.run(NODE_OPTIONS=f'--require={fault}')
+    assert result.returncode == 0, result.stderr
+    receipt = runtime.receipt()
+    assert receipt['mapping_version'] == runtime.mapping['mapping_version']
+    assert orphan.is_dir()
+    assert runtime.run().returncode == 0
+    assert runtime.receipt() == receipt
+    assert not orphan.exists()

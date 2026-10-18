@@ -61,6 +61,9 @@ probe:
   claude_supported_countries_snapshot: "2026-03-16"
 
 policy:
+  # A requires conclusive DNSBL results for at least 80% of queried zones.
+  # Partial/failed queries stay visible; unknown evidence alone never means C.
+  dnsbl_min_checked_ratio: 0.8
   # maintenance keeps these identities unordered and fixed; rebuild lets all
   # fully audited candidates compete for these slots again.
   stable_slots: 3

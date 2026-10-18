@@ -106,7 +106,12 @@ function validatePaths() {
   if (exists(exportDir) && fs.lstatSync(exportDir).isSymbolicLink()) throw new Error('export directory must not itself be a symlink');
 }
 function hashExports(directory) {
-  if (!exists(directory)) return null;
+  let stat;
+  try { stat = fs.lstatSync(directory); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!stat.isDirectory()) throw new Error('exports must be a directory');
   const files = {};
   for (const name of fs.readdirSync(directory).sort()) {
     const file = path.join(directory, name);
@@ -114,6 +119,9 @@ function hashExports(directory) {
     files[name] = fileHash(file);
   }
   return converter.digest(files);
+}
+function exportsMatch(directory, expected) {
+  try { return hashExports(directory) === expected; } catch { return false; }
 }
 function generation(id) {
   if (!/^[0-9a-f-]{36}$/.test(id || '')) throw new Error('invalid generation reference');
@@ -214,7 +222,11 @@ function approvals() {
 }
 function copyExports(source, destination) {
   fs.mkdirSync(destination, { mode: 0o700 });
-  for (const name of fs.readdirSync(source)) persistedCopy(path.join(source, name), path.join(destination, name));
+  for (const name of fs.readdirSync(source)) {
+    const file = path.join(source, name);
+    if (!fs.lstatSync(file).isFile()) throw new Error('exports must contain regular files only');
+    persistedCopy(file, path.join(destination, name));
+  }
   syncDirectory(destination);
 }
 function exportFiles(manifest, map) {
@@ -295,34 +307,71 @@ async function restore(receipt, forceRestart = false) {
     replaceConfig(snapshot, readJSON(path.join(directory, 'permissions.json')));
     if (!exists(core) || fileHash(core) !== receipt.core_sha256) atomicWrite(core, fs.readFileSync(path.join(directory, 'core')), 0o755);
   } catch { failed = true; }
-  try { publishExports(path.join(directory, 'exports')); } catch { failed = true; }
+  const exports = path.join(directory, 'exports');
+  // A corrupt export must neither be published nor prevent service recovery.
+  if (exportsMatch(exports, receipt.exports_hash)) {
+    try { publishExports(exports); } catch { failed = true; }
+  } else { failed = true; }
   const config = readConfig(snapshot);
   const map = exists(path.join(directory, 'map.json')) ? readJSON(path.join(directory, 'map.json')) : null;
   if (changed || forceRestart || !(await runtimeReady(config, map))) {
     if (!(await restartAndWait(config, map))) failed = true;
   }
+  if (!exportsMatch(exportDir, receipt.exports_hash) ||
+      fileHash(configPath) !== receipt.config_sha256 || fileHash(core) !== receipt.core_sha256 ||
+      !(await runtimeReady(config, map))) failed = true;
   if (failed) throw new Error('local runtime recovery incomplete; previous generation retained');
 }
-async function recoverLocal() {
-  currentPhase = 'recover';
-  if (exists(pendingPath)) {
-    const pending = readJSON(pendingPath);
-    if (!exists(appliedPath)) throw new Error('pending apply has no recovery receipt');
+function pruneGenerations() {
+  // Called only under the existing process lock. Failure is diagnostic: GC
+  // cannot revoke a committed apply or destroy an incomplete rollback.
+  try {
+    if (!exists(appliedPath)) return;
     const receipt = readJSON(appliedPath);
-    // applied.json is the only commit selector, including the post-commit crash window.
-    if (receipt.generation_id !== pending.next_generation_id && receipt.generation_id !== pending.previous_generation_id) throw new Error('pending apply does not match commit selector');
-    await restore(receipt, receipt.generation_id === pending.previous_generation_id);
-    fs.unlinkSync(pendingPath); syncDirectory(cache);
-  }
-  if (!exists(appliedPath)) return false;
-  const receipt = readJSON(appliedPath);
-  const directory = generation(receipt.generation_id);
-  const config = readConfig(path.join(directory, 'config.yaml'));
-  const map = exists(path.join(directory, 'map.json')) ? readJSON(path.join(directory, 'map.json')) : null;
-  const coherent = exists(configPath) && fileHash(configPath) === receipt.config_sha256 && exists(core) &&
-    fileHash(core) === receipt.core_sha256 && hashExports(exportDir) === receipt.exports_hash;
-  if (!coherent || !(await runtimeReady(config, map))) { await restore(receipt); return true; }
-  return false;
+    if (!exists(generation(receipt.generation_id))) return;
+    if (receipt.previous_generation_id != null) generation(receipt.previous_generation_id);
+    const retained = new Set([receipt.generation_id, receipt.previous_generation_id]);
+    if (exists(pendingPath)) {
+      const pending = readJSON(pendingPath);
+      generation(pending.previous_generation_id); generation(pending.next_generation_id);
+      retained.add(pending.previous_generation_id); retained.add(pending.next_generation_id);
+    }
+    for (const name of fs.readdirSync(generationRoot)) {
+      if (!/^[0-9a-f-]{36}$/.test(name) || retained.has(name)) continue;
+      const directory = generation(name);
+      if (!fs.lstatSync(directory).isDirectory() || exists(path.join(directory, 'baseline.json'))) continue;
+      // Old receipts have no durable predecessor pointer. Preserve unknown
+      // complete legacy snapshots until a new commit establishes that pointer.
+      if (Object.hasOwn(receipt, 'previous_generation_id') ||
+          exists(path.join(directory, 'candidate.json')) || !exists(path.join(directory, 'core'))) {
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    }
+    syncDirectory(generationRoot);
+  } catch { process.stderr.write('node-health apply: generation cleanup pending\n'); }
+}
+async function recoverLocal() {
+  try {
+    currentPhase = 'recover';
+    if (exists(pendingPath)) {
+      const pending = readJSON(pendingPath);
+      if (!exists(appliedPath)) throw new Error('pending apply has no recovery receipt');
+      const receipt = readJSON(appliedPath);
+      // applied.json is the only commit selector, including the post-commit crash window.
+      if (receipt.generation_id !== pending.next_generation_id && receipt.generation_id !== pending.previous_generation_id) throw new Error('pending apply does not match commit selector');
+      await restore(receipt, receipt.generation_id === pending.previous_generation_id);
+      fs.unlinkSync(pendingPath); syncDirectory(cache);
+    }
+    if (!exists(appliedPath)) return false;
+    const receipt = readJSON(appliedPath);
+    const directory = generation(receipt.generation_id);
+    const config = readConfig(path.join(directory, 'config.yaml'));
+    const map = exists(path.join(directory, 'map.json')) ? readJSON(path.join(directory, 'map.json')) : null;
+    const coherent = exists(configPath) && fileHash(configPath) === receipt.config_sha256 && exists(core) &&
+      fileHash(core) === receipt.core_sha256 && exportsMatch(exportDir, receipt.exports_hash);
+    if (!coherent || !(await runtimeReady(config, map))) { await restore(receipt); return true; }
+    return false;
+  } finally { pruneGenerations(); }
 }
 async function apply(sourcePath, mapPath, expectedVersion) {
   await recoverLocal();
@@ -352,64 +401,62 @@ async function apply(sourcePath, mapPath, expectedVersion) {
   }
   const id = crypto.randomUUID(), directory = generation(id);
   fs.mkdirSync(directory, { mode: 0o700 });
-  const candidate = path.join(directory, 'config.yaml');
-  currentPhase = 'validate-config';
-  atomicWrite(candidate, yaml.dump(rendered.config, { noRefs: true, lineWidth: -1 }));
-  if (!command(core, ['-d', work, '-t', '-f', candidate])) throw new Error('runtime rejected candidate configuration');
-  persistedCopy(core, path.join(directory, 'core'));
-  const oldStat = fs.statSync(configPath);
-  const permissions = { mode: Number.parseInt(env.CONFIG_MODE || '0640', 8), uid: oldStat.uid, gid: oldStat.gid };
-  writeJSON(path.join(directory, 'permissions.json'), permissions);
-  writeJSON(path.join(directory, 'map.json'), map);
-  writeJSON(path.join(directory, 'manifest.json'), rendered.manifest);
-  const exports = path.join(directory, 'exports');
-  fs.mkdirSync(exports, { mode: 0o700 });
-  for (const [name, contents] of Object.entries(outputFiles)) atomicWrite(path.join(exports, name), contents);
-  const unchanged = converter.digest(readConfig(configPath)) === rendered.runtime_config_hash && fileHash(core) === previous.core_sha256;
-  // Preserve exact bytes on semantic no-ops, including a YAML formatting difference.
-  if (unchanged) persistedCopy(configPath, candidate);
-  const next = receiptFor(id, 'managed', map, rendered);
-  syncDirectory(directory);
-  syncDirectory(generationRoot);
-  checkInterrupted();
-  writeJSON(pendingPath, { schema_version: 1, previous_generation_id: previous.generation_id, next_generation_id: id });
   try {
-    currentPhase = 'replace-config';
-    if (!unchanged) replaceConfig(candidate, permissions);
+    writeJSON(path.join(directory, 'candidate.json'), { previous_generation_id: previous.generation_id });
+    const candidate = path.join(directory, 'config.yaml');
+    currentPhase = 'validate-config';
+    atomicWrite(candidate, yaml.dump(rendered.config, { noRefs: true, lineWidth: -1 }));
+    if (!command(core, ['-d', work, '-t', '-f', candidate])) throw new Error('runtime rejected candidate configuration');
+    persistedCopy(core, path.join(directory, 'core'));
+    const oldStat = fs.statSync(configPath);
+    const permissions = { mode: Number.parseInt(env.CONFIG_MODE || '0640', 8), uid: oldStat.uid, gid: oldStat.gid };
+    writeJSON(path.join(directory, 'permissions.json'), permissions);
+    writeJSON(path.join(directory, 'map.json'), map);
+    writeJSON(path.join(directory, 'manifest.json'), rendered.manifest);
+    const exports = path.join(directory, 'exports');
+    fs.mkdirSync(exports, { mode: 0o700 });
+    for (const [name, contents] of Object.entries(outputFiles)) atomicWrite(path.join(exports, name), contents);
+    const unchanged = converter.digest(readConfig(configPath)) === rendered.runtime_config_hash && fileHash(core) === previous.core_sha256;
+    // Preserve exact bytes on semantic no-ops, including a YAML formatting difference.
+    if (unchanged) persistedCopy(configPath, candidate);
+    const next = receiptFor(id, 'managed', map, rendered);
+    next.previous_generation_id = previous.generation_id;
+    syncDirectory(directory);
+    syncDirectory(generationRoot);
     checkInterrupted();
-    if (!unchanged || !(await runtimeReady(rendered.config, map))) {
-      currentPhase = 'restart';
-      if (!(await restartAndWait(rendered.config, map))) throw new Error('new runtime is not ready');
-    }
-    checkInterrupted();
-    if (fileHash(configPath) !== next.config_sha256 || fileHash(core) !== next.core_sha256) throw new Error('runtime files changed during apply');
-    currentPhase = 'exports';
-    publishExports(exports);
-    if (hashExports(exportDir) !== next.exports_hash) throw new Error('export publication mismatch');
-    next.applied_at = new Date().toISOString();
-    currentPhase = 'commit';
-    writeJSON(appliedPath, next);
-  } catch (error) {
-    const failedPhase = currentPhase;
-    const committed = readJSON(appliedPath);
-    await restore(committed, !unchanged);
-    if (exists(pendingPath)) { fs.unlinkSync(pendingPath); syncDirectory(cache); }
-    currentPhase = failedPhase;
-    throw error;
-  }
-  // These projections do not change the committed application outcome.
-  try {
-    fs.unlinkSync(pendingPath); syncDirectory(cache);
-    atomicWrite(path.join(cache, 'applied.version'), `${map.mapping_version}\n`);
-    atomicWrite(path.join(cache, 'applied.sha256'), `${next.config_sha256}\n`);
-    for (const name of fs.readdirSync(generationRoot)) {
-      if (name !== id && name !== previous.generation_id && /^[0-9a-f-]{36}$/.test(name) &&
-          !exists(path.join(generationRoot, name, 'baseline.json'))) {
-        fs.rmSync(path.join(generationRoot, name), { recursive: true, force: true });
+    writeJSON(pendingPath, { schema_version: 1, previous_generation_id: previous.generation_id, next_generation_id: id });
+    try {
+      currentPhase = 'replace-config';
+      if (!unchanged) replaceConfig(candidate, permissions);
+      checkInterrupted();
+      if (!unchanged || !(await runtimeReady(rendered.config, map))) {
+        currentPhase = 'restart';
+        if (!(await restartAndWait(rendered.config, map))) throw new Error('new runtime is not ready');
       }
+      checkInterrupted();
+      if (fileHash(configPath) !== next.config_sha256 || fileHash(core) !== next.core_sha256) throw new Error('runtime files changed during apply');
+      currentPhase = 'exports';
+      publishExports(exports);
+      if (hashExports(exportDir) !== next.exports_hash) throw new Error('export publication mismatch');
+      next.applied_at = new Date().toISOString();
+      currentPhase = 'commit';
+      writeJSON(appliedPath, next);
+    } catch (error) {
+      const failedPhase = currentPhase;
+      const committed = readJSON(appliedPath);
+      await restore(committed, !unchanged);
+      if (exists(pendingPath)) { fs.unlinkSync(pendingPath); syncDirectory(cache); }
+      currentPhase = failedPhase;
+      throw error;
     }
-  } catch { process.stderr.write('node-health apply: committed; derived cleanup pending\n'); }
-  return next;
+    // These projections do not change the committed application outcome.
+    try {
+      fs.unlinkSync(pendingPath); syncDirectory(cache);
+      atomicWrite(path.join(cache, 'applied.version'), `${map.mapping_version}\n`);
+      atomicWrite(path.join(cache, 'applied.sha256'), `${next.config_sha256}\n`);
+    } catch { process.stderr.write('node-health apply: committed; derived cleanup pending\n'); }
+    return next;
+  } finally { pruneGenerations(); }
 }
 const MAX_BUNDLE_BYTES = 32 * 1024 * 1024;
 async function downloadBundle(destination, stage) {

@@ -32,8 +32,9 @@ function nodeKey(proxy) {
   return sha256Hex(canonicalJson(proxy, true));
 }
 const normalizeIdentityText = value => String(value || '').normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase();
-const originalName = proxy => String(proxy._nh_original_name || proxy._original_name || proxy.name || '').trim().replace(/\s+/gu, ' ');
-const sourceId = proxy => normalizeIdentityText(proxy._nh_source_id || proxy._source_id);
+const originalName = proxy => [proxy._nh_original_name, proxy._original_name, proxy.name]
+  .map(value => String(value || '').trim().replace(/\s+/gu, ' ')).find(Boolean) || '';
+const sourceId = proxy => [proxy._nh_source_id, proxy._source_id].map(normalizeIdentityText).find(Boolean) || '';
 const aliasEntryId = (key, source, original, name, ordinal = 1) => sha256Hex(JSON.stringify([key, source, original, name, ordinal]));
 
 function inventoryEntries(proxies) {
@@ -132,8 +133,32 @@ function listenerOptions(listener) {
   if (value.type !== 'mixed') throw new Error('approved listeners must be mixed');
   return value;
 }
-const runtimeProfileHash = profile => digest({ shell: runtimeShell(profile),
-  listeners: (profile.listeners || []).map(listener => ({ port: listener.port, options: listenerOptions(listener) })) });
+function profileReferences(profile) {
+  const targets = (profile['proxy-groups'] || []).flatMap(group => group.proxies || []);
+  for (const rule of profile.rules || []) {
+    if (typeof rule !== 'string') throw new Error('unsupported runtime rule');
+    const parts = rule.split(',');
+    targets.push(parts.at(-1) === 'no-resolve' ? parts.at(-2) : parts.at(-1));
+  }
+  const used = new Set(targets), references = new Map();
+  for (const proxy of profile.proxies || []) {
+    if (!used.has(proxy.name)) continue;
+    const key = `nh-${nodeKey(proxy)}`;
+    if (references.has(proxy.name) && references.get(proxy.name) !== key) {
+      throw new Error('ambiguous runtime profile reference');
+    }
+    references.set(proxy.name, key);
+  }
+  return references;
+}
+function runtimeProfileHash(profile) {
+  const payload = { shell: runtimeShell(profile),
+    listeners: (profile.listeners || []).map(listener => ({ port: listener.port, options: listenerOptions(listener) })) };
+  const references = [...profileReferences(profile)].sort(([a], [b]) => compareCodePoints(a, b));
+  // Profiles without name-based references retain their existing approval.
+  if (references.length) payload.references = references;
+  return digest(payload);
+}
 function optionsForPort(profile, port) {
   const listeners = profile.listeners || [];
   const existing = listeners.find(listener => listener.port === port);
@@ -167,7 +192,7 @@ function proxyForRuntime(proxy, previous) {
 }
 function remapShellReferences(profile, shell, proxies) {
   const names = new Set(proxies.map(proxy => proxy.name));
-  const oldNames = new Map((profile.proxies || []).map(proxy => [proxy.name, `nh-${nodeKey(proxy)}`]));
+  const oldNames = profileReferences(profile);
   const groups = new Set((shell['proxy-groups'] || []).map(group => group.name));
   const builtins = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL']);
   function target(name) {

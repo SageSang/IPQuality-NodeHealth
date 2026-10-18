@@ -93,6 +93,7 @@ def _full_from_dict(value: Any) -> FullResult | None:
         "tor",
         "dnsbl_blacklisted",
         "dnsbl_listed_count",
+        "dnsbl_coverage",
         "risk_sources",
         "labels",
         "details",

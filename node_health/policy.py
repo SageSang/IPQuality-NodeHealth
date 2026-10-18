@@ -8,6 +8,7 @@ from statistics import median
 from typing import Any
 
 from .config import PolicyConfig
+from .dnsbl import clean_coverage
 from .models import Evaluation, FullResult, Node, QuickResult, SiteProbeResult
 
 
@@ -63,42 +64,30 @@ def attach_quick_ai_evidence(full: FullResult, quick: QuickResult) -> FullResult
     return full
 
 
-_RISK_LABELS = {
-    "very low",
-    "low",
-    "medium",
-    "moderate",
-    "elevated",
-    "high",
-    "very high",
-    "veryhigh",
-    "high risk",
-    "highrisk",
-    "very high risk",
-    "critical",
-    "极低",
-    "低",
-    "中等",
-    "高",
-    "极高",
-    "高风险",
-    "极高风险",
-}
 _UNKNOWN_RISK_VALUES = {"", "none", "null", "unknown", "n/a", "na", "nan", "-", "timeout"}
 _RISK_SEVERITY = {
     "very low": 0.05,
+    "verylow": 0.05,
+    "极低": 0.05,
     "low": 0.15,
+    "低": 0.15,
     "medium": 0.5,
     "moderate": 0.5,
+    "中等": 0.5,
     "elevated": 0.65,
     "high": 0.8,
     "high risk": 0.8,
     "highrisk": 0.8,
+    "高": 0.8,
+    "高风险": 0.8,
     "very high": 0.95,
     "veryhigh": 0.95,
     "very high risk": 0.95,
+    "极高": 0.95,
+    "极高风险": 0.95,
     "critical": 1.0,
 }
+_RISK_LABELS = frozenset(_RISK_SEVERITY)
 _DEFAULT_DNSBL_REDLINE_THRESHOLD = 3
 
 
@@ -182,34 +171,19 @@ def full_has_sufficient_risk_coverage(full: FullResult | None, policy: PolicyCon
 
 
 def _risk_severity(value: str) -> float:
-    normalized = value.strip().lower().replace("_", " ").replace("-", " ")
-    normalized = " ".join(normalized.split())
+    normalized = normalize_risk_value(value)
+    if not normalized:
+        raise ValueError("unknown risk value has no severity")
     numeric = normalized[:-1].strip() if normalized.endswith("%") else normalized
     try:
         return max(0.0, min(1.0, float(numeric) / 100.0))
     except ValueError:
-        return _RISK_SEVERITY.get(normalized, 0.5)
+        return _RISK_SEVERITY[normalized]
 
 
 def _is_high_risk(value: str) -> bool:
-    normalized = value.strip().lower().replace("_", " ").replace("-", " ")
-    if normalized in {
-        "high",
-        "very high",
-        "veryhigh",
-        "high risk",
-        "highrisk",
-        "critical",
-        "danger",
-        "dangerous",
-        "高风险",
-        "极高风险",
-    }:
-        return True
-    try:
-        return float(normalized.rstrip("%")) >= 75
-    except ValueError:
-        return False
+    normalized = normalize_risk_value(value)
+    return bool(normalized and _risk_severity(normalized) >= 0.75)
 
 
 def dnsbl_listed_count(full: FullResult | None) -> int:
@@ -402,6 +376,7 @@ def _route_risk_profile(
     *,
     dnsbl_count: int = 0,
     dnsbl_threshold: int = _DEFAULT_DNSBL_REDLINE_THRESHOLD,
+    dnsbl_checked: bool = True,
 ) -> dict[str, Any]:
     severities = [_risk_severity(value) for value in risks.values()]
     if severities:
@@ -454,6 +429,7 @@ def _route_risk_profile(
         len(risks) >= minimum_sources
         and max(severities, default=1.0) < 0.5
         and dnsbl_count == 0
+        and dnsbl_checked
         and not any(
             factors[name]
             for name in ("proxy", "vpn", "server", "abuser", "tor")
@@ -478,6 +454,8 @@ def _risk_profile(
         policy.min_valid_risk_sources,
         dnsbl_count=dnsbl_listed_count(full),
         dnsbl_threshold=_dnsbl_severe_threshold(policy),
+        dnsbl_checked=bool(full and full.completed and
+                           clean_coverage(full.dnsbl_coverage, policy.dnsbl_min_checked_ratio)),
     )
     routes = {"generic": generic}
     split_claude_route = bool(
@@ -763,6 +741,8 @@ def evaluate_node(
             reasons.append(f"dnsbl-redline:{listed_count}>={dnsbl_threshold}")
         elif listed_count:
             reasons.append(f"dnsbl-listed:{listed_count}")
+        if not clean_coverage(full.dnsbl_coverage, policy.dnsbl_min_checked_ratio) and not listed_count:
+            reasons.append("dnsbl-coverage-insufficient")
         high_sources = sorted(name for name, value in valid_risk_sources(full).items() if _is_high_risk(value))
         if len(high_sources) >= 2:
             reasons.append("multiple-high-risk-sources:" + ",".join(high_sources))

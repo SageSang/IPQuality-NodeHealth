@@ -53,6 +53,8 @@ def site(host="chatgpt.com", ip="8.8.8.8", country="US", result="available"):
 
 def full_result(*args, **kwargs):
     kwargs.setdefault("risk_evidence_version", 1)
+    kwargs.setdefault("dnsbl_coverage", {"version": 1, "status": "clean", "total": 5,
+                                       "checked": 5, "clean": 5, "listed": 0, "unknown": 0, "error_count": 0})
     return FullResult(*args, **kwargs)
 
 

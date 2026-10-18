@@ -177,6 +177,8 @@ class FakeFull:
         return FullResult(
             completed=completed,
             risk_evidence_version=1 if completed else 0,
+            dnsbl_coverage={"version": 1, "status": "clean", "total": 5,
+                            "checked": 5, "clean": 5, "listed": 0, "unknown": 0, "error_count": 0},
             audited_exit_ip=self.exit_ips.get(node.key, f"8.8.8.{index}"),
             risk_sources=self.risk_sources.get(
                 node.key,
