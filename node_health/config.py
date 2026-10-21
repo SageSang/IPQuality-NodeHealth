@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 import logging
+import ipaddress
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -109,6 +111,13 @@ class ProbeConfig:
     samples: int = 3
     ip_url: str = "https://api.ipify.org?format=json"
     geo_url_template: str = "https://ipapi.co/{ip}/json/"
+    geo_token: str = ""
+    ipinfo_risk_enabled: bool = True
+    ipapi_risk_enabled: bool = True
+    ipapi_proxy_url: str = ""
+    dnsbl_server: str = ""
+    dnsbl_port: int = 53
+    dnsbl_concurrency: int = 10
     google_url: str = "https://www.gstatic.com/generate_204"
     chatgpt_url: str = "https://chatgpt.com/cdn-cgi/trace"
     unavailable_retry_delays_seconds: list[float] = field(
@@ -394,6 +403,37 @@ def _validate_config(config: AppConfig, local_socks_raw: dict[str, Any]) -> None
         )
     if config.probe.concurrency < 1 or config.probe.full_concurrency < 1:
         raise ValueError("probe concurrency values must be positive")
+    for field_name in ("ipinfo_risk_enabled", "ipapi_risk_enabled"):
+        if type(getattr(config.probe, field_name)) is not bool:
+            raise ValueError(f"probe.{field_name} must be a boolean")
+    if not isinstance(config.probe.geo_token, str):
+        raise ValueError("probe.geo_token must be a string")
+    try:
+        if not isinstance(config.probe.ipapi_proxy_url, str):
+            raise ValueError()
+        proxy = urlsplit(config.probe.ipapi_proxy_url)
+        if config.probe.ipapi_proxy_url and (
+            proxy.scheme not in {"http", "https", "socks5", "socks5h"}
+            or not proxy.hostname or not proxy.port
+            or proxy.path not in {"", "/"} or proxy.query or proxy.fragment
+            or any(character.isspace() for character in config.probe.ipapi_proxy_url)
+        ):
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("probe.ipapi_proxy_url must be an HTTP/SOCKS proxy URL with an explicit port") from None
+    if not isinstance(config.probe.dnsbl_server, str):
+        raise ValueError("probe.dnsbl_server must be an IP address or empty")
+    if config.probe.dnsbl_server:
+        try:
+            ipaddress.ip_address(config.probe.dnsbl_server)
+        except ValueError:
+            raise ValueError("probe.dnsbl_server must be an IP address or empty") from None
+    for field_name, maximum in (("dnsbl_port", 65535), ("dnsbl_concurrency", 50)):
+        value = getattr(config.probe, field_name)
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise ValueError(f"probe.{field_name} must be an integer in 1..{maximum}")
+    if not config.probe.dnsbl_server and config.probe.dnsbl_port != 53:
+        raise ValueError("probe.dnsbl_server is required for a custom DNSBL port")
     for field_name in ("provider_max_requests_per_scan", "max_response_bytes"):
         value = getattr(config.probe, field_name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:

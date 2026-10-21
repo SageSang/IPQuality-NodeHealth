@@ -199,7 +199,7 @@ def dns_result(total=5, clean=5, listed=0, unknown=0, errors=0):
     (';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1', 0, [1, 1, 0, 0, 0]),
     (';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1', 0, [1, 1, 0, 0, 0]),
     (';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\nx. 30 IN A 127.0.0.2\nx. 30 IN A 127.0.0.3', 0, [1, 0, 0, 1, 0]),
-    (';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\nx. 30 IN A 127.255.255.254', 0, [1, 0, 1, 0, 0]),
+    (';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\nx. 30 IN A 127.255.255.254', 0, [1, 0, 0, 0, 1]),
 ])
 def test_dnsbl_checks_exit_and_dns_status(body, code, counts):
     source = (ROOT / 'ip.sh').read_text()
@@ -207,7 +207,13 @@ def test_dnsbl_checks_exit_and_dns_status(body, code, counts):
     shell = '''declare -A smail
 read_dnsbl_zones(){ printf 'test.invalid\n'; }
 filter_dnsbl_zones(){ cat; }
-dig(){ printf '%s\n' "$DNS_BODY"; return "$DNS_EXIT"; }
+dig(){
+case "${@: -2:1}" in
+2.0.0.127.*)printf ';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\nx. 30 IN A 127.0.0.2\n';;
+1.0.0.127.*)printf ';; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n';;
+*)printf '%s\n' "$DNS_BODY"; return "$DNS_EXIT";;
+esac
+}
 export -f dig
 '''+function+'\ncheck_dnsbl_parallel 8.8.8.8 1\n'
     result = subprocess.run(['bash', '-c', shell], env=dict(os.environ, DNS_BODY=body, DNS_EXIT=str(code)),

@@ -782,6 +782,8 @@ maxmind[map]="null"
 fi
 }
 db_ipinfo(){
+ipinfo=()
+[[ ${IPQUALITY_IPINFO_ENABLED:-1} == 1 ]]||return 0
 local temp_info="$Font_Cyan$Font_B${sinfo[database]}${Font_I}IPinfo $Font_Suffix"
 ((ibar_step+=3))
 show_progress_bar "$temp_info" $((40-7-${sinfo[ldatabase]}))&
@@ -942,16 +944,29 @@ ipregistry[server]=$(echo "$RESPONSE"|jq -r '.security.is_cloud_provider')
 ipregistry[abuser]=$(echo "$RESPONSE"|jq -r '.security.is_abuser')
 }
 db_ipapi(){
+ipapi=()
+[[ ${IPQUALITY_IPAPI_ENABLED:-1} == 1 ]]||return 0
 local temp_info="$Font_Cyan$Font_B${sinfo[database]}${Font_I}ipapi $Font_Suffix"
 ((ibar_step+=3))
 show_progress_bar "$temp_info" $((40-6-${sinfo[ldatabase]}))&
 bar_pid="$!"&&disown "$bar_pid"
 trap "kill_progress_bar" RETURN
 ipapi=()
+local api_url="https://api.ipapi.is/?q=$IP"
+local proxy_args=()
+if [[ -n ${IPQUALITY_IPAPI_PROXY_URL:-} ]];then
+proxy_args=(--proxy "$IPQUALITY_IPAPI_PROXY_URL" --noproxy "")
+fi
+if [[ -n ${IPAPI_KEY:-} ]];then
+api_url+="&key=$(printf '%s' "$IPAPI_KEY"|jq -sRr @uri)"
+fi
 if [[ $IP == *:* ]];then
-local RESPONSE=$(curl -fLs -m 10 "https://api.ipapi.is/?q=$IP")
+local RESPONSE=$(curl "${proxy_args[@]}" -fLs -m 10 "$api_url")
 else
-local RESPONSE=$(curl $CurlARG -fsL -m 10 "https://api.ipapi.is/?q=$IP")
+local RESPONSE=$(curl $CurlARG "${proxy_args[@]}" -fsL -m 10 "$api_url")
+fi
+if [[ -n ${IPQUALITY_IPAPI_PROXY_URL:-} ]];then
+printf '%s\n' "$RESPONSE"|jq -e --arg ip "$IP" 'type == "object" and .ip == $ip' >/dev/null 2>&1||return 1
 fi
 printf '%s\n' "$RESPONSE"|jq -e 'type == "object" and (.error | not) and (.company.abuser_score != null)' >/dev/null 2>&1||return 1
 ipapi[usetype]=$(echo "$RESPONSE"|jq -r '.asn.type')
@@ -1814,6 +1829,7 @@ if (valid) print tolower(zone)
 check_dnsbl_parallel(){
 ip_to_check=$1
 parallel_jobs=$2
+[[ $parallel_jobs =~ ^[0-9]+$ ]]&&((parallel_jobs>=1&&parallel_jobs<=50))||return 1
 smail[t]=0
 smail[c]=0
 smail[m]=0
@@ -1824,9 +1840,16 @@ local clean=0
 local blacklisted=0
 local other=0
 local errors=0
-dnsbl_query(){
-local result status records
-if ! result=$(dig +time=3 +tries=1 +noall +comments +answer "${2}.${1}" A 2>/dev/null);then
+dnsbl_lookup(){
+local result status records address listed=0
+local server="${IPQUALITY_DNSBL_SERVER:-}" port="${IPQUALITY_DNSBL_PORT:-53}"
+local args=(+time=3 +tries=1 +noall +comments +answer)
+if [[ ! $port =~ ^[0-9]+$ ]]||((port<1||port>65535))||[[ -z $server && $port != 53 ]];then
+echo "Error"
+return
+fi
+if [[ -n $server ]];then args+=("@$server" -p "$port");fi
+if ! result=$(dig "${args[@]}" "${2}.${1}" A 2>/dev/null);then
 echo "Error"
 return
 fi
@@ -1837,16 +1860,47 @@ NOERROR)
 records=$(printf '%s\n' "$result"|awk '!/^;/ && NF')
 if [[ -z $records ]];then
 echo "Clean"
-elif printf '%s\n' "$records"|awk '$4=="A" && $5=="127.0.0.2" {found=1} END {exit !found}';then
-echo "Blacklisted"
 else
+while IFS= read -r address;do
+case "$address" in
+127.255.255.*)echo "Error";return;;
+127.0.0.2)listed=1;;
+127.0.0.3|127.0.0.4|127.0.0.9)
+case "$1" in
+*.spamhaus.org|*.spamhaus.net)listed=1;;
+*):;;
+esac;;
+*):;;
+esac
+done < <(printf '%s\n' "$records"|awk '$4=="A" {print $5}')
+# Fake-IP, unrelated answers and policy-only codes are not clean evidence.
+if printf '%s\n' "$records"|awk '$4=="A" && $5!~/^127\./ {found=1} END {exit !found}';then
 echo "Other"
+elif ((listed));then echo "Blacklisted"
+else echo "Other"
+fi
 fi;;
 SERVFAIL|REFUSED|FORMERR|NOTIMP)echo "Error";;
 *)echo "Other";;
 esac
 }
-export -f dnsbl_query
+dnsbl_query(){
+local positive negative
+# A retired or wildcarded zone must not turn NXDOMAIN into clean evidence.
+# Resolver caching reuses these fixed controls across targets and workers.
+positive=$(dnsbl_lookup "$1" 2.0.0.127)
+if [[ $positive != Blacklisted ]];then
+[[ $positive == Error ]]&&echo "Error"||echo "Other"
+return
+fi
+negative=$(dnsbl_lookup "$1" 1.0.0.127)
+if [[ $negative != Clean ]];then
+[[ $negative == Error ]]&&echo "Error"||echo "Other"
+return
+fi
+dnsbl_lookup "$1" "$2"
+}
+export -f dnsbl_lookup dnsbl_query
 read_dnsbl_zones|filter_dnsbl_zones|sort -u|xargs -P "$parallel_jobs" -I {} bash -c 'dnsbl_query "$1" "$2"' _ {} "$reversed_ip"|{
 while IFS= read -r line;do
 ((total++))
@@ -1870,7 +1924,7 @@ local temp_info="$Font_Cyan$Font_B${sinfo[dnsbl]} $Font_Suffix"
 show_progress_bar "$temp_info" $((40-1-${sinfo[ldnsbl]}))&
 bar_pid="$!"&&disown "$bar_pid"
 trap "kill_progress_bar" RETURN
-local num_array=($(check_dnsbl_parallel "$IP" 50))
+local num_array=($(check_dnsbl_parallel "$IP" "${IPQUALITY_DNSBL_CONCURRENCY:-10}"))
 smail[t]=${num_array[0]:-0}
 smail[c]=${num_array[1]:-0}
 smail[m]=${num_array[2]:-0}

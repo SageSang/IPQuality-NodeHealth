@@ -278,7 +278,7 @@ class CurlQuickProbe:
         self._provider_counts: dict[str, Counter] = {}
         self._provider_observations: dict[str, dict[str, Any]] = {}
         self._provider_budget: dict[str, int] = {}
-        self._provider_failures: dict[str, list[tuple[float, int, str]]] = {}
+        self._provider_failures: dict[str, list[tuple[float, str, str]]] = {}
         self._diagnostic_retries: Counter[str] = Counter()
         self._planned_routes: set[int] | None = None
 
@@ -296,14 +296,16 @@ class CurlQuickProbe:
             # provider cooldowns have a meaning beyond this route allocation.
             self._provider_backoff = {
                 key: value for key, value in self._provider_backoff.items()
-                if key[0] != "route"
+                if key[0] != "route" or key[-1].startswith("configured-")
             }
             if request_routes is not None:
-                for template in (
-                    self.config.probe.geo_url_template,
-                    self.config.probe.claude_ipinfo_url_template,
-                    self.config.probe.claude_ipapi_url_template,
+                for enabled, template in (
+                    (True, self.config.probe.geo_url_template),
+                    (self.config.probe.ipinfo_risk_enabled, self.config.probe.claude_ipinfo_url_template),
+                    (self.config.probe.ipapi_risk_enabled, self.config.probe.claude_ipapi_url_template),
                 ):
+                    if not enabled or not template.strip():
+                        continue
                     source = urllib.parse.urlsplit(template).hostname or "unknown"
                     self._provider_budget[source] = min(
                         self.config.probe.provider_max_requests_per_scan,
@@ -315,9 +317,22 @@ class CurlQuickProbe:
             return {source: {**dict(counts), **self._provider_observations.get(source, {})}
                     for source, counts in self._provider_counts.items()}
 
+    def _require_source(self, enabled: bool, resource_kind: str) -> None:
+        if enabled:
+            return
+        # Capability configuration is independent of a hostname's live health.
+        # Disabling paid lookup must not put a working Lite endpoint in backoff.
+        with self._provider_lock:
+            self._provider_counts.setdefault(resource_kind, Counter())["disabled_skips"] += 1
+            self._provider_observations[resource_kind] = {
+                "enabled": False, "last_status": "provider_disabled",
+            }
+        raise ProbeFailure("provider_disabled")
+
     def _provider_get(
         self, port: int, url: str, timeout_seconds: float | None = None,
         *, resource_kind: str = "geo", target_ip: str = "",
+        proxy_url: str = "",
     ) -> tuple[str, float]:
         source = urllib.parse.urlsplit(url).hostname or "unknown"
         if not url.strip():
@@ -332,7 +347,9 @@ class CurlQuickProbe:
         auth = hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest()
         authenticated = any(any(value for value in values) for values in credentials.values())
         cache_key = json.dumps((source, auth, resource_kind, target_ip or url, RISK_EVIDENCE_VERSION))
-        scopes = [("provider", source), ("account", source, auth), ("route", source, auth, str(port))]
+        route = ("configured-" + hashlib.sha256(proxy_url.encode()).hexdigest()
+                 if proxy_url else str(port))
+        scopes = [("provider", source), ("account", source, auth), ("route", source, auth, route)]
         with self._provider_lock:
             lock = self._provider_locks.setdefault(source, threading.Lock())
         # Serialize each provider to avoid a quota burst, and coalesce lookups
@@ -343,6 +360,7 @@ class CurlQuickProbe:
                 counts = self._provider_counts.setdefault(source, Counter())
                 observation = self._provider_observations.setdefault(source, {})
                 observation["credential_configured"] = authenticated
+                observation["query_transport"] = "configured-proxy" if proxy_url else "node"
                 cached = self._provider_cache.get(cache_key)
                 if cached and cached[0] > now:
                     counts["cache_hits"] += 1
@@ -364,7 +382,8 @@ class CurlQuickProbe:
                     counts["half_open_requests"] += 1
                 counts["requests"] += 1
             try:
-                response = self._http_get(port, url, timeout_seconds)
+                response = (self._http_get(port, url, timeout_seconds, proxy_url=proxy_url)
+                            if proxy_url else self._http_get(port, url, timeout_seconds))
                 body, elapsed = response.body, response.elapsed_ms
                 if response.transport_code or response.error_code or not 200 <= response.http_status < 300:
                     code = (
@@ -379,6 +398,15 @@ class CurlQuickProbe:
                 payload = json.loads(body)
                 if not isinstance(payload, dict) or payload.get("error"):
                     raise ProbeFailure("provider_invalid_response", response)
+                if proxy_url:
+                    # The query egress differs from the measured node: a
+                    # self-IP reply must never be attached to that node.
+                    try:
+                        matched = ipaddress.ip_address(str(payload.get("ip", ""))) == ipaddress.ip_address(target_ip)
+                    except ValueError:
+                        matched = False
+                    if not matched:
+                        raise ProbeFailure("provider_invalid_response", response)
             except Exception as error:
                 failure = error if isinstance(error, ProbeFailure) else ProbeFailure("provider_invalid_response")
                 response = failure.response
@@ -409,7 +437,7 @@ class CurlQuickProbe:
                         delay = 300 if status == 403 else 60
                         self._provider_backoff[scopes[2]] = (now + (retry_after if retry_after is not None else delay), code)
                         failures = [(stamp, route, kind) for stamp, route, kind in self._provider_failures.get(source, []) if now - stamp <= 60]
-                        failures.append((now, port, code))
+                        failures.append((now, route, code))
                         self._provider_failures[source] = failures
                         if len({route for _, route, kind in failures if kind == code}) >= 2 or half_open:
                             self._provider_backoff[scopes[0]] = (now + max(60, retry_after or 0), code)
@@ -448,7 +476,8 @@ class CurlQuickProbe:
             raise ProbeFailure("probe_timeout" if response.transport_code == 28 else "probe_failed", response)
         return response.body, response.elapsed_ms
 
-    def _http_get(self, port: int | None, url: str, timeout_seconds: float | None = None) -> HTTPResult:
+    def _http_get(self, port: int | None, url: str, timeout_seconds: float | None = None,
+                  *, proxy_url: str = "") -> HTTPResult:
         timeout = timeout_seconds or self.config.probe.request_timeout_seconds
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="node-health-http-") as directory:
@@ -459,7 +488,9 @@ class CurlQuickProbe:
                        "--max-filesize", str(self.config.probe.max_response_bytes),
                        "--output", str(body_path), "--dump-header", str(headers_path),
                        "--write-out", "%{http_code}\n%{url_effective}"]
-            if port is not None:
+            if proxy_url:
+                command.extend(["--proxy", proxy_url, "--noproxy", ""])
+            elif port is not None:
                 command.extend(["--proxy", f"http://{self.config.probe.proxy_host}:{port}",
                                 "--noproxy", ""])
             command.append(url)
@@ -562,6 +593,7 @@ class CurlQuickProbe:
         risk_providers: set[str] = set()
 
         try:
+            self._require_source(self.config.probe.ipinfo_risk_enabled, "ipinfo-risk")
             body, _ = self._provider_get(
                 port,
                 _provider_url(
@@ -607,6 +639,7 @@ class CurlQuickProbe:
             payload["errors"].append(safe_error_text(None, "quick-scan", code=error.code if isinstance(error, ProbeFailure) else "provider_invalid_response"))
 
         try:
+            self._require_source(self.config.probe.ipapi_risk_enabled, "ipapi-risk")
             body, _ = self._provider_get(
                 port,
                 _provider_url(
@@ -617,6 +650,7 @@ class CurlQuickProbe:
                 ),
                 self.config.probe.claude_timeout_seconds,
                 resource_kind="ipapi-risk", target_ip=exit_ip,
+                proxy_url=self.config.probe.ipapi_proxy_url,
             )
             response = json.loads(body)
             if not isinstance(response, dict):
@@ -762,7 +796,11 @@ class CurlQuickProbe:
         country = ""
         asn = ""
         try:
-            body, _ = self._provider_get(port, self.config.probe.geo_url_template.format(ip=exit_ip), resource_kind="geo", target_ip=exit_ip)
+            body, _ = self._provider_get(
+                port, _provider_url(self.config.probe.geo_url_template, exit_ip,
+                                    "token", self.config.probe.geo_token),
+                resource_kind="geo", target_ip=exit_ip,
+            )
             geo = json.loads(body)
             country = str(geo.get("country_code") or geo.get("country") or "").upper()
             if not re.fullmatch(r"[A-Z]{2}", country):
@@ -896,6 +934,13 @@ class IPQualityAuditor:
                         "IPQUALITY_SKIP_MAIL": "1",
                         "IPQUALITY_SKIP_AI": "1",
                         "IPQUALITY_DNSBL_FILE": BUNDLED_DNSBL_FILE,
+                        "IPQUALITY_DNSBL_SERVER": self.config.probe.dnsbl_server,
+                        "IPQUALITY_DNSBL_PORT": str(self.config.probe.dnsbl_port),
+                        "IPQUALITY_DNSBL_CONCURRENCY": str(self.config.probe.dnsbl_concurrency),
+                        "IPQUALITY_IPINFO_ENABLED": "1" if self.config.probe.ipinfo_risk_enabled else "0",
+                        "IPQUALITY_IPAPI_ENABLED": "1" if self.config.probe.ipapi_risk_enabled else "0",
+                        "IPAPI_KEY": self.config.probe.claude_ipapi_key,
+                        "IPQUALITY_IPAPI_PROXY_URL": self.config.probe.ipapi_proxy_url,
                     },
                 )
             except (OSError, subprocess.TimeoutExpired):

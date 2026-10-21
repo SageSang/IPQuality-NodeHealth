@@ -36,7 +36,22 @@ probe:
   max_response_bytes: 1048576
   samples: 3
   ip_url: https://api.ipify.org?format=json
-  geo_url_template: https://ipapi.co/{ip}/json/
+  # Lite supplies country/ASN only, never privacy/reputation evidence.
+  geo_url_template: https://api.ipinfo.io/lite/{ip}
+  geo_token: ${IPINFO_TOKEN:-}
+  # Enable only after the account/route can return the required risk fields.
+  # These switches cover Python lookups AND the corresponding ip.sh sources.
+  ipinfo_risk_enabled: false
+  ipapi_risk_enabled: false
+  # Optional verified transport for explicit-IP metadata queries only.
+  # Node reachability/site/latency probes still use the measured node.
+  # Nonempty requires each response to identify the requested IP.
+  ipapi_proxy_url: ""
+  # Set a reachable real DNS resolver for DNSBL only. Empty uses system DNS.
+  # Public resolvers may be refused by some lists; refusals remain unknown.
+  dnsbl_server: ""
+  dnsbl_port: 53
+  dnsbl_concurrency: 10
   google_url: https://www.gstatic.com/generate_204
   chatgpt_url: https://chatgpt.com/cdn-cgi/trace
   # An unavailable node is checked again after 2 and then 5 minutes before the
@@ -45,12 +60,10 @@ probe:
   claude_timeout_seconds: 8
   claude_trace_url: https://claude.ai/cdn-cgi/trace
   anthropic_trace_url: https://www.anthropic.com/cdn-cgi/trace
-  # IPinfo Core/Plus lookup. A token is needed for reliable privacy/hosting
-  # evidence; without one only whatever the provider returns is used.
+  # IPinfo paid lookup; the Lite token does not grant privacy capability.
   claude_ipinfo_url_template: https://api.ipinfo.io/lookup/{ip}
   claude_ipinfo_token: ${IPINFO_TOKEN:-}
-  # The anonymous ipapi.is endpoint is rate-limited. Configure IPAPI_KEY for
-  # larger pools and complete responses.
+  # IPAPI_KEY is also passed to the enabled ip.sh ipapi source.
   claude_ipapi_url_template: https://api.ipapi.is/?q={ip}
   claude_ipapi_key: ${IPAPI_KEY:-}
   # OpenAI ChatGPT web/mobile support snapshot checked 2026-09-02. Override

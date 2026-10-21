@@ -17,6 +17,7 @@ ERROR_CODES = frozenset({
     "storage_failed", "storage_access_denied", "legacy_error_detail_hidden",
     "provider_http_error", "provider_rate_limited", "provider_denied",
     "provider_invalid_auth", "provider_forbidden", "provider_missing_config",
+    "provider_disabled",
     "provider_invalid_response", "provider_backoff", "provider_budget_exhausted",
     "probe_timeout", "probe_failed", "full_audit_failed", "full_audit_incomplete",
     "egress_mismatch", "mapping_unavailable", "report_unavailable",
