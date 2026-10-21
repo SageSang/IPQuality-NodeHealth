@@ -8,7 +8,7 @@ import pytest
 
 from node_health.config import AppConfig, InventoryConfig, ProbeConfig, load_config
 from node_health.models import ClaudeResult, Node
-from node_health.probe import CurlQuickProbe, HTTPResult, IPQualityAuditor
+from node_health.probe import CurlQuickProbe, HTTPResult, IPQualityAuditor, ProbeFailure
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -338,3 +338,57 @@ def test_dnsbl_target_transport_failure_is_not_clean(tmp_path):
 def test_bad_dnsbl_settings_do_not_silently_fall_back_to_system_dns(tmp_path):
     counts, calls = dnsbl(tmp_path, NEGATIVE, server="", port="1053")
     assert counts == [1, 0, 0, 0, 1] and not calls
+
+
+@pytest.mark.parametrize("zones", [
+    ["dev.null.dk", "spamsources.fabel.dk"],
+    ["zen.spamhaus.org", "sbl.spamhaus.org", "zen.spamhaus.net"],
+    ["dnsbl-1.uceprotect.net", "dnsbl-2.uceprotect.net", "dnsbl-3.uceprotect.net"],
+    ["bl.mailspike.net", "bl.mailspike.org", "rep.mailspike.net"],
+    ["b.barracudacentral.org", "bb.barracudacentral.org"],
+])
+def test_dnsbl_same_operator_zones_are_one_redline_source(tmp_path, zones):
+    counts, _ = dnsbl(tmp_path, POSITIVE, zone="\n".join(zones))
+    assert counts == [len(zones), 0, len(zones) - 1, 1, 0]
+
+
+def test_dnsbl_three_independent_operators_still_count_three(tmp_path):
+    zones = ["spamsources.fabel.dk", "zen.spamhaus.org", "bl.spamcop.net"]
+    counts, _ = dnsbl(tmp_path, POSITIVE, zone="\n".join(zones))
+    assert counts == [3, 0, 0, 3, 0]
+
+
+@pytest.mark.parametrize("zone", ["korea.services.net", "korea.rominet.net", "wl.mailspike.net",
+                                  "list.dnswl.org", "0spamtrust.fusionzero.com", "0spamurl.fusionzero.com"])
+def test_dnsbl_non_security_or_unverified_lists_never_become_abuse_votes(tmp_path, zone):
+    counts, calls = dnsbl(tmp_path, POSITIVE, zone=zone)
+    assert counts == [1, 0, 1, 0, 0] and calls == []
+
+
+def test_real_redline_regression_alias_and_geographic_list_are_one_source(tmp_path):
+    zones = ["dev.null.dk", "korea.services.net", "spamsources.fabel.dk"]
+    counts, _ = dnsbl(tmp_path, POSITIVE, zone="\n".join(zones))
+    assert counts == [3, 0, 2, 1, 0]
+
+
+@pytest.mark.parametrize("recent_success,status,transport,global_backoff", [
+    (True, 0, 35, False),
+    (True, 0, 28, False),
+    (False, 0, 35, True),
+    (True, 429, 0, True),
+    (True, 403, 0, True),
+])
+def test_recent_provider_success_separates_route_failure_from_provider_refusal(
+        monkeypatch, recent_success, status, transport, global_backoff):
+    now = [100.0]
+    monkeypatch.setattr("node_health.probe.time.monotonic", lambda: now[0])
+    probe = CurlQuickProbe(config())
+    probe._http_get = lambda *_: HTTPResult(0, 200, 1, '{"country_code":"US"}')
+    probe._provider_get(20000, "https://geo.invalid/one", target_ip="8.8.8.8")
+    now[0] += 1 if recent_success else 61
+    probe._http_get = lambda *_: HTTPResult(transport, status, 1)
+    for port, ip in [(20001, "1.1.1.1"), (20002, "9.9.9.9")]:
+        with pytest.raises(ProbeFailure):
+            probe._provider_get(port, "https://geo.invalid/" + ip, target_ip=ip)
+    assert (("provider", "geo.invalid") in probe._provider_backoff) is global_backoff
+    assert sum(key[0] == "route" for key in probe._provider_backoff) == 2

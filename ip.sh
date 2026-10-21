@@ -1885,7 +1885,13 @@ SERVFAIL|REFUSED|FORMERR|NOTIMP)echo "Error";;
 esac
 }
 dnsbl_query(){
-local positive negative
+local positive negative target provider
+# Queryable is not the same as security evidence. Allow lists, URI lists and
+# unverified geographic blocks must not count as abusive-IP findings.
+case "$1" in
+korea.services.net|korea.rominet.net|wl.mailspike.net|list.dnswl.org|dnswl.*|vouch.dwl.spamhaus.org|0spamtrust.fusionzero.com|0spamurl.fusionzero.com)
+echo "Other";return;;
+esac
 # A retired or wildcarded zone must not turn NXDOMAIN into clean evidence.
 # Resolver caching reuses these fixed controls across targets and workers.
 positive=$(dnsbl_lookup "$1" 2.0.0.127)
@@ -1898,15 +1904,42 @@ if [[ $negative != Clean ]];then
 [[ $negative == Error ]]&&echo "Error"||echo "Other"
 return
 fi
-dnsbl_lookup "$1" "$2"
+target=$(dnsbl_lookup "$1" "$2")
+if [[ $target != Blacklisted ]];then echo "$target";return;fi
+# Multiple zones (including legacy aliases) from one operator are one source,
+# not independent votes for the three-source redline.
+case "$1" in
+dev.null.dk|spamsources.fabel.dk)provider=fabel.dk;;
+*.mailspike.net|*.mailspike.org)provider=mailspike.net;;
+*.spamhaus.org|*.spamhaus.net)provider=spamhaus.org;;
+*.fusionzero.com)provider=fusionzero.com;;
+*.barracudacentral.org)provider=barracudacentral.org;;
+*.spameatingmonkey.net)provider=spameatingmonkey.net;;
+*.surriel.com)provider=surriel.com;;
+*.uceprotect.net)provider=uceprotect.net;;
+*.sorbs.net)provider=sorbs.net;;
+*.spamrats.com)provider=spamrats.com;;
+*.dnsbl.bit.nl)provider=bit.nl;;
+*)provider=$1;;
+esac
+printf 'Blacklisted:%s\n' "$provider"
 }
 export -f dnsbl_lookup dnsbl_query
 read_dnsbl_zones|filter_dnsbl_zones|sort -u|xargs -P "$parallel_jobs" -I {} bash -c 'dnsbl_query "$1" "$2"' _ {} "$reversed_ip"|{
+declare -A listed_providers=()
 while IFS= read -r line;do
 ((total++))
 case "$line" in
 "Clean")((clean++));;
-"Blacklisted")((blacklisted++));;
+Blacklisted:*)
+provider=${line#Blacklisted:}
+if [[ -z ${listed_providers[$provider]:-} ]];then
+listed_providers[$provider]=1
+((blacklisted++))
+else
+# Keep the original zone denominator; duplicate votes are not clean evidence.
+((other++))
+fi;;
 "Error")((errors++));;
 *)((other++))
 esac

@@ -279,6 +279,7 @@ class CurlQuickProbe:
         self._provider_observations: dict[str, dict[str, Any]] = {}
         self._provider_budget: dict[str, int] = {}
         self._provider_failures: dict[str, list[tuple[float, str, str]]] = {}
+        self._provider_last_success: dict[str, float] = {}
         self._diagnostic_retries: Counter[str] = Counter()
         self._planned_routes: set[int] | None = None
 
@@ -439,10 +440,14 @@ class CurlQuickProbe:
                         failures = [(stamp, route, kind) for stamp, route, kind in self._provider_failures.get(source, []) if now - stamp <= 60]
                         failures.append((now, route, code))
                         self._provider_failures[source] = failures
-                        if len({route for _, route, kind in failures if kind == code}) >= 2 or half_open:
+                        recent_success = now - self._provider_last_success.get(source, float("-inf")) <= 60
+                        route_transport_failure = bool(response and (response.transport_code or not status))
+                        if ((len({route for _, route, kind in failures if kind == code}) >= 2 or half_open)
+                                and not (route_transport_failure and recent_success)):
                             self._provider_backoff[scopes[0]] = (now + max(60, retry_after or 0), code)
                 raise failure from None
             with self._provider_lock:
+                self._provider_last_success[source] = time.monotonic()
                 # Bound memory even for repeated independent audit jobs.
                 if len(self._provider_cache) >= 4096:
                     self._provider_cache.pop(next(iter(self._provider_cache)))
