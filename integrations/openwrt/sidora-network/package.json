@@ -1,0 +1,10 @@
+{
+  "name": "ipquality-sidora-router-tool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Restricted OpenWrt control and readback for Sidora",
+  "engines": {"node": ">=18.20.8"},
+  "dependencies": {"js-yaml": "4.1.1"},
+  "scripts": {"test": "node --test test/*.test.mjs"}
+}
