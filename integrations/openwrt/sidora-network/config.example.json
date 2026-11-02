@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "raw_config": "/etc/openclash/config/REPLACE_WITH_SELECTED_PROFILE.yaml",
+  "runtime_config": "/etc/openclash/REPLACE_WITH_SELECTED_PROFILE.yaml",
+  "updater": "/usr/share/openclash/openclash.sh",
+  "service": "/etc/init.d/openclash",
+  "core": "/etc/openclash/core/clash_meta",
+  "state_dir": "/etc/sidora-network/state",
+  "controller_url": "http://127.0.0.1:9090",
+  "controller_token_file": "/etc/sidora-network/controller-token",
+  "converter": "/etc/local-socks/convert-any-proxy-to-local-socks-stable.js",
+  "local_socks_cache": "/etc/local-socks/cache/node-health",
+  "local_socks_config": "/etc/local-socks/config.yaml",
+  "local_socks_core": "/etc/local-socks/bin/mihomo-local-socks",
+  "update_mode": "catalog_hot_reload",
+  "refresh_sha256": "REPLACE_WITH_SHA256_OF_REVIEWED_REFRESH_MODULE"
+}

@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+node_modules/
 
 # Runtime state and local deployment secrets.
 data/
